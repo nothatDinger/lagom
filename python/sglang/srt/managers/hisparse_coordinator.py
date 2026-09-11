@@ -689,12 +689,13 @@ class HiSparseCoordinator:
         self._prefetch_groups, self._prefetch_slot = _build_prefetch_groups(
             self._is_shared_index_layer
         )
+        # Shared-index replay and speculative one-shot swap-in both use the
+        # copy-only kernel. Keep its launch geometry available even when no
+        # shared-index layer enables the rest of the prefetch machinery.
+        self._prefetch_copy_blocks = 4
         if not self.enable_prefetch:
             return
 
-        # Small fixed grid for the copy-only kernel: low SM footprint so the
-        # copies overlap compute with little contention.
-        self._prefetch_copy_blocks = 4
         max_group_size = max(len(g) for g in self._prefetch_groups.values())
         self.prefetch_stream = device_module.Stream()
         self._prefetch_events = [device_module.Event() for _ in range(max_group_size)]

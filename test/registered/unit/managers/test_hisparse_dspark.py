@@ -354,7 +354,10 @@ def test_dspark_verify_window_plans_and_copies_once(monkeypatch):
     coordinator.swap_in_block_size = 256
     coordinator.item_size_bytes = 16
     coordinator.skip_io = False
-    coordinator._prefetch_copy_blocks = 4
+    coordinator._init_shared_index_prefetch(
+        shared_index_layers=None, layer_num=1, max_num_req_slots=4
+    )
+    assert not coordinator.enable_prefetch
     coordinator.num_real_reqs = torch.tensor([2], dtype=torch.int32)
     coordinator._spec_miss_src = torch.empty((4, 6), dtype=torch.int64)
     coordinator._spec_miss_dst = torch.empty((4, 6), dtype=torch.int32)
@@ -383,6 +386,7 @@ def test_dspark_verify_window_plans_and_copies_once(monkeypatch):
     assert planner.call_args.kwargs["verify_width"] == 3
     assert planner.call_args.kwargs["skip_io"]
     assert planner.call_args.kwargs["miss_src"].shape == (2, 6)
+    assert copier.call_args.kwargs["num_blocks"] == 4
     assert copier.call_args.kwargs["miss_src"].data_ptr() == (
         planner.call_args.kwargs["miss_src"].data_ptr()
     )
