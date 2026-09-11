@@ -141,11 +141,76 @@ def _load_cache_to_device_buffer_mla(
     skip_io: bool,
     verify_width: int = 1,
 ) -> None:
-    assert hot_buffer_size >= num_top_k, (
-        f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
-    )
+    if verify_width <= 0:
+        raise ValueError(f"verify_width must be positive, got {verify_width}")
+    required_window_capacity = verify_width * num_top_k
+    if hot_buffer_size < required_window_capacity:
+        raise ValueError(
+            f"hot_buffer_size ({hot_buffer_size}) must be >= verify_width * "
+            f"num_top_k ({verify_width} * {num_top_k} = "
+            f"{required_window_capacity})"
+        )
+
+    if top_k_tokens.size(0) % verify_width != 0:
+        raise ValueError(
+            f"Top-K rows ({top_k_tokens.size(0)}) must be divisible by "
+            f"verify_width ({verify_width})"
+        )
+    num_reqs = top_k_tokens.size(0) // verify_width
+    if seq_lens.numel() not in (num_reqs, top_k_tokens.size(0)):
+        raise ValueError(
+            "Sequence lengths must contain one value per request or Top-K row: "
+            f"lengths={seq_lens.numel()}, requests={num_reqs}, "
+            f"rows={top_k_tokens.size(0)}"
+        )
 
     record_miss_plan = miss_src is not None
+    if record_miss_plan:
+        if miss_dst is None or miss_count is None:
+            raise ValueError(
+                "miss_src, miss_dst, and miss_count must be provided together"
+            )
+        if miss_src.dtype != torch.int64 or miss_dst.dtype != torch.int32:
+            raise ValueError("miss_src must be int64 and miss_dst must be int32")
+        if miss_count.dtype != torch.int32:
+            raise ValueError("miss_count must be int32")
+        if miss_src.dim() != 2 or miss_dst.dim() != 2:
+            raise ValueError("miss_src and miss_dst must be two-dimensional")
+        if miss_src.size(0) < num_reqs or miss_dst.size(0) < num_reqs:
+            raise ValueError(
+                "Miss-plan buffers must contain one row per request: "
+                f"requests={num_reqs}, src_rows={miss_src.size(0)}, "
+                f"dst_rows={miss_dst.size(0)}"
+            )
+        if (
+            miss_src.size(1) < required_window_capacity
+            or miss_dst.size(1) < required_window_capacity
+        ):
+            raise ValueError(
+                "Each miss-plan row must hold verify_width * num_top_k entries: "
+                f"required={required_window_capacity}, "
+                f"src_capacity={miss_src.size(1)}, "
+                f"dst_capacity={miss_dst.size(1)}"
+            )
+        if miss_count.numel() < num_reqs:
+            raise ValueError(
+                "miss_count must contain one value per request: "
+                f"required={num_reqs}, capacity={miss_count.numel()}"
+            )
+        if miss_src.stride(1) != 1 or miss_dst.stride(1) != 1:
+            raise ValueError("Miss-plan entries must be contiguous within each row")
+        if (
+            miss_src.stride(0) < required_window_capacity
+            or miss_dst.stride(0) < required_window_capacity
+            or miss_src.stride(0) != miss_dst.stride(0)
+        ):
+            raise ValueError(
+                "Miss-plan row strides must match and cover the verify window: "
+                f"required={required_window_capacity}, "
+                f"src_stride={miss_src.stride(0)}, "
+                f"dst_stride={miss_dst.stride(0)}"
+            )
+
     module = _jit_sparse_module(
         item_size_bytes,
         block_size,
@@ -167,16 +232,8 @@ def _load_cache_to_device_buffer_mla(
             device=top_k_tokens.device,
         )
 
-    assert top_k_tokens.size(0) % verify_width == 0
-    num_reqs = top_k_tokens.size(0) // verify_width
-    assert seq_lens.numel() in (num_reqs, top_k_tokens.size(0))
-
     if record_miss_plan:
         assert miss_dst is not None and miss_count is not None
-        assert miss_src.dtype == torch.int64 and miss_dst.dtype == torch.int32
-        assert miss_count.dtype == torch.int32
-        # The kernel indexes both plan rows with one stride.
-        assert miss_src.stride(0) == miss_dst.stride(0)
     else:
         # Unused sentinels; the RecordMissPlan=false instantiation never reads them.
         miss_src = miss_dst = miss_count = empty
