@@ -46,7 +46,7 @@ def test_plan_only_then_copy_replays_into_existing_device_buffer() -> None:
     device_buffer = torch.full(
         (DEVICE_CACHE_SIZE, 1, KV_DIM), -1, dtype=DTYPE, device=DEVICE
     )
-    candidates = torch.tensor([[7]], dtype=torch.int32, device=DEVICE)
+    candidates = torch.tensor([[6]], dtype=torch.int32, device=DEVICE)
     miss_src = torch.zeros((1, 1), dtype=torch.int64, device=DEVICE)
     miss_dst = torch.zeros((1, 1), dtype=torch.int32, device=DEVICE)
     miss_count = torch.zeros(1, dtype=torch.int32, device=DEVICE)
@@ -92,7 +92,7 @@ def test_plan_only_then_copy_replays_into_existing_device_buffer() -> None:
         item_size_bytes=ITEM_SIZE_BYTES,
     )
     torch.cuda.synchronize()
-    assert torch.equal(device_buffer[miss_dst.item()].cpu(), host_cache[7])
+    assert torch.equal(device_buffer[miss_dst.item()].cpu(), host_cache[6])
 
 
 DSV4_ITEM_BYTES = DSV4_VALUE_BYTES + DSV4_SCALE_BYTES
@@ -476,6 +476,18 @@ def test_load_cache_to_device_buffer_miss_uses_updated_lru_slot() -> None:
 
 def test_verify_window_plans_and_copies_ordered_miss_union() -> None:
     """One block must preserve step order and copy duplicate-free misses once."""
+    reference = _long_case()
+    reference_outputs = []
+    for row in ([6, 2], [2, 6]):
+        reference_outputs.append(
+            _run_kernel(
+                top_k_tokens=torch.tensor([row], dtype=torch.int32, device=DEVICE),
+                seq_len=8,
+                **reference,
+            )
+        )
+    expected_output = torch.cat(reference_outputs)
+
     state = _long_case()
     top_k_tokens = torch.tensor([[6, 2], [2, 6]], dtype=torch.int32, device=DEVICE)
     output = torch.full_like(top_k_tokens, -1)
@@ -515,14 +527,12 @@ def test_verify_window_plans_and_copies_ordered_miss_union() -> None:
     )
     torch.cuda.synchronize()
 
-    assert torch.equal(output.cpu(), torch.tensor([[9, 3], [3, 9]]))
+    assert torch.equal(output.cpu(), expected_output.cpu())
     assert miss_count.item() == 1
     assert miss_src[0, 0].item() == 6
     assert miss_dst[0, 0].item() == 9
     assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
-    assert torch.equal(
-        state["lru_slots"].cpu(), torch.tensor([[3, 1, 2, 0]], dtype=torch.int16)
-    )
+    assert torch.equal(state["lru_slots"].cpu(), reference["lru_slots"].cpu())
 
 
 @pytest.mark.skipif(

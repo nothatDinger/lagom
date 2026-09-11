@@ -209,7 +209,9 @@ def test_dspark_graph_scratch_metadata_updates_in_place():
     replay_result = coordinator.select_dspark_scratch_locs(compressed, swapped, writers)
 
     assert coordinator._dspark_scratch_compressed_locs.data_ptr() == metadata_ptr
-    torch.testing.assert_close(replay_result, torch.tensor([200, 101, 202]))
+    torch.testing.assert_close(
+        replay_result, torch.tensor([200, 101, 202], dtype=torch.int32)
+    )
 
 
 def test_dspark_prepare_translates_with_coordinator_device_pool():
@@ -395,7 +397,7 @@ def test_dspark_swap_in_rejects_inconsistent_ragged_geometry():
             compressed_seq_lens=torch.tensor([10, 20]),
             top_k_result=torch.zeros((4, 2), dtype=torch.int64),
             layer_id=3,
-            verify_lens_cpu=[1, 2],
+            verify_lens_cpu=[2, 3],
         )
 
 
