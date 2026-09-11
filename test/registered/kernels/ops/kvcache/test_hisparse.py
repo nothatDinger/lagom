@@ -442,6 +442,57 @@ def test_load_cache_to_device_buffer_miss_uses_updated_lru_slot() -> None:
     assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
 
 
+def test_verify_window_plans_and_copies_ordered_miss_union() -> None:
+    """One block must preserve step order and copy duplicate-free misses once."""
+    state = _long_case()
+    top_k_tokens = torch.tensor([[6, 2], [2, 6]], dtype=torch.int32, device=DEVICE)
+    output = torch.full_like(top_k_tokens, -1)
+    miss_src = torch.full((1, 4), -1, dtype=torch.int64, device=DEVICE)
+    miss_dst = torch.full((1, 4), -1, dtype=torch.int32, device=DEVICE)
+    miss_count = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+    num_real_reqs = torch.tensor([1], dtype=torch.int32, device=DEVICE)
+
+    load_cache_to_device_buffer_mla(
+        top_k_tokens=top_k_tokens,
+        top_k_device_locs=output,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([8, 8], dtype=torch.int32, device=DEVICE),
+        item_size_bytes=state["host_cache"][0].numel()
+        * state["host_cache"].element_size(),
+        num_top_k=2,
+        hot_buffer_size=HOT_BUFFER_SIZE,
+        page_size=1,
+        block_size=256,
+        num_real_reqs=num_real_reqs,
+        miss_src=miss_src,
+        miss_dst=miss_dst,
+        miss_count=miss_count,
+        skip_io=True,
+        verify_width=2,
+        **state,
+    )
+    copy_cache_planned_mla(
+        miss_src=miss_src,
+        miss_dst=miss_dst,
+        miss_count=miss_count,
+        num_real_reqs=num_real_reqs,
+        host_cache=state["host_cache"],
+        device_buffer=state["device_buffer"],
+        item_size_bytes=state["host_cache"][0].numel()
+        * state["host_cache"].element_size(),
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(output.cpu(), torch.tensor([[9, 3], [3, 9]]))
+    assert miss_count.item() == 1
+    assert miss_src[0, 0].item() == 6
+    assert miss_dst[0, 0].item() == 9
+    assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
+    assert torch.equal(
+        state["lru_slots"].cpu(), torch.tensor([[3, 1, 2, 0]], dtype=torch.int16)
+    )
+
+
 @pytest.mark.skipif(
     not is_hip(),
     reason="CUDA transfer_item_warp assumes 16B-aligned items with no sub-8B remainder.",

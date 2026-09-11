@@ -255,25 +255,42 @@ def _coordinator_with_recording_kernel():
     coordinator.device = "cpu"
     calls = []
 
-    def run(self, req, seq_len, top_k, layer_id, *, output_buffer, **_kwargs):
-        calls.append((req.tolist(), seq_len.tolist(), top_k.tolist(), layer_id))
-        output_buffer.copy_(top_k.to(torch.int32) + 100)
+    def run(
+        self,
+        *,
+        req_pool_indices,
+        compressed_seq_lens,
+        top_k_result,
+        layer_id,
+        verify_width,
+        output_buffer,
+    ):
+        calls.append(
+            (
+                req_pool_indices.tolist(),
+                compressed_seq_lens.tolist(),
+                top_k_result.tolist(),
+                layer_id,
+                verify_width,
+            )
+        )
+        output_buffer.copy_(top_k_result.to(torch.int32) + 100)
         return output_buffer
 
-    coordinator._run_swap_in_kernel = MethodType(run, coordinator)
+    coordinator._run_swap_in_verify_window = MethodType(run, coordinator)
     return coordinator, calls
 
 
 @pytest.mark.parametrize(
     ("verify_lens", "seq_lens", "expected_launches"),
     [
-        (None, [10, 10, 20, 20], [[7, 9], [7, 9]]),
-        ([1, 3], [10, 20], [[7, 9], [9], [9]]),
-        (None, [[10, 10], [20, 20]], [[7, 9], [7, 9]]),
+        (None, [10, 10, 20, 20], [[7, 9]]),
+        ([1, 3], [10, 20], [[7, 9]]),
+        (None, [[10, 10], [20, 20]], [[7, 9]]),
     ],
 )
 def test_dspark_swap_in_is_request_major(verify_lens, seq_lens, expected_launches):
-    """A batched kernel would race LRU updates from two steps of one request."""
+    """One planner owns every ordered step of each request in one launch."""
     coordinator, calls = _coordinator_with_recording_kernel()
     top_k = torch.arange(8, dtype=torch.int64).view(4, 2)
     output = torch.full((4, 2), -1, dtype=torch.int32)
@@ -288,6 +305,8 @@ def test_dspark_swap_in_is_request_major(verify_lens, seq_lens, expected_launche
     )
 
     assert [call[0] for call in calls] == expected_launches
+    expected_width = 3 if verify_lens == [1, 3] else 2
+    assert calls[0][4] == expected_width
     assert actual.data_ptr() == output.data_ptr()
     torch.testing.assert_close(actual, top_k.to(torch.int32) + 100)
 
@@ -307,9 +326,64 @@ def test_dspark_swap_in_ignores_graph_padding_rows():
         output_buffer=output,
     )
 
-    assert [call[0] for call in calls] == [[7, 9], [9], [9]]
+    assert [call[0] for call in calls] == [[7, 9]]
+    assert calls[0][4] == 3
     torch.testing.assert_close(actual[:4], top_k[:4].to(torch.int32) + 100)
     torch.testing.assert_close(actual[4:], torch.full((2, 2), -1, dtype=torch.int32))
+
+
+def test_dspark_verify_window_plans_and_copies_once(monkeypatch):
+    """The complete verify window produces one ordered plan and one copy."""
+    planner = MagicMock()
+    copier = MagicMock()
+    monkeypatch.setattr(
+        "sglang.srt.managers.hisparse_coordinator.load_cache_to_device_buffer_dsv4_mla",
+        planner,
+    )
+    monkeypatch.setattr(
+        "sglang.srt.managers.hisparse_coordinator.copy_cache_planned_mla",
+        copier,
+    )
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator.is_dsv4_hisparse = True
+    coordinator._speculative_verify_width = 3
+    coordinator.top_k = 2
+    coordinator.device_buffer_size = 6
+    coordinator.swap_in_block_size = 256
+    coordinator.item_size_bytes = 16
+    coordinator.skip_io = False
+    coordinator._prefetch_copy_blocks = 4
+    coordinator.num_real_reqs = torch.tensor([2], dtype=torch.int32)
+    coordinator._spec_miss_src = torch.empty((4, 6), dtype=torch.int64)
+    coordinator._spec_miss_dst = torch.empty((4, 6), dtype=torch.int32)
+    coordinator._spec_miss_count = torch.zeros(4, dtype=torch.int32)
+    coordinator.req_device_buffer_tokens = torch.empty((1, 4, 7), dtype=torch.int32)
+    coordinator.req_to_host_pool = torch.empty((4, 16), dtype=torch.int64)
+    coordinator.req_device_buffer_token_locs = torch.empty((1, 4, 7), dtype=torch.int32)
+    coordinator.lru_slots = torch.empty((1, 4, 6), dtype=torch.int16)
+    coordinator.mem_pool_host = SimpleNamespace(kv_buffer=[torch.empty(1)])
+    coordinator.mem_pool_device = SimpleNamespace(kv_buffer=[torch.empty(1)])
+    top_k = torch.arange(12, dtype=torch.int32).view(6, 2)
+    output = torch.full_like(top_k, -1)
+
+    actual = coordinator._run_swap_in_verify_window(
+        req_pool_indices=torch.tensor([1, 3]),
+        compressed_seq_lens=torch.tensor([10, 10, 10, 20, 20, 20]),
+        top_k_result=top_k,
+        layer_id=0,
+        verify_width=3,
+        output_buffer=output,
+    )
+
+    assert actual.data_ptr() == output.data_ptr()
+    planner.assert_called_once()
+    copier.assert_called_once()
+    assert planner.call_args.kwargs["verify_width"] == 3
+    assert planner.call_args.kwargs["skip_io"]
+    assert planner.call_args.kwargs["miss_src"].shape == (2, 6)
+    assert copier.call_args.kwargs["miss_src"].data_ptr() == (
+        planner.call_args.kwargs["miss_src"].data_ptr()
+    )
 
 
 def test_dspark_swap_in_rejects_inconsistent_ragged_geometry():
