@@ -276,6 +276,9 @@ def _coordinator_with_recording_kernel():
                 verify_width,
             )
         )
+        assert compressed_seq_lens.is_contiguous()
+        assert top_k_result.is_contiguous()
+        assert output_buffer.is_contiguous()
         output_buffer.copy_(top_k_result.to(torch.int32) + 100)
         return output_buffer
 
