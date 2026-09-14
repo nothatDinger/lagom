@@ -256,6 +256,9 @@ def _coordinator_with_recording_kernel():
     calls = []
 
     def run(self, req, seq_len, top_k, layer_id, *, output_buffer, **_kwargs):
+        assert seq_len.is_contiguous()
+        assert top_k.is_contiguous()
+        assert output_buffer.is_contiguous()
         calls.append((req.tolist(), seq_len.tolist(), top_k.tolist(), layer_id))
         output_buffer.copy_(top_k.to(torch.int32) + 100)
         return output_buffer

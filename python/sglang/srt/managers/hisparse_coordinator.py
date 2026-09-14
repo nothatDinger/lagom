@@ -1990,18 +1990,30 @@ class HiSparseCoordinator:
             # Static ownership is fixed and request-aligned, including CUDA
             # Graph padding. Launch one full request batch per step: the kernel's
             # num_real_reqs mask now correctly removes padded request blocks.
+            # A column selected from the request-major [B, W, ...] views is
+            # strided by W. The raw CUDA kernel indexes all of its inputs and
+            # output as packed arrays, so materialize packed step buffers and
+            # scatter the output back into request-major order afterwards.
             for step in range(verify_width):
+                step_seq_lens = (
+                    compressed_seq_lens
+                    if seq_lens_by_req is None
+                    else seq_lens_by_req[:, step].contiguous()
+                )
+                step_top_k = top_k_by_req[:, step, : self.top_k].contiguous()
+                step_output = torch.empty(
+                    (batch_size, self.top_k),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
                 self._run_swap_in_kernel(
                     req_pool_indices,
-                    (
-                        compressed_seq_lens
-                        if seq_lens_by_req is None
-                        else seq_lens_by_req[:, step]
-                    ),
-                    top_k_by_req[:, step, : self.top_k],
+                    step_seq_lens,
+                    step_top_k,
                     layer_id,
-                    output_buffer=result_by_req[:, step, : self.top_k],
+                    output_buffer=step_output,
                 )
+                result_by_req[:, step, : self.top_k] = step_output
             return result
 
         result.fill_(-1)
