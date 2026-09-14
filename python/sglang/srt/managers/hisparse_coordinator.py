@@ -426,6 +426,27 @@ class HiSparseCoordinator:
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
+        self._speculative_verify_width = speculative_verify_width
+        self._spec_miss_src = None
+        self._spec_miss_dst = None
+        self._spec_miss_count = None
+        if self.is_dsv4_hisparse and is_speculative and speculative_verify_width > 0:
+            # One row per request holds the ordered union of all verify-step
+            # misses. Fixed addresses make plan+copy safe to capture and replay.
+            max_verify_misses = speculative_verify_width * self.top_k
+            self._spec_miss_src = torch.empty(
+                (max_num_req_slots, max_verify_misses),
+                dtype=torch.int64,
+                device=device,
+            )
+            self._spec_miss_dst = torch.empty(
+                (max_num_req_slots, max_verify_misses),
+                dtype=torch.int32,
+                device=device,
+            )
+            self._spec_miss_count = torch.zeros(
+                max_num_req_slots, dtype=torch.int32, device=device
+            )
 
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
@@ -668,12 +689,13 @@ class HiSparseCoordinator:
         self._prefetch_groups, self._prefetch_slot = _build_prefetch_groups(
             self._is_shared_index_layer
         )
+        # Shared-index replay and speculative one-shot swap-in both use the
+        # copy-only kernel. Keep its launch geometry available even when no
+        # shared-index layer enables the rest of the prefetch machinery.
+        self._prefetch_copy_blocks = 4
         if not self.enable_prefetch:
             return
 
-        # Small fixed grid for the copy-only kernel: low SM footprint so the
-        # copies overlap compute with little contention.
-        self._prefetch_copy_blocks = 4
         max_group_size = max(len(g) for g in self._prefetch_groups.values())
         self.prefetch_stream = device_module.Stream()
         self._prefetch_events = [device_module.Event() for _ in range(max_group_size)]
@@ -1931,6 +1953,66 @@ class HiSparseCoordinator:
                     )
         return anchor_locs
 
+    def _run_swap_in_verify_window(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        layer_id: int,
+        verify_width: int,
+        output_buffer: torch.Tensor,
+    ) -> torch.Tensor:
+        """Resolve one verify window, then copy its ordered miss union once."""
+        if not self.is_dsv4_hisparse:
+            raise RuntimeError("one-shot verify swap-in requires DeepSeek-V4 C4")
+        if verify_width <= 0 or verify_width > self._speculative_verify_width:
+            raise ValueError(
+                "HiSparse verify width exceeds the fixed one-shot capacity: "
+                f"width={verify_width}, capacity={self._speculative_verify_width}"
+            )
+        num_reqs = req_pool_indices.numel()
+        plan_width = verify_width * self.top_k
+        miss_src = self._spec_miss_src[:num_reqs, :plan_width]
+        miss_dst = self._spec_miss_dst[:num_reqs, :plan_width]
+        miss_count = self._spec_miss_count[:num_reqs]
+        load_cache_to_device_buffer_dsv4_mla(
+            top_k_tokens=top_k_result,
+            device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+            host_cache_locs=self.req_to_host_pool,
+            device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
+            host_cache=self.mem_pool_host.kv_buffer[layer_id],
+            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+            top_k_device_locs=output_buffer,
+            req_pool_indices=req_pool_indices,
+            seq_lens=compressed_seq_lens,
+            lru_slots=self.lru_slots[layer_id],
+            item_size_bytes=self.item_size_bytes,
+            num_top_k=self.top_k,
+            hot_buffer_size=self.device_buffer_size,
+            page_size=1,
+            block_size=self.swap_in_block_size,
+            num_real_reqs=self.num_real_reqs,
+            miss_src=miss_src,
+            miss_dst=miss_dst,
+            miss_count=miss_count,
+            skip_io=True,
+            verify_width=verify_width,
+        )
+        copy_cache_planned_mla(
+            miss_src=miss_src,
+            miss_dst=miss_dst,
+            miss_count=miss_count,
+            num_real_reqs=self.num_real_reqs,
+            host_cache=self.mem_pool_host.kv_buffer[layer_id],
+            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+            item_size_bytes=self.item_size_bytes,
+            num_blocks=self._prefetch_copy_blocks,
+            is_dsv4_layout=True,
+            skip_io=self.skip_io,
+        )
+        return output_buffer
+
     def swap_in_selected_pages_spec(
         self,
         req_pool_indices: torch.Tensor,
@@ -1941,18 +2023,18 @@ class HiSparseCoordinator:
         verify_lens_cpu: Optional[List[int]] = None,
         output_buffer: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Swap DSPARK verify selections in request-major step order.
+        """Plan and copy a complete DSPARK verify window in two launches.
 
         ``top_k_result`` is the *real* Indexer output, with either static
         ``[B * W, K]`` rows or compact ``[sum(verify_lens), K]`` rows. LRU and
-        resident-slot tables are per request, so two steps of one request must
-        never share a launch. Launch step-major batches instead: requests run
-        in parallel while each request's later step observes the prior launch.
-        Padding rows beyond ``sum(verify_lens)`` remain invalid and never launch.
+        resident-slot tables are per request, so one planner block owns a request
+        and resolves all of its steps serially. The resulting ordered miss union
+        is copied with one copy-only launch.
+        Padding rows beyond ``sum(verify_lens)`` remain invalid and never update
+        resident state.
 
-        This eager synchronous path is intentional: speculative decoding disables
-        shared-index/previous-layer prefetch, while preserving the Indexer's
-        Top-K unchanged.
+        This dedicated synchronous path preserves the Indexer's Top-K unchanged
+        and keeps its plan/output storage at fixed addresses for CUDA graphs.
         """
         if top_k_result.dim() != 2:
             raise ValueError(
@@ -1974,8 +2056,6 @@ class HiSparseCoordinator:
                     f"rows={top_k_result.size(0)}, batch={batch_size}"
                 )
             verify_width = top_k_result.size(0) // batch_size
-            top_k_by_req = top_k_result.view(batch_size, verify_width, -1)
-            result_by_req = result.view(batch_size, verify_width, -1)
             if compressed_seq_lens.numel() == batch_size:
                 seq_lens_by_req = None
             elif compressed_seq_lens.numel() == top_k_result.size(0):
@@ -1987,33 +2067,19 @@ class HiSparseCoordinator:
                     f"lengths={compressed_seq_lens.numel()}, batch={batch_size}, "
                     f"rows={top_k_result.size(0)}"
                 )
-            # Static ownership is fixed and request-aligned, including CUDA
-            # Graph padding. Launch one full request batch per step: the kernel's
-            # num_real_reqs mask now correctly removes padded request blocks.
-            # A column selected from the request-major [B, W, ...] views is
-            # strided by W. The raw CUDA kernel indexes all of its inputs and
-            # output as packed arrays, so materialize packed step buffers and
-            # scatter the output back into request-major order afterwards.
-            for step in range(verify_width):
-                step_seq_lens = (
-                    compressed_seq_lens
-                    if seq_lens_by_req is None
-                    else seq_lens_by_req[:, step].contiguous()
-                )
-                step_top_k = top_k_by_req[:, step, : self.top_k].contiguous()
-                step_output = torch.empty(
-                    (batch_size, self.top_k),
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-                self._run_swap_in_kernel(
-                    req_pool_indices,
-                    step_seq_lens,
-                    step_top_k,
-                    layer_id,
-                    output_buffer=step_output,
-                )
-                result_by_req[:, step, : self.top_k] = step_output
+            window_seq_lens = (
+                compressed_seq_lens
+                if seq_lens_by_req is None
+                else seq_lens_by_req.reshape(-1)
+            )
+            self._run_swap_in_verify_window(
+                req_pool_indices=req_pool_indices,
+                compressed_seq_lens=window_seq_lens,
+                top_k_result=top_k_result,
+                layer_id=layer_id,
+                verify_width=verify_width,
+                output_buffer=result,
+            )
             return result
 
         result.fill_(-1)
@@ -2033,38 +2099,49 @@ class HiSparseCoordinator:
                 f"rows={top_k_result.size(0)}"
             )
 
-        # One launch per verify step, with all requests owning that step in the
-        # same launch. This preserves per-request ordering while retaining
-        # request-level GPU parallelism. Compact rows are request-major, hence
-        # offsets identify the row for (request, step).
+        # Ragged verify is eager today. Pad it to request-major fixed width so it
+        # uses the same one-shot planner/copy contract as graph-captured static
+        # verify, then scatter locations back to compact row order.
         offsets = [0]
         for verify_len in verify_lens_cpu:
             offsets.append(offsets[-1] + verify_len)
-        for step in range(max(verify_lens_cpu, default=0)):
-            active_reqs = [
-                i for i, length in enumerate(verify_lens_cpu) if step < length
-            ]
-            row_ids = [offsets[i] + step for i in active_reqs]
-            active_idx = torch.tensor(
-                active_reqs, dtype=torch.int64, device=self.device
-            )
-            row_idx = torch.tensor(row_ids, dtype=torch.int64, device=self.device)
-            step_seq_lens = (
-                compressed_seq_lens[active_idx]
-                if num_seq_lens == batch_size
-                else compressed_seq_lens[row_idx]
-            )
-            step_output = torch.empty(
-                (len(active_reqs), self.top_k), dtype=torch.int32, device=self.device
-            )
-            self._run_swap_in_kernel(
-                req_pool_indices[active_idx],
-                step_seq_lens,
-                top_k_result[row_idx, : self.top_k],
-                layer_id,
-                output_buffer=step_output,
-            )
-            result[row_idx, : self.top_k] = step_output
+        verify_width = max(verify_lens_cpu, default=0)
+        if verify_width == 0:
+            return result
+        padded_top_k = torch.full(
+            (batch_size, verify_width, self.top_k),
+            -1,
+            dtype=top_k_result.dtype,
+            device=self.device,
+        )
+        padded_seq_lens = torch.zeros(
+            (batch_size, verify_width),
+            dtype=compressed_seq_lens.dtype,
+            device=self.device,
+        )
+        for req, verify_len in enumerate(verify_lens_cpu):
+            if verify_len == 0:
+                continue
+            rows = slice(offsets[req], offsets[req + 1])
+            padded_top_k[req, :verify_len] = top_k_result[rows, : self.top_k]
+            if num_seq_lens == batch_size:
+                padded_seq_lens[req, :verify_len] = compressed_seq_lens[req]
+            else:
+                padded_seq_lens[req, :verify_len] = compressed_seq_lens[rows]
+        padded_output = torch.full_like(padded_top_k, -1, dtype=torch.int32)
+        self._run_swap_in_verify_window(
+            req_pool_indices=req_pool_indices,
+            compressed_seq_lens=padded_seq_lens.reshape(-1),
+            top_k_result=padded_top_k.reshape(-1, self.top_k),
+            layer_id=layer_id,
+            verify_width=verify_width,
+            output_buffer=padded_output.reshape(-1, self.top_k),
+        )
+        for req, verify_len in enumerate(verify_lens_cpu):
+            if verify_len:
+                result[offsets[req] : offsets[req + 1], : self.top_k] = padded_output[
+                    req, :verify_len
+                ]
         return result
 
     def prepare_dspark_verify_window(

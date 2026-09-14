@@ -332,6 +332,7 @@ template <
     bool IsDsv4Layout,
     bool RecordMissPlan,
     bool SkipIO,
+    int VERIFY_WIDTH,
     typename SeqLensT,
     typename ReqPoolIndicesT>
 __global__ void load_cache_to_device_buffer_kernel(
@@ -358,7 +359,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t* __restrict__ miss_src_out,
     int32_t* __restrict__ miss_dst_out,
     int32_t* __restrict__ miss_count_out,
-    int64_t plan_stride) {
+    int64_t plan_stride,
+    int64_t seq_lens_request_stride) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
@@ -367,13 +369,16 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   const int bid = blockIdx.x;
   const int tid = threadIdx.x;
-  int32_t* req_top_k_device_locs = top_k_device_locs + bid * top_k_device_locs_stride;
 
   // CUDA graph pads the batch to a captured size. Keep padded output rows
   // invalid without a separate fill kernel.
   if (bid >= num_real_reqs[0]) {
-    for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
-      req_top_k_device_locs[i] = -1;
+    for (int step = 0; step < VERIFY_WIDTH; ++step) {
+      int32_t* row_locs = top_k_device_locs +
+          (bid * VERIFY_WIDTH + step) * top_k_device_locs_stride;
+      for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+        row_locs[i] = -1;
+      }
     }
     return;
   }
@@ -383,10 +388,23 @@ __global__ void load_cache_to_device_buffer_kernel(
   const BallotMask lanes_before = (BallotMask(1) << lane_id) - BallotMask(1);
 
   const int64_t rid = req_pool_indices[bid];
-  const int64_t seq_len = seq_lens[bid];
+  int plan_offset = 0;
+  if constexpr (RecordMissPlan) {
+    if (tid == 0) miss_count_out[bid] = 0;
+  }
+
+  // A speculative verify instantiation assigns one block to one request and
+  // resolves that request's rows in order.  This preserves the per-request LRU
+  // dependency while producing one deduplicated miss plan for the whole window.
+  for (int verify_step = 0; verify_step < VERIFY_WIDTH; ++verify_step) {
+  const int row = bid * VERIFY_WIDTH + verify_step;
+  int32_t* req_top_k_device_locs = top_k_device_locs + row * top_k_device_locs_stride;
+  const int64_t seq_len = seq_lens_request_stride == 0
+      ? seq_lens[bid]
+      : seq_lens[bid * seq_lens_request_stride + verify_step];
 
   // Calculate offsets for this request
-  const int32_t* req_top_k_tokens = top_k_tokens + bid * top_k_tokens_stride;
+  const int32_t* req_top_k_tokens = top_k_tokens + row * top_k_tokens_stride;
 
   const int64_t buffer_offset = rid * buffer_stride_0;
   int32_t* req_device_buffer_tokens = device_buffer_tokens + buffer_offset;
@@ -410,10 +428,10 @@ __global__ void load_cache_to_device_buffer_kernel(
     // Short sequences load nothing from host: an empty miss plan for this request.
     if constexpr (RecordMissPlan) {
       if (tid == 0) {
-        miss_count_out[bid] = 0;
+        miss_count_out[bid] = plan_offset;
       }
     }
-    return;
+    continue;
   }
 
   // Dynamic shared memory layout: int32_t arrays first, then int16_t arrays.
@@ -644,8 +662,8 @@ __global__ void load_cache_to_device_buffer_kernel(
       // Record the plan where the eviction is decided so it cannot disagree
       // with the copy phase; locs are layer-independent (lockstep buffers).
       if constexpr (RecordMissPlan) {
-        miss_src_out[bid * plan_stride + miss_offset] = req_host_cache_locs[my_token];
-        miss_dst_out[bid * plan_stride + miss_offset] = req_device_buffer_locs[evict_slot];
+        miss_src_out[bid * plan_stride + plan_offset + miss_offset] = req_host_cache_locs[my_token];
+        miss_dst_out[bid * plan_stride + plan_offset + miss_offset] = req_device_buffer_locs[evict_slot];
       }
     }
   }
@@ -654,7 +672,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   total_misses = NUM_TOP_K - s_total_hits - s_newest_hit - s_invalid_count;
   if constexpr (RecordMissPlan) {
     if (tid == 0) {
-      miss_count_out[bid] = total_misses;
+      miss_count_out[bid] = plan_offset + total_misses;
     }
   }
   // Write back LRU order: evictables at front (LRU), hits at back (MRU).
@@ -706,6 +724,9 @@ __global__ void load_cache_to_device_buffer_kernel(
           lane_id, host_cache_k, host_cache_v, device_buffer_k, device_buffer_v, src_loc, dst_loc, item_size_bytes);
     }
   }
+  plan_offset += total_misses;
+  __syncthreads();
+  }
 }
 
 template <
@@ -715,7 +736,8 @@ template <
     bool IsMLA,
     bool IsDsv4Layout,
     bool RecordMissPlan,
-    bool SkipIO>
+    bool SkipIO,
+    int VERIFY_WIDTH>
 void load_cache_to_device_buffer(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -737,7 +759,14 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView miss_count_out) {
   using namespace host;
 
-  const int64_t bs = top_k_tokens.shape()[0];
+  if (top_k_tokens.shape()[0] % VERIFY_WIDTH != 0) {
+    throw std::runtime_error("load_cache_to_device_buffer: rows must be divisible by verify width");
+  }
+  const int64_t bs = top_k_tokens.shape()[0] / VERIFY_WIDTH;
+  if (seq_lens.shape()[0] != bs && seq_lens.shape()[0] != top_k_tokens.shape()[0]) {
+    throw std::runtime_error("load_cache_to_device_buffer: sequence lengths must be per request or per input row");
+  }
+  const int64_t seq_lens_request_stride = seq_lens.shape()[0] == bs ? 0 : VERIFY_WIDTH;
   const int64_t host_stride = host_cache_locs.shape()[1];
   // Miss-plan side outputs; 0-dim sentinels when RecordMissPlan is false.
   int64_t* const miss_src_ptr = RecordMissPlan ? static_cast<int64_t*>(miss_src_out.data_ptr()) : nullptr;
@@ -787,7 +816,8 @@ void load_cache_to_device_buffer(
         miss_src_ptr,
         miss_dst_ptr,
         miss_count_ptr,
-        plan_stride);
+        plan_stride,
+        seq_lens_request_stride);
   };
 
   const auto seq_dtype = seq_lens.dtype();
@@ -805,6 +835,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            VERIFY_WIDTH,
             int64_t,
             int64_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()),
@@ -819,6 +850,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            VERIFY_WIDTH,
             int64_t,
             int32_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()),
@@ -833,6 +865,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            VERIFY_WIDTH,
             int32_t,
             int64_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),
@@ -847,6 +880,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            VERIFY_WIDTH,
             int32_t,
             int32_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),
