@@ -642,6 +642,8 @@ DeepSeek-V4 cold startup can exceed 15 minutes while loading weights, autotuning
 
 The SPS profiler requires its server to report exactly `SGLANG_SIMULATE_ACC_LEN=1.0`; `profile_sps.sh` now exports that value automatically together with `SGLANG_DSPARK_ENABLE_SPS_RECORD=1`. Both variables are scoped to the profiling script, so the subsequent filter-boundary runs still measure real acceptance rather than simulated acceptance.
 
+The profiling wrapper uses the profiler's `all` subcommand. The `run` subcommand creates only raw `.records.jsonl` and `.rounds.jsonl` measurements; it does not fit or create `sps/dspark-sps.json`, so it cannot be followed directly by `run_experiment.sh`. The wrapper also verifies that the fitted table exists before reporting success.
+
 After the workload finishes, the experiment script automatically summarizes every repetition with this equivalent command:
 
 ```bash Command

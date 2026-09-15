@@ -80,3 +80,9 @@ variables: `SGLANG_DSPARK_ENABLE_SPS_RECORD=1` and
 `SGLANG_SIMULATE_ACC_LEN=1.0`. Do not override the latter for SPS profiling. The
 setting is scoped to the profiling subprocess and is not inherited by the later
 filter-boundary runs, which must use real target-model acceptance.
+
+The wrapper invokes `dspark_sps_profiler all`, not `run`: `run` stops after
+writing raw `.records.jsonl` and `.rounds.jsonl` artifacts, while `all` also fits
+and writes the `sps/dspark-sps.json` table required by `run_experiment.sh`. If a
+previous attempt used `run`, rerun `profile_sps.sh`; the raw files alone are not
+the scheduler table.
