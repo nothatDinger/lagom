@@ -14,6 +14,9 @@ The deterministic-inference setting is applied consistently to both the
 performance and trace launches, so all four K groups in one run use the same
 execution mode. Set `DETERMINISTIC_INFERENCE=0` for a non-deterministic control
 run; do not add the corresponding CLI flag through `SERVER_EXTRA_ARGS`.
+The server always receives `--disable-radix-cache`, which is a mandatory
+HiSparse constraint; omitting it causes SGLang argument validation to fail
+before the model workers start.
 
 There are two server launches per K:
 

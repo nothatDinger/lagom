@@ -18,3 +18,4 @@ Both passes use the same `DETERMINISTIC_INFERENCE` setting. The `det_on`/`det_of
 directory suffix and `run_config.txt` make that setting explicit.
 The DeepSeek-V4-Flash-0731 checkpoint supplies both target weights and its bundled
 DSpark draft head, so the experiment does not require a separate draft-model path.
+The launch command also disables the radix cache, as required by HiSparse.

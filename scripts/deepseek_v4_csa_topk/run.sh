@@ -41,7 +41,8 @@ run_server() {
   env "${trace_env[@]}" python3 -m sglang.launch_server \
     --model-path "$MODEL_PATH" --tp "$TP_SIZE" --host "$HOST" --port "$PORT" \
     "${deterministic_args[@]}" \
-    --enable-hisparse --hisparse-config "{\"top_k\":$k,\"device_buffer_size\":$(( (DSPARK_BLOCK_SIZE + 1) * k )),\"host_to_device_ratio\":${HOST_TO_DEVICE_RATIO:-5}}" \
+    --enable-hisparse --disable-radix-cache \
+    --hisparse-config "{\"top_k\":$k,\"device_buffer_size\":$(( (DSPARK_BLOCK_SIZE + 1) * k )),\"host_to_device_ratio\":${HOST_TO_DEVICE_RATIO:-5}}" \
     --speculative-algorithm DSPARK \
     --speculative-dspark-block-size "$DSPARK_BLOCK_SIZE" "${trace_args[@]}" ${SERVER_EXTRA_ARGS:-} \
     >"$dir/server_${mode}.log" 2>"$dir/server_${mode}.err" &
