@@ -18,6 +18,13 @@ The server always receives `--disable-radix-cache`, which is a mandatory
 HiSparse constraint; omitting it causes SGLang argument validation to fail
 before the model workers start.
 
+DeepSeek-V4-Flash-0731 contains FP4 MoE weights. The experiment therefore uses
+`MOE_RUNNER_BACKEND=flashinfer_mxfp4` by default, matching the official 0731
+launch recipe. Letting this checkpoint fall back to the Triton MoE runner can
+fail during CUDA graph capture with `AssertionError: Hidden size mismatch`.
+Override the variable only when the selected checkpoint and installed backend
+are known to use a different compatible weight layout.
+
 There are two server launches per K:
 
 1. **perf** uses normal CUDA graphs and supplies the reported mean TPOT from
@@ -56,7 +63,8 @@ Every invocation creates a new directory named
 If two jobs use the same timestamp and mode, a numeric suffix prevents overwrite.
 `RUN_TIMESTAMP` can be supplied by a job scheduler to override the UTC timestamp,
 and `RESULTS_DIR` changes the parent directory rather than the individual run
-directory. `run_config.txt` records the mode and input paths used for the run.
+directory. `run_config.txt` records the mode, input paths, and MoE runner used
+for the run.
 
 ## Monitor and inspect
 
