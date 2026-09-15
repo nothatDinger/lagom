@@ -59,11 +59,17 @@ run_server() {
 }
 
 benchmark() {
-  local k=$1 mode=$2 output_args=()
-  [[ "$mode" != perf ]] || output_args=(--output-file "$OUT/k$k/benchmark.jsonl" --output-details)
+  local k=$1 mode=$2 output_file
+  if [[ "$mode" == perf ]]; then
+    output_file="$OUT/k$k/benchmark.jsonl"
+  else
+    output_file="$OUT/k$k/benchmark_trace.jsonl"
+  fi
+  rm -f "$output_file"
   python3 -m sglang.benchmark.serving --backend sglang --host "$HOST" --port "$PORT" \
     --dataset-name sharegpt --dataset-path "$OUT/sharegpt_first_${NUM_PROMPTS}.json" \
-    --num-prompts "$NUM_PROMPTS" --max-concurrency 1 --seed 0 "${output_args[@]}" \
+    --num-prompts "$NUM_PROMPTS" --max-concurrency 1 --seed 0 \
+    --output-file "$output_file" --output-details \
     >"$OUT/k$k/client_${mode}.log" 2>"$OUT/k$k/client_${mode}.err"
 }
 

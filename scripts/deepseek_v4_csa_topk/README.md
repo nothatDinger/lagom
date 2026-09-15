@@ -48,7 +48,11 @@ There are two server launches per K:
    `sglang.benchmark.serving`.
 2. **trace** disables CUDA graphs and enables the intrusive H2D probe. The probe
    times each layer's cache-miss copy with CUDA events and records actual miss
-   entries per request. Its synchronized TPOT is deliberately discarded.
+   entries per request. Its synchronized TPOT is deliberately discarded. The
+   client result is still written to `benchmark_trace.jsonl`; explicitly giving
+   both passes an absolute output path prevents `bench_serving` from attempting
+   to create its default `sglang_<date>_*.jsonl` in gpuq's read-only working
+   directory.
 
 Mean H2D latency is the mean, over decode steps, of the sum of all layer copy
 times. `H2D / TPOT` uses milliseconds divided by milliseconds. The transfer
