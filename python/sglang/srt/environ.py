@@ -450,6 +450,9 @@ class Envs:
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
+    # JSONL destination for the intrusive HiSparse H2D experiment probe.
+    # The probe synchronizes CUDA and must never be enabled in production runs.
+    SGLANG_HISPARSE_H2D_TRACE_PATH = EnvStr("")
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.

@@ -1,6 +1,8 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
+import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, NamedTuple, Optional, Tuple, Union
 
@@ -263,6 +265,9 @@ class HiSparseCoordinator:
         # Timing probe: skip the host->device KV bytes to measure the "IO is
         # free" floor. Produces garbage output; benchmarking only.
         self.skip_io = envs.SGLANG_DEBUG_HISPARSE_SKIP_IO.get()
+        self._h2d_trace_path = envs.SGLANG_HISPARSE_H2D_TRACE_PATH.get()
+        self._h2d_trace_step = 0
+        self._h2d_trace_last_seq_len = -1
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
         self.is_dsv4_hisparse = isinstance(
@@ -1187,9 +1192,9 @@ class HiSparseCoordinator:
         Returns:
             Device KV cache indices for the selected tokens.  Shape: (num_reqs, top_k)
         """
-        assert not self.is_dsv4_hisparse, (
-            "naive_load_topk is not implemented for dsv4 hisparse"
-        )
+        assert (
+            not self.is_dsv4_hisparse
+        ), "naive_load_topk is not implemented for dsv4 hisparse"
         num_reqs = req_pool_indices.size(0)
         top_k_indices = torch.full(
             (num_reqs, self.top_k), -1, dtype=torch.int32, device=self.device
@@ -1204,9 +1209,9 @@ class HiSparseCoordinator:
             req_idx = int(req_pool_indices[i].item())
             selected_tokens = top_k_tokens[i, :top_n].to(dtype=torch.int64)
 
-            assert torch.all(selected_tokens >= 0), (
-                f"Req {req_idx}: selected tokens contain negative positions"
-            )
+            assert torch.all(
+                selected_tokens >= 0
+            ), f"Req {req_idx}: selected tokens contain negative positions"
             assert torch.all(selected_tokens < seq_len), (
                 f"Req {req_idx}: selected tokens {selected_tokens.tolist()} "
                 f"out of range for seq_len={seq_len}"
@@ -1905,9 +1910,11 @@ class HiSparseCoordinator:
                 self._submit_previous_prefetch(
                     req_pool_indices,
                     compressed_seq_lens,
-                    top_k_result
-                    if prefetch_candidates is None
-                    else prefetch_candidates,
+                    (
+                        top_k_result
+                        if prefetch_candidates is None
+                        else prefetch_candidates
+                    ),
                     layer_id,
                 )
             elif self.prefetcher_name == "ema" and prefetch_candidates is not None:
@@ -1999,6 +2006,11 @@ class HiSparseCoordinator:
             skip_io=True,
             verify_width=verify_width,
         )
+        trace_this_call = bool(self._h2d_trace_path)
+        if trace_this_call:
+            h2d_start = device_module.Event(enable_timing=True)
+            h2d_end = device_module.Event(enable_timing=True)
+            h2d_start.record()
         copy_cache_planned_mla(
             miss_src=miss_src,
             miss_dst=miss_dst,
@@ -2011,6 +2023,35 @@ class HiSparseCoordinator:
             is_dsv4_layout=True,
             skip_io=self.skip_io,
         )
+        if trace_this_call:
+            h2d_end.record()
+            h2d_end.synchronize()
+            # This intentionally synchronizes and copies the counters to host.
+            # Use a separate profiling pass; never use its TPOT as the result.
+            counts = miss_count.to(device="cpu", dtype=torch.int64).tolist()
+            # The supplied experiment uses concurrency=1. A reused request-pool
+            # slot is detected by its compressed sequence length moving back.
+            current_seq_len = int(compressed_seq_lens.reshape(-1)[0].item())
+            if layer_id == 0 and current_seq_len <= self._h2d_trace_last_seq_len:
+                self._h2d_trace_step = 0
+            record = {
+                "decode_step": self._h2d_trace_step,
+                "layer_id": layer_id,
+                "h2d_ms": h2d_start.elapsed_time(h2d_end),
+                "miss_tokens_per_request": counts,
+                "num_requests": num_reqs,
+                "verify_width": verify_width,
+                "top_k": self.top_k,
+                "item_size_bytes": self.item_size_bytes,
+            }
+            trace_path = f"{self._h2d_trace_path}.tp{torch.distributed.get_rank(group=self.tp_group)}.jsonl"
+            os.makedirs(os.path.dirname(trace_path) or ".", exist_ok=True)
+            with open(trace_path, "a", encoding="utf-8") as trace_file:
+                trace_file.write(json.dumps(record) + "\n")
+            if layer_id == self.mem_pool_device.layer_num - 1:
+                self._h2d_trace_step += 1
+            if layer_id == 0:
+                self._h2d_trace_last_seq_len = current_seq_len
         return output_buffer
 
     def swap_in_selected_pages_spec(
