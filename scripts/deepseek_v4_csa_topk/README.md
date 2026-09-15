@@ -25,6 +25,23 @@ fail during CUDA graph capture with `AssertionError: Hidden size mismatch`.
 Override the variable only when the selected checkpoint and installed backend
 are known to use a different compatible weight layout.
 
+### Deterministic mode and the MXFP4 runner
+
+`--enable-deterministic-inference` and
+`--moe-runner-backend=flashinfer_mxfp4` are compatible configuration options in
+this SGLang tree: deterministic-mode argument resolution changes the sampling,
+attention, and collective choices but does not replace or reject the explicitly
+selected MoE runner. The MXFP4 implementation dispatches separately on SM90,
+SM100, and SM120. On SM90 it requires FlashInfer with the mixed-input MXFP4
+helpers (FlashInfer PR #3084, version 0.6.11 or newer); a missing helper produces
+an explicit startup error rather than silently falling back to Triton.
+
+Here, "compatible" means the server supports and can launch the combination; it
+does not mean results from different GPU architectures or different FlashInfer
+versions are bitwise identical. Compare deterministic and non-deterministic runs
+only on the same node, container, checkpoint, and backend version. Check
+`run_config.txt` and the server log before using the measurements.
+
 There are two server launches per K:
 
 1. **perf** uses normal CUDA graphs and supplies the reported mean TPOT from

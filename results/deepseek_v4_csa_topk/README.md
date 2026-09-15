@@ -21,3 +21,5 @@ DSpark draft head, so the experiment does not require a separate draft-model pat
 The launch command also disables the radix cache, as required by HiSparse.
 For the FP4 0731 checkpoint it defaults to the `flashinfer_mxfp4` MoE runner;
 `run_config.txt` records the selected runner for later diagnosis.
+This runner can be selected together with deterministic inference, but comparisons
+must keep the GPU architecture and FlashInfer/SGLang versions fixed.
