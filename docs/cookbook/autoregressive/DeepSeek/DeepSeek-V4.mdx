@@ -614,6 +614,9 @@ Pass the model and dataset paths only through environment variables. Tune other 
 export MODEL_PATH=deepseek-ai/DeepSeek-V4-Flash-0731
 export DATASET_PATH=/path/to/ShareGPT_V3_unfiltered_cleaned_split.json
 export DATASET_NAME=sharegpt
+export DATASET_SAMPLING=head
+export DATASET_SAMPLE_SIZE=100
+export NUM_PROMPTS=100
 
 bash scripts/dspark_filter_experiment/profile_sps.sh
 bash scripts/dspark_filter_experiment/run_experiment.sh
@@ -631,7 +634,9 @@ gpuq <site allocation flags> -- \
 
 GPUQ flags differ between clusters, so replace `<site allocation flags>` with your installation's GPU count, queue, and timeout flags. If GPUQ already exports the variables, submit only the payload script. Set `EXPERIMENT_ENV_SETUP_SCRIPT` to a shell script when the non-interactive job must activate a virtual environment. The payload prints `CUDA_VISIBLE_DEVICES`, changes to the repository root, profiles SPS, runs all repetitions, and leaves every artifact under `results/dspark_filter_experiment`.
 
-The SPS table is required for a meaningful dynamic boundary; an uninitialized table degenerates to verify-all. The scripts restart the server for every run, remove stale JSONL output, use seeds starting at `BASE_SEED`, and keep all other settings fixed. Override `TP_SIZE`, `RUN_COUNT`, `NUM_PROMPTS`, `MAX_CONCURRENCY`, `REQUEST_RATE`, or `EDGE_MARGIN` before running. Use `EXTRA_SERVER_ARGS`, `EXTRA_SPS_ARGS`, and `EXTRA_BENCH_ARGS` for flags without dedicated variables; for example, export `EXTRA_SERVER_ARGS="--enable-hisparse"` to collect DeepSeek-V4 CSA misses.
+The SPS table is required for a meaningful dynamic boundary; an uninitialized table degenerates to verify-all. `DATASET_SAMPLING=head` selects the first `DATASET_SAMPLE_SIZE` rows before starting any repetition, so the example always tests the same first 100 ShareGPT records. Set it to `random` for a reproducible sample controlled by `DATASET_SAMPLE_SEED`, or `all` to use the complete JSON array. The prepared dataset is saved under `results/dspark_filter_experiment/datasets`.
+
+The scripts restart the server for every run, remove stale JSONL output, use request seeds starting at `BASE_SEED`, and keep all other settings fixed. Override `TP_SIZE`, `RUN_COUNT`, `NUM_PROMPTS`, `MAX_CONCURRENCY`, `REQUEST_RATE`, or `EDGE_MARGIN` before running. Use `EXTRA_SERVER_ARGS`, `EXTRA_SPS_ARGS`, and `EXTRA_BENCH_ARGS` for flags without dedicated variables; for example, export `EXTRA_SERVER_ARGS="--enable-hisparse"` to collect DeepSeek-V4 CSA misses.
 
 After the workload finishes, the experiment script automatically summarizes every repetition with this equivalent command:
 

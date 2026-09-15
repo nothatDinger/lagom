@@ -18,6 +18,15 @@ fi
 mkdir -p "${RESULTS_ROOT}/raw" "${RESULTS_ROOT}/logs" "${RESULTS_ROOT}/bench" "${RESULTS_ROOT}/reports"
 trap stop_server EXIT INT TERM
 
+dataset_for_run="${RESULTS_ROOT}/datasets/${DATASET_NAME}-${DATASET_SAMPLING}-${DATASET_SAMPLE_SIZE}.json"
+python "${SCRIPT_DIR}/prepare_dataset.py" \
+  --input "${DATASET_PATH}" \
+  --output "${dataset_for_run}" \
+  --strategy "${DATASET_SAMPLING}" \
+  --size "${DATASET_SAMPLE_SIZE}" \
+  --seed "${DATASET_SAMPLE_SEED}" \
+  2>&1 | tee "${RESULTS_ROOT}/logs/dataset-preparation.log"
+
 records=()
 for ((run = 1; run <= RUN_COUNT; run++)); do
   record_path="${RESULTS_ROOT}/raw/run-${run}.jsonl"
@@ -38,7 +47,7 @@ for ((run = 1; run <= RUN_COUNT; run++)); do
     --base-url "http://${HOST}:${PORT}" \
     --model "${MODEL_PATH}" \
     --dataset-name "${DATASET_NAME}" \
-    --dataset-path "${DATASET_PATH}" \
+    --dataset-path "${dataset_for_run}" \
     --num-prompts "${NUM_PROMPTS}" \
     --max-concurrency "${MAX_CONCURRENCY}" \
     --request-rate "${REQUEST_RATE}" \

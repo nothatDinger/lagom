@@ -7,7 +7,12 @@ export PORT="${PORT:-30000}"
 export HOST="${HOST:-127.0.0.1}"
 export MOE_RUNNER_BACKEND="${MOE_RUNNER_BACKEND:-flashinfer_mxfp4}"
 export DATASET_NAME="${DATASET_NAME:-sharegpt}"
-export NUM_PROMPTS="${NUM_PROMPTS:-1000}"
+# Dataset rows are selected once before all repetitions. Use "head" to take the
+# first N source rows, "random" for a seeded sample, or "all" to pass it through.
+export DATASET_SAMPLING="${DATASET_SAMPLING:-head}"
+export DATASET_SAMPLE_SIZE="${DATASET_SAMPLE_SIZE:-100}"
+export DATASET_SAMPLE_SEED="${DATASET_SAMPLE_SEED:-42}"
+export NUM_PROMPTS="${NUM_PROMPTS:-${DATASET_SAMPLE_SIZE}}"
 export MAX_CONCURRENCY="${MAX_CONCURRENCY:-32}"
 export REQUEST_RATE="${REQUEST_RATE:-inf}"
 export RUN_COUNT="${RUN_COUNT:-3}"
