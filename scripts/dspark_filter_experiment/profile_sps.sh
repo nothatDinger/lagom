@@ -10,6 +10,10 @@ mkdir -p "${RESULTS_ROOT}/sps" "${RESULTS_ROOT}/logs"
 trap stop_server EXIT INT TERM
 
 export SGLANG_DSPARK_ENABLE_SPS_RECORD=1
+# SPS measures serving cost rather than model acceptance. Advancing every request
+# by exactly the bonus token keeps the KV-length distribution deterministic; the
+# profiler validates this value through /server_info before starting a sweep.
+export SGLANG_SIMULATE_ACC_LEN=1.0
 start_server static "${RESULTS_ROOT}/logs/sps-server.log"
 
 # shellcheck disable=SC2206

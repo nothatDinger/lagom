@@ -74,3 +74,9 @@ The harness sends SIGTERM and waits up to `SERVER_STOP_TIMEOUT_SECONDS` (default
 semaphores and shared memory. A `resource_tracker` leak warning is usually a
 shutdown symptom; inspect the server-log tail printed immediately before it to
 find the startup failure, such as an OOM, missing model, or insufficient GPUs.
+
+`profile_sps.sh` automatically starts its server with both required profiling
+variables: `SGLANG_DSPARK_ENABLE_SPS_RECORD=1` and
+`SGLANG_SIMULATE_ACC_LEN=1.0`. Do not override the latter for SPS profiling. The
+setting is scoped to the profiling subprocess and is not inherited by the later
+filter-boundary runs, which must use real target-model acceptance.

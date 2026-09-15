@@ -640,6 +640,8 @@ The scripts restart the server for every run, remove stale JSONL output, use req
 
 DeepSeek-V4 cold startup can exceed 15 minutes while loading weights, autotuning, and capturing graphs. The scripts wait 30 minutes by default; set `SERVER_READY_TIMEOUT_SECONDS=3600` for a one-hour limit. On an early exit or timeout they print the last 200 server-log lines, which contain the actionable error hidden by the old generic health-check message. Shutdown sends SIGTERM and waits up to 120 seconds before SIGKILL so multiprocessing workers can release semaphores and shared memory. Treat Python `resource_tracker` leaked-semaphore/shared-memory warnings as shutdown symptoms and inspect the preceding server-log tail for the root cause.
 
+The SPS profiler requires its server to report exactly `SGLANG_SIMULATE_ACC_LEN=1.0`; `profile_sps.sh` now exports that value automatically together with `SGLANG_DSPARK_ENABLE_SPS_RECORD=1`. Both variables are scoped to the profiling script, so the subsequent filter-boundary runs still measure real acceptance rather than simulated acceptance.
+
 After the workload finishes, the experiment script automatically summarizes every repetition with this equivalent command:
 
 ```bash Command
