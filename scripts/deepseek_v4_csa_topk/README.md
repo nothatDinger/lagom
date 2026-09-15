@@ -5,7 +5,7 @@
 The controlled variable is CSA `top_k`: 512, 1024, 2048, and 4096. Every group
 uses the deterministic first `NUM_PROMPTS` records from the ShareGPT JSON array
 (100 by default), seed 0, and concurrency 1. The DSpark verify width is
-`DSPARK_BLOCK_SIZE + 1`; consequently the resident HiSparse buffer is set to
+`DSPARK_BLOCK_SIZE + 1` (the 0731 checkpoint default is 5 + 1); consequently the resident HiSparse buffer is set to
 `verify_width * K`, the minimum safe size for a verify window whose Top-K sets
 are disjoint.
 
@@ -33,8 +33,10 @@ source scripts/deepseek_v4_csa_topk/env.example
 gpuq scripts/deepseek_v4_csa_topk/gpuq_entry.sh
 ```
 
-`MODEL_PATH`, `DSPARK_MODEL_PATH`, and `DATASET_PATH` are mandatory environment
-variables. `SERVER_EXTRA_ARGS` is the supported way to add hardware/checkpoint
+`MODEL_PATH` and `DATASET_PATH` are mandatory environment variables. `MODEL_PATH`
+must point to DeepSeek-V4-Flash-0731, whose bundled DSpark draft head is loaded
+from the same checkpoint; do not set `--speculative-draft-model-path`.
+`SERVER_EXTRA_ARGS` is the supported way to add hardware/checkpoint
 specific SGLang flags without editing the experiment. Run one gpuq allocation
 with enough GPUs for `TP_SIZE`; do not run the four groups as independent jobs,
 because sequential execution keeps the machine and software environment fixed.

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-: "${MODEL_PATH:?set MODEL_PATH}" "${DSPARK_MODEL_PATH:?set DSPARK_MODEL_PATH}" "${DATASET_PATH:?set DATASET_PATH}"
+: "${MODEL_PATH:?set MODEL_PATH}" "${DATASET_PATH:?set DATASET_PATH}"
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 OUT=${RESULTS_DIR:-"$ROOT/results/deepseek_v4_csa_topk"}
 HOST=${HOST:-127.0.0.1}; PORT=${PORT:-30000}; TP_SIZE=${TP_SIZE:-8}
-NUM_PROMPTS=${NUM_PROMPTS:-100}; DSPARK_BLOCK_SIZE=${DSPARK_BLOCK_SIZE:-7}
+NUM_PROMPTS=${NUM_PROMPTS:-100}; DSPARK_BLOCK_SIZE=${DSPARK_BLOCK_SIZE:-5}
 mkdir -p "$OUT"
 python3 "$ROOT/scripts/deepseek_v4_csa_topk/sample_sharegpt.py" --input "$DATASET_PATH" --output "$OUT/sharegpt_first_${NUM_PROMPTS}.json" --count "$NUM_PROMPTS"
 
@@ -24,7 +24,7 @@ run_server() {
   env "${trace_env[@]}" python3 -m sglang.launch_server \
     --model-path "$MODEL_PATH" --tp "$TP_SIZE" --host "$HOST" --port "$PORT" \
     --enable-hisparse --hisparse-config "{\"top_k\":$k,\"device_buffer_size\":$(( (DSPARK_BLOCK_SIZE + 1) * k )),\"host_to_device_ratio\":${HOST_TO_DEVICE_RATIO:-5}}" \
-    --speculative-algorithm DSPARK --speculative-draft-model-path "$DSPARK_MODEL_PATH" \
+    --speculative-algorithm DSPARK \
     --speculative-dspark-block-size "$DSPARK_BLOCK_SIZE" "${trace_args[@]}" ${SERVER_EXTRA_ARGS:-} \
     >"$dir/server_${mode}.log" 2>"$dir/server_${mode}.err" &
   server_pid=$!
