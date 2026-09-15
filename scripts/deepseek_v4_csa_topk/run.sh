@@ -3,10 +3,27 @@ set -Eeuo pipefail
 
 : "${MODEL_PATH:?set MODEL_PATH}" "${DATASET_PATH:?set DATASET_PATH}"
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-OUT=${RESULTS_DIR:-"$ROOT/results/deepseek_v4_csa_topk"}
+RESULTS_ROOT=${RESULTS_DIR:-"$ROOT/results/deepseek_v4_csa_topk"}
 HOST=${HOST:-127.0.0.1}; PORT=${PORT:-30000}; TP_SIZE=${TP_SIZE:-8}
 NUM_PROMPTS=${NUM_PROMPTS:-100}; DSPARK_BLOCK_SIZE=${DSPARK_BLOCK_SIZE:-5}
+DETERMINISTIC_INFERENCE=${DETERMINISTIC_INFERENCE:-1}
+case "$DETERMINISTIC_INFERENCE" in
+  1|true|TRUE|yes|YES) deterministic_label=det_on; deterministic_args=(--enable-deterministic-inference) ;;
+  0|false|FALSE|no|NO) deterministic_label=det_off; deterministic_args=() ;;
+  *) echo "DETERMINISTIC_INFERENCE must be 1/0, true/false, or yes/no" >&2; exit 2 ;;
+esac
+RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date -u +%Y%m%dT%H%M%SZ)}
+run_name="${RUN_TIMESTAMP}_${deterministic_label}"
+OUT="$RESULTS_ROOT/$run_name"
+collision=1
+while [[ -e "$OUT" ]]; do
+  OUT="$RESULTS_ROOT/${run_name}_$collision"
+  ((collision += 1))
+done
 mkdir -p "$OUT"
+printf 'timestamp_utc=%s\ndeterministic_inference=%s\nmodel_path=%s\ndataset_path=%s\n' \
+  "$RUN_TIMESTAMP" "$DETERMINISTIC_INFERENCE" "$MODEL_PATH" "$DATASET_PATH" >"$OUT/run_config.txt"
+ln -sfn "$(basename "$OUT")" "$RESULTS_ROOT/latest"
 python3 "$ROOT/scripts/deepseek_v4_csa_topk/sample_sharegpt.py" --input "$DATASET_PATH" --output "$OUT/sharegpt_first_${NUM_PROMPTS}.json" --count "$NUM_PROMPTS"
 
 server_pid=""
@@ -23,7 +40,7 @@ run_server() {
   fi
   env "${trace_env[@]}" python3 -m sglang.launch_server \
     --model-path "$MODEL_PATH" --tp "$TP_SIZE" --host "$HOST" --port "$PORT" \
-    --enable-deterministic-inference \
+    "${deterministic_args[@]}" \
     --enable-hisparse --hisparse-config "{\"top_k\":$k,\"device_buffer_size\":$(( (DSPARK_BLOCK_SIZE + 1) * k )),\"host_to_device_ratio\":${HOST_TO_DEVICE_RATIO:-5}}" \
     --speculative-algorithm DSPARK \
     --speculative-dspark-block-size "$DSPARK_BLOCK_SIZE" "${trace_args[@]}" ${SERVER_EXTRA_ARGS:-} \

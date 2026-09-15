@@ -4,15 +4,16 @@
 
 The controlled variable is CSA `top_k`: 512, 1024, 2048, and 4096. Every group
 uses the deterministic first `NUM_PROMPTS` records from the ShareGPT JSON array
-(100 by default), seed 0, concurrency 1, and SGLang's
-`--enable-deterministic-inference` mode. The DSpark verify width is
+(100 by default), seed 0, and concurrency 1. SGLang's deterministic inference
+mode is controlled by `DETERMINISTIC_INFERENCE` (enabled by default). The DSpark verify width is
 `DSPARK_BLOCK_SIZE + 1` (the 0731 checkpoint default is 5 + 1); consequently the resident HiSparse buffer is set to
 `verify_width * K`, the minimum safe size for a verify window whose Top-K sets
 are disjoint.
 
-Deterministic inference is enabled for both the performance and trace launches,
-so batch-invariant kernels and deterministic sampling remain identical across
-all four K groups. Do not override this flag through `SERVER_EXTRA_ARGS`.
+The deterministic-inference setting is applied consistently to both the
+performance and trace launches, so all four K groups in one run use the same
+execution mode. Set `DETERMINISTIC_INFERENCE=0` for a non-deterministic control
+run; do not add the corresponding CLI flag through `SERVER_EXTRA_ARGS`.
 
 There are two server launches per K:
 
@@ -29,7 +30,7 @@ this avoids incorrectly multiplying logical token volume by the layer count.
 
 ## Run through gpuq
 
-From the repository root, copy or source `env.example`, set all three required
+From the repository root, copy or source `env.example`, set both required
 path variables, and submit the single entry point with your site's gpuq syntax:
 
 ```bash
@@ -46,23 +47,31 @@ specific SGLang flags without editing the experiment. Run one gpuq allocation
 with enough GPUs for `TP_SIZE`; do not run the four groups as independent jobs,
 because sequential execution keeps the machine and software environment fixed.
 
+Every invocation creates a new directory named
+`YYYYmmddTHHMMSSZ_det_on` or `YYYYmmddTHHMMSSZ_det_off` under
+`results/deepseek_v4_csa_topk`. The `latest` symlink points to the newest run.
+If two jobs use the same timestamp and mode, a numeric suffix prevents overwrite.
+`RUN_TIMESTAMP` can be supplied by a job scheduler to override the UTC timestamp,
+and `RESULTS_DIR` changes the parent directory rather than the individual run
+directory. `run_config.txt` records the mode and input paths used for the run.
+
 ## Monitor and inspect
 
 While the job is active:
 
 ```bash
-tail -F results/deepseek_v4_csa_topk/k*/server_*.err
-tail -F results/deepseek_v4_csa_topk/k*/client_*.err
-tail -F results/deepseek_v4_csa_topk/k*/server_*.log
+tail -F results/deepseek_v4_csa_topk/latest/k*/server_*.err
+tail -F results/deepseek_v4_csa_topk/latest/k*/client_*.err
+tail -F results/deepseek_v4_csa_topk/latest/k*/server_*.log
 ```
 
 After it exits:
 
 ```bash
-cat results/deepseek_v4_csa_topk/REPORT.md
-column -s, -t results/deepseek_v4_csa_topk/summary.csv
-column -s, -t results/deepseek_v4_csa_topk/h2d_tokens_by_step.csv | less
-find results/deepseek_v4_csa_topk -name '*.err' -size +0 -print
+cat results/deepseek_v4_csa_topk/latest/REPORT.md
+column -s, -t results/deepseek_v4_csa_topk/latest/summary.csv
+column -s, -t results/deepseek_v4_csa_topk/latest/h2d_tokens_by_step.csv | less
+find -L results/deepseek_v4_csa_topk/latest -name '*.err' -size +0 -print
 ```
 
 The SVG beside the CSV files is the requested mean per-request H2D-token curve.
