@@ -11,5 +11,7 @@ or `column -s, -t results/deepseek_v4_csa_topk/summary.csv`.
 The performance and trace passes are intentionally separate: the trace probe synchronizes the
 GPU to obtain cache-miss copy latency and counts, so its TPOT is not reported. Each K uses the
 same deterministic first 100 ShareGPT rows and serial request concurrency.
+Both passes enable SGLang deterministic inference so all K groups use the same
+batch-invariant execution mode.
 The DeepSeek-V4-Flash-0731 checkpoint supplies both target weights and its bundled
 DSpark draft head, so the experiment does not require a separate draft-model path.

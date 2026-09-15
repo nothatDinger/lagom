@@ -4,10 +4,15 @@
 
 The controlled variable is CSA `top_k`: 512, 1024, 2048, and 4096. Every group
 uses the deterministic first `NUM_PROMPTS` records from the ShareGPT JSON array
-(100 by default), seed 0, and concurrency 1. The DSpark verify width is
+(100 by default), seed 0, concurrency 1, and SGLang's
+`--enable-deterministic-inference` mode. The DSpark verify width is
 `DSPARK_BLOCK_SIZE + 1` (the 0731 checkpoint default is 5 + 1); consequently the resident HiSparse buffer is set to
 `verify_width * K`, the minimum safe size for a verify window whose Top-K sets
 are disjoint.
+
+Deterministic inference is enabled for both the performance and trace launches,
+so batch-invariant kernels and deterministic sampling remain identical across
+all four K groups. Do not override this flag through `SERVER_EXTRA_ARGS`.
 
 There are two server launches per K:
 

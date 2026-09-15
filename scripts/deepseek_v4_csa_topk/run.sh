@@ -23,6 +23,7 @@ run_server() {
   fi
   env "${trace_env[@]}" python3 -m sglang.launch_server \
     --model-path "$MODEL_PATH" --tp "$TP_SIZE" --host "$HOST" --port "$PORT" \
+    --enable-deterministic-inference \
     --enable-hisparse --hisparse-config "{\"top_k\":$k,\"device_buffer_size\":$(( (DSPARK_BLOCK_SIZE + 1) * k )),\"host_to_device_ratio\":${HOST_TO_DEVICE_RATIO:-5}}" \
     --speculative-algorithm DSPARK \
     --speculative-dspark-block-size "$DSPARK_BLOCK_SIZE" "${trace_args[@]}" ${SERVER_EXTRA_ARGS:-} \
