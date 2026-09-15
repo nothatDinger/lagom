@@ -20,6 +20,10 @@ export BASE_SEED="${BASE_SEED:-42}"
 export EDGE_MARGIN="${EDGE_MARGIN:-0.02}"
 export SPS_MAX_BATCH_SIZE="${SPS_MAX_BATCH_SIZE:-256}"
 export SPS_REPEATS="${SPS_REPEATS:-3}"
+# DeepSeek-V4 cold starts can spend more than 15 minutes loading weights,
+# autotuning kernels, and capturing graphs.
+export SERVER_READY_TIMEOUT_SECONDS="${SERVER_READY_TIMEOUT_SECONDS:-1800}"
+export SERVER_STOP_TIMEOUT_SECONDS="${SERVER_STOP_TIMEOUT_SECONDS:-120}"
 
 # Optional whitespace-separated arguments. Prefer dedicated variables above.
 export EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-}"

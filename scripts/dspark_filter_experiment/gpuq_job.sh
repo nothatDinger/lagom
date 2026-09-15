@@ -15,6 +15,15 @@ cd "${REPO_ROOT}"
 echo "GPU allocation: ${CUDA_VISIBLE_DEVICES:-not set}"
 echo "Results: ${RESULTS_ROOT:-${REPO_ROOT}/results/dspark_filter_experiment}"
 
+if [[ "${CUDA_VISIBLE_DEVICES:-}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+  IFS=, read -r -a visible_gpus <<<"${CUDA_VISIBLE_DEVICES}"
+  requested_tp="${TP_SIZE:-4}"
+  if ((${#visible_gpus[@]} < requested_tp)); then
+    echo "error: TP_SIZE=${requested_tp}, but GPUQ exposed only ${#visible_gpus[@]} GPUs (${CUDA_VISIBLE_DEVICES})" >&2
+    exit 2
+  fi
+fi
+
 # GPUQ normally starts a non-interactive shell. Activate the serving environment
 # here when the queue image does not already contain sglang.
 if [[ -n "${EXPERIMENT_ENV_SETUP_SCRIPT:-}" ]]; then

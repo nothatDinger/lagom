@@ -638,6 +638,8 @@ The SPS table is required for a meaningful dynamic boundary; an uninitialized ta
 
 The scripts restart the server for every run, remove stale JSONL output, use request seeds starting at `BASE_SEED`, and keep all other settings fixed. Override `TP_SIZE`, `RUN_COUNT`, `NUM_PROMPTS`, `MAX_CONCURRENCY`, `REQUEST_RATE`, or `EDGE_MARGIN` before running. Use `EXTRA_SERVER_ARGS`, `EXTRA_SPS_ARGS`, and `EXTRA_BENCH_ARGS` for flags without dedicated variables; for example, export `EXTRA_SERVER_ARGS="--enable-hisparse"` to collect DeepSeek-V4 CSA misses.
 
+DeepSeek-V4 cold startup can exceed 15 minutes while loading weights, autotuning, and capturing graphs. The scripts wait 30 minutes by default; set `SERVER_READY_TIMEOUT_SECONDS=3600` for a one-hour limit. On an early exit or timeout they print the last 200 server-log lines, which contain the actionable error hidden by the old generic health-check message. Shutdown sends SIGTERM and waits up to 120 seconds before SIGKILL so multiprocessing workers can release semaphores and shared memory. Treat Python `resource_tracker` leaked-semaphore/shared-memory warnings as shutdown symptoms and inspect the preceding server-log tail for the root cause.
+
 After the workload finishes, the experiment script automatically summarizes every repetition with this equivalent command:
 
 ```bash Command

@@ -57,3 +57,20 @@ export DATASET_SAMPLING=head
 export DATASET_SAMPLE_SIZE=100
 export NUM_PROMPTS=100
 ```
+
+## Startup timeout and diagnostics
+
+DeepSeek-V4 may need more than 15 minutes for a cold start. The harness waits
+30 minutes by default; override `SERVER_READY_TIMEOUT_SECONDS` when required.
+When the process exits early or misses the deadline, the job prints the final
+200 lines of the corresponding file under `results/dspark_filter_experiment/logs`.
+
+```bash
+export SERVER_READY_TIMEOUT_SECONDS=3600
+```
+
+The harness sends SIGTERM and waits up to `SERVER_STOP_TIMEOUT_SECONDS` (default
+120 seconds) before SIGKILL. This lets SGLang's multiprocessing workers release
+semaphores and shared memory. A `resource_tracker` leak warning is usually a
+shutdown symptom; inspect the server-log tail printed immediately before it to
+find the startup failure, such as an OOM, missing model, or insufficient GPUs.
