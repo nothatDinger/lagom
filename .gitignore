@@ -276,6 +276,7 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 *.ply
 *.npz
 artifacts/
+results/
 .claude/scheduled_tasks.lock
 .humanize/
 
