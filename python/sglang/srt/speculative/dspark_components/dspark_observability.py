@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
 import statistics
@@ -495,7 +496,6 @@ def _format_float(value: float, digits: int = 4) -> str:
 
 
 class PerPositionConfidenceMetrics:
-
     def __init__(
         self,
         *,
@@ -655,7 +655,6 @@ class PerPositionConfidenceMetrics:
 
 
 class ConfidenceMetricsProbe:
-
     def __init__(
         self,
         *,
@@ -744,6 +743,7 @@ class DsparkStepObservers:
         self._gamma = int(gamma)
         self._verify_num_draft_tokens = int(verify_num_draft_tokens)
         self._simulate_acc_len = float(simulate_acc_len)
+        self._tp_rank = int(tp_rank)
 
         self._confidence_probe = ConfidenceMetricsProbe(
             gamma=gamma,
@@ -770,6 +770,7 @@ class DsparkStepObservers:
             )
         self._sts_collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
         self._sts_recorder: Optional[StsDataRecorder] = None
+        self._filter_experiment_path = envs.SGLANG_DSPARK_FILTER_EXPERIMENT_PATH.get()
 
     # --- step lifecycle -------------------------------------------------
 
@@ -838,8 +839,17 @@ class DsparkStepObservers:
         req_pool_indices: torch.Tensor,
         verify_tier_num_tokens: int,
         dp_tier_num_tokens: Optional[int],
+        csa_cache_miss: Optional[torch.Tensor] = None,
     ) -> None:
         planner = self._planner
+        self._record_filter_experiment(
+            forward_ct=forward_ct,
+            reqs=reqs,
+            confidence=confidence,
+            layout=layout,
+            correct_len=correct_len,
+            csa_cache_miss=csa_cache_miss,
+        )
         if not proposal_folded:
             self._maybe_record_sts_collect(
                 verify_ids_2d=verify_ids_2d,
@@ -927,6 +937,52 @@ class DsparkStepObservers:
                     rids=[req.rid for req in reqs],
                 )
             )
+
+    def _record_filter_experiment(
+        self, *, forward_ct, reqs, confidence, layout, correct_len, csa_cache_miss
+    ) -> None:
+        """Append one self-contained JSONL row per candidate token.
+
+        Collection is deliberately opt-in: converting these small tensors to host
+        values synchronizes the decode stream and is intended for experiments, not
+        production serving. Run cap-accept mode to obtain counterfactual labels
+        for tokens that compact mode would otherwise remove.
+        """
+        if not self._filter_experiment_path or confidence is None or self._tp_rank != 0:
+            return
+        survival = torch.cumprod(confidence.float(), dim=1).cpu()
+        conf = confidence.float().cpu()
+        accepted = correct_len.to("cpu")
+        miss_rates = csa_cache_miss.to("cpu") if csa_cache_miss is not None else None
+        verify_lens = layout.verify_lens.to("cpu") if layout is not None else None
+        with open(self._filter_experiment_path, "a", encoding="utf-8") as output:
+            for row, req in enumerate(reqs):
+                kept = (
+                    self._gamma
+                    if verify_lens is None
+                    else max(0, int(verify_lens[row]) - 1)
+                )
+                threshold = (
+                    None
+                    if kept <= 0 or kept >= self._gamma
+                    else (float(survival[row, kept - 1]) + float(survival[row, kept]))
+                    / 2
+                )
+                for pos in range(self._gamma):
+                    record = {
+                        "forward_ct": int(forward_ct),
+                        "rid": req.rid,
+                        "position": pos,
+                        "confidence": float(conf[row, pos]),
+                        "survival": float(survival[row, pos]),
+                        "threshold": threshold,
+                        "kept": pos < kept,
+                        "accepted_by_target": pos < int(accepted[row]),
+                        "csa_cache_miss_rate": (
+                            None if miss_rates is None else float(miss_rates[row])
+                        ),
+                    }
+                    output.write(json.dumps(record, separators=(",", ":")) + "\n")
 
     def _maybe_record_sts_collect(
         self,
