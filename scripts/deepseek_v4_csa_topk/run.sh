@@ -3,7 +3,8 @@ set -Eeuo pipefail
 
 : "${MODEL_PATH:?set MODEL_PATH}" "${DATASET_PATH:?set DATASET_PATH}"
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-RESULTS_ROOT=${RESULTS_DIR:-"$ROOT/results/deepseek_v4_csa_topk"}
+RESULTS_DIR=${RESULTS_DIR:-"$ROOT/results"}
+RESULTS_ROOT="$RESULTS_DIR/deepseek_v4_csa_topk"
 HOST=${HOST:-127.0.0.1}; PORT=${PORT:-30000}; TP_SIZE=${TP_SIZE:-8}
 NUM_PROMPTS=${NUM_PROMPTS:-100}; DSPARK_BLOCK_SIZE=${DSPARK_BLOCK_SIZE:-5}
 MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-flashinfer_mxfp4}
@@ -29,9 +30,10 @@ while [[ -e "$OUT" ]]; do
   ((collision += 1))
 done
 mkdir -p "$OUT"
-printf 'timestamp_utc=%s\ndeterministic_inference=%s\nmodel_path=%s\ndataset_path=%s\nmoe_runner_backend=%s\nmem_fraction_static=%s\npytorch_cuda_alloc_conf=%s\n' \
+printf 'timestamp_utc=%s\ndeterministic_inference=%s\nmodel_path=%s\ndataset_path=%s\nresults_dir=%s\nmoe_runner_backend=%s\nmem_fraction_static=%s\npytorch_cuda_alloc_conf=%s\n' \
   "$RUN_TIMESTAMP" "$DETERMINISTIC_INFERENCE" "$MODEL_PATH" "$DATASET_PATH" \
-  "$MOE_RUNNER_BACKEND" "$MEM_FRACTION_STATIC" "$PYTORCH_CUDA_ALLOC_CONF" \
+  "$RESULTS_DIR" "$MOE_RUNNER_BACKEND" "$MEM_FRACTION_STATIC" \
+  "$PYTORCH_CUDA_ALLOC_CONF" \
   >"$OUT/run_config.txt"
 ln -sfn "$(basename "$OUT")" "$RESULTS_ROOT/latest"
 python3 "$ROOT/scripts/deepseek_v4_csa_topk/sample_sharegpt.py" --input "$DATASET_PATH" --output "$OUT/sharegpt_first_${NUM_PROMPTS}.json" --count "$NUM_PROMPTS"

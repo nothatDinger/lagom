@@ -101,12 +101,15 @@ because sequential execution keeps the machine and software environment fixed.
 
 Every invocation creates a new directory named
 `YYYYmmddTHHMMSSZ_det_off` under
-`results/deepseek_v4_csa_topk`. The `latest` symlink points to the newest run.
+`$RESULTS_DIR/deepseek_v4_csa_topk`. `RESULTS_DIR` defaults to the repository's
+`results` directory and may be set to an absolute output directory before the
+job is submitted. The `latest` symlink points to the newest run.
 If two jobs use the same timestamp and mode, a numeric suffix prevents overwrite.
 `RUN_TIMESTAMP` can be supplied by a job scheduler to override the UTC timestamp,
-and `RESULTS_DIR` changes the parent directory rather than the individual run
-directory. `run_config.txt` records the mode, input paths, MoE runner,
-static-memory fraction, and PyTorch allocator configuration used for the run.
+and `RESULTS_DIR` changes the parent directory rather than the timestamped run
+directory. `run_config.txt` records the mode, input and output paths, MoE
+runner, static-memory fraction, and PyTorch allocator configuration used for
+the run.
 
 ## Monitor and inspect
 
