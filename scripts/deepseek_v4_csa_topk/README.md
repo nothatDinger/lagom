@@ -27,6 +27,24 @@ fail during CUDA graph capture with `AssertionError: Hidden size mismatch`.
 Override the variable only when the selected checkpoint and installed backend
 are known to use a different compatible weight layout.
 
+The runner sets `MEM_FRACTION_STATIC=0.85` rather than allowing the generic
+GPU-memory heuristic to fill nearly all of an 80 GiB device with weights and KV
+cache. This leaves several GiB for the temporary workspace allocated by
+FlashInfer's fused-MoE kernel. If `cutlass_fused_moe` still reports an
+out-of-memory error, lower `MEM_FRACTION_STATIC` (for example, to `0.82`). This
+reduces KV capacity, so do not lower it farther than necessary for the longest
+prompts in the corpus.
+
+Because the benchmark fixes `--max-concurrency 1`, the server also receives
+`--cuda-graph-max-bs-decode 1` by default. Capturing the generic 80 GiB-device
+default up to batch size 512 creates graph-private pools that this experiment
+can never use and may exhaust memory before K=512 starts. Override
+`CUDA_GRAPH_MAX_BS_DECODE` only if the benchmark concurrency is raised. The
+runner deliberately does not force `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`:
+the observed graph-capture failure had only about 115 MiB reserved-but-unused
+but 4.32 GiB in graph-private pools, so it was capacity exhaustion rather than
+allocator fragmentation.
+
 ### Deterministic mode and the MXFP4 runner
 
 The reported error is an attention-backend incompatibility, not an MXFP4 MoE
@@ -91,12 +109,14 @@ because sequential execution keeps the machine and software environment fixed.
 
 Every invocation creates a new directory named
 `YYYYmmddTHHMMSSZ_det_off` under
-`results/deepseek_v4_csa_topk`. The `latest` symlink points to the newest run.
+`$RESULTS_DIR/deepseek_v4_csa_topk`. `RESULTS_DIR` defaults to the repository's
+`results` directory and may be set to an absolute output directory before the
+job is submitted. The `latest` symlink points to the newest run.
 If two jobs use the same timestamp and mode, a numeric suffix prevents overwrite.
 `RUN_TIMESTAMP` can be supplied by a job scheduler to override the UTC timestamp,
-and `RESULTS_DIR` changes the parent directory rather than the individual run
-directory. `run_config.txt` records the mode, input paths, and MoE runner used
-for the run.
+and `RESULTS_DIR` changes the parent directory rather than the timestamped run
+directory. `run_config.txt` records the mode, input and output paths, MoE
+runner, static-memory fraction, and decode CUDA graph limit used for the run.
 
 ## Monitor and inspect
 
