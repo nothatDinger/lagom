@@ -14,6 +14,9 @@ groups are skipped and listed in the generated report instead of aborting analys
 Inspect live errors with `tail -f results/deepseek_v4_csa_topk/latest/k*/server_*.err` and
 `tail -f results/deepseek_v4_csa_topk/latest/k*/client_*.err`. After completion, read
 `latest/REPORT.md` or `column -s, -t results/deepseek_v4_csa_topk/latest/summary.csv`.
+Run `scripts/deepseek_v4_csa_topk/status.sh .../latest --watch` on the GPU node
+to combine process, health, file-progress, and GPU-utilization signals when a
+startup log appears to stop advancing.
 
 The performance and trace passes are intentionally separate: the trace probe synchronizes the
 GPU to obtain cache-miss copy latency and counts, so its TPOT is not reported. Each K uses the

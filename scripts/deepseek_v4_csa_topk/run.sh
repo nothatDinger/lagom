@@ -29,11 +29,28 @@ ln -sfn "$(basename "$OUT")" "$RESULTS_ROOT/latest"
 python3 "$ROOT/scripts/deepseek_v4_csa_topk/sample_sharegpt.py" --input "$DATASET_PATH" --output "$OUT/sharegpt_first_${NUM_PROMPTS}.json" --count "$NUM_PROMPTS"
 
 server_pid=""
+current_k="-"; current_mode="setup"; current_state="starting"
+write_state() {
+  local tmp="$OUT/run_state.tmp"
+  printf 'state=%s\nk=%s\nmode=%s\nserver_pid=%s\nupdated_at_utc=%s\n' \
+    "$current_state" "$current_k" "$current_mode" "${server_pid:--}" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$tmp"
+  mv "$tmp" "$OUT/run_state.env"
+}
 cleanup() { [[ -z "$server_pid" ]] || kill "$server_pid" 2>/dev/null || true; }
-trap cleanup EXIT INT TERM
+on_exit() {
+  local status=$?
+  cleanup
+  if (( status == 0 )); then current_state=complete; else current_state=failed; fi
+  write_state
+}
+trap on_exit EXIT
+trap 'exit 130' INT TERM
+write_state
 
 run_server() {
   local k=$1 mode=$2 dir="$OUT/k$1"
+  current_k=$k; current_mode=$mode; current_state=server_starting; write_state
   mkdir -p "$dir"
   local trace_env=() trace_args=()
   if [[ "$mode" == trace ]]; then
@@ -50,8 +67,11 @@ run_server() {
     --speculative-dspark-block-size "$DSPARK_BLOCK_SIZE" "${trace_args[@]}" ${SERVER_EXTRA_ARGS:-} \
     >"$dir/server_${mode}.log" 2>"$dir/server_${mode}.err" &
   server_pid=$!
+  write_state
   for _ in $(seq 1 "${SERVER_WAIT_POLLS:-1800}"); do
-    curl -fsS "http://$HOST:$PORT/health" >/dev/null && return
+    if curl -fsS "http://$HOST:$PORT/health" >/dev/null; then
+      current_state=server_ready; write_state; return
+    fi
     kill -0 "$server_pid" 2>/dev/null || { cat "$dir/server_${mode}.err" >&2; return 1; }
     sleep 2
   done
@@ -66,6 +86,7 @@ benchmark() {
     output_file="$OUT/k$k/benchmark_trace.jsonl"
   fi
   rm -f "$output_file"
+  current_k=$k; current_mode=$mode; current_state=benchmark_running; write_state
   python3 -m sglang.benchmark.serving --backend sglang --host "$HOST" --port "$PORT" \
     --dataset-name sharegpt --dataset-path "$OUT/sharegpt_first_${NUM_PROMPTS}.json" \
     --num-prompts "$NUM_PROMPTS" --max-concurrency 1 --seed 0 \
@@ -78,4 +99,5 @@ for k in 512 1024 2048 4096; do
   run_server "$k" perf; benchmark "$k" perf; cleanup; wait "$server_pid" 2>/dev/null || true; server_pid=""
   run_server "$k" trace; benchmark "$k" trace; cleanup; wait "$server_pid" 2>/dev/null || true; server_pid=""
 done
+current_state=analyzing; current_k="-"; current_mode="analysis"; server_pid=""; write_state
 python3 "$ROOT/scripts/deepseek_v4_csa_topk/analyze.py" --results-dir "$OUT"

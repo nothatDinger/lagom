@@ -92,10 +92,28 @@ for the run.
 While the job is active:
 
 ```bash
+scripts/deepseek_v4_csa_topk/status.sh \
+  results/deepseek_v4_csa_topk/latest --watch
 tail -F results/deepseek_v4_csa_topk/latest/k*/server_*.err
 tail -F results/deepseek_v4_csa_topk/latest/k*/client_*.err
 tail -F results/deepseek_v4_csa_topk/latest/k*/server_*.log
 ```
+
+`status.sh` combines four signals: the saved experiment phase/server PID, the
+HTTP health endpoint, the age/size of the newest log or trace, and per-GPU
+utilization/memory. By default it reports `STUCK-SUSPECTED` (exit code 2) only
+when health is unavailable, no observed file has changed for 1200 seconds, and
+all GPUs are below 10% utilization. Override these conservative thresholds with
+`STALL_THRESHOLD_SEC` and `GPU_BUSY_THRESHOLD`; use `WATCH_INTERVAL_SEC` to
+change the 30-second watch interval. Run it on the allocated GPU node so that
+the recorded PID and `nvidia-smi` refer to the correct host.
+
+The log stopping near `SymmDeviceMemory` does not by itself prove a hang. The
+first 0731/FlashInfer startup can spend 10–15 minutes compiling/autotuning and
+capturing CUDA graphs without frequent log lines. If GPU utilization remains
+nonzero, memory is allocated on all TP ranks, and the server process is alive,
+continue waiting. Treat it as likely stuck when all four monitor signals remain
+negative beyond the threshold; then inspect every `server_*.err`, not only TP0.
 
 After it exits:
 
