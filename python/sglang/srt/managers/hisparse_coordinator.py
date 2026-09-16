@@ -263,6 +263,9 @@ class HiSparseCoordinator:
         # Timing probe: skip the host->device KV bytes to measure the "IO is
         # free" floor. Produces garbage output; benchmarking only.
         self.skip_io = envs.SGLANG_DEBUG_HISPARSE_SKIP_IO.get()
+        self.record_dspark_kv_residency = envs.SGLANG_DSPARK_RECORD_KV_RESIDENCY.get()
+        self._dspark_kv_hits: Optional[torch.Tensor] = None
+        self._dspark_kv_totals: Optional[torch.Tensor] = None
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
         self.is_dsv4_hisparse = isinstance(
@@ -402,6 +405,7 @@ class HiSparseCoordinator:
             dtype=torch.int32,
             device=device,
         )
+
         self._lru_init = torch.arange(
             self.device_buffer_size, dtype=torch.int16, device=device
         )
@@ -664,6 +668,21 @@ class HiSparseCoordinator:
                 self.prefetcher.size,
                 self.top_k,
             )
+
+    def take_dspark_kv_residency(
+        self, *, batch_size: int, verify_width: int
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Return and clear pre-swap CSA residency counts for draft rows."""
+        hits, totals = self._dspark_kv_hits, self._dspark_kv_totals
+        self._dspark_kv_hits = None
+        self._dspark_kv_totals = None
+        expected = batch_size * verify_width
+        if hits is None or totals is None or hits.numel() != expected:
+            return None, None
+        return (
+            hits.view(batch_size, verify_width)[:, 1:],
+            totals.view(batch_size, verify_width)[:, 1:],
+        )
 
     def _init_shared_index_prefetch(
         self,
@@ -2049,6 +2068,39 @@ class HiSparseCoordinator:
         result = output_buffer[: top_k_result.size(0)]
         compressed_seq_lens = compressed_seq_lens.reshape(-1)
 
+        if self.record_dspark_kv_residency:
+            # Measure against the buffer *before* the one-shot planner updates
+            # residency. A row represents the CSA lookup that would be needed
+            # if that verify token were accepted. Aggregate over CSA layers;
+            # analysis can therefore report hits / (top_k * observed_layers).
+            resident = self.req_device_buffer_tokens[layer_id]
+            if verify_lens_cpu is None:
+                width = top_k_result.size(0) // batch_size
+                row_counts = [width] * batch_size
+            else:
+                row_counts = verify_lens_cpu
+            num_rows = sum(row_counts)
+            rows = top_k_result[:num_rows, : self.top_k]
+            valid = rows >= 0
+            hit_parts = []
+            offset = 0
+            for req_idx, row_count in zip(req_pool_indices, row_counts):
+                req_rows = rows[offset : offset + row_count]
+                hit_parts.append(
+                    (torch.isin(req_rows, resident[req_idx]) & (req_rows >= 0)).sum(
+                        dim=-1
+                    )
+                )
+                offset += row_count
+            hits = torch.cat(hit_parts)
+            totals = valid.sum(dim=-1)
+            if self._dspark_kv_hits is None:
+                self._dspark_kv_hits = hits
+                self._dspark_kv_totals = totals
+            else:
+                self._dspark_kv_hits = self._dspark_kv_hits + hits
+                self._dspark_kv_totals = self._dspark_kv_totals + totals
+
         if verify_lens_cpu is None:
             if top_k_result.size(0) % batch_size != 0:
                 raise ValueError(
@@ -2162,6 +2214,9 @@ class HiSparseCoordinator:
         """
         if not self.is_dsv4_hisparse:
             raise RuntimeError("DSPARK HiSparse windows require DeepSeek-V4 C4")
+        if self.record_dspark_kv_residency:
+            self._dspark_kv_hits = None
+            self._dspark_kv_totals = None
         if self._has_pending_dspark_commit:
             # Commit copies may have been issued by another producer stream.
             # A stream dependency preserves overlap without a CPU-wide barrier.
