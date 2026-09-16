@@ -89,6 +89,8 @@ class ReqDetail(msgspec.Struct, omit_defaults=True):
     rid: Optional[str] = None
     confidence: Optional[list[float]] = None
     survival: Optional[list[float]] = None
+    kv_hit_counts: Optional[list[int]] = None
+    kv_topk_counts: Optional[list[int]] = None
 
 
 class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
@@ -133,6 +135,8 @@ class DecodeStepObservation(msgspec.Struct):
     cap_trim_lens: torch.Tensor
     commit_lens: torch.Tensor
     rids: Optional[list[str]]
+    kv_hit_counts: Optional[torch.Tensor] = None
+    kv_topk_counts: Optional[torch.Tensor] = None
 
 
 class _PendingStep(msgspec.Struct):
@@ -329,6 +333,9 @@ class DsparkInfoDumper:
             tensors["verify_lens"] = obs.verify_lens
         if obs.confidence is not None:
             tensors["confidence"] = obs.confidence
+        if obs.kv_hit_counts is not None:
+            tensors["kv_hit_counts"] = obs.kv_hit_counts
+            tensors["kv_topk_counts"] = obs.kv_topk_counts
         return FutureTensors.device_to_host(tensors, d2h_stream=self._d2h_stream)
 
     def _drain_pending(self) -> None:
@@ -450,6 +457,11 @@ class DsparkInfoDumper:
         else:
             conf_rows = None
             survival_rows = None
+        kv_hit_rows = host.get("kv_hit_counts")
+        kv_topk_rows = host.get("kv_topk_counts")
+        if kv_hit_rows is not None:
+            kv_hit_rows = kv_hit_rows.tolist()
+            kv_topk_rows = kv_topk_rows.tolist()
 
         reqs: list[ReqDetail] = []
         for row in range(bs):
@@ -479,6 +491,16 @@ class DsparkInfoDumper:
                         if survival_rows is None
                         else [round(float(p), 4) for p in survival_rows[row]]
                     ),
+                    kv_hit_counts=(
+                        None
+                        if kv_hit_rows is None
+                        else [int(x) for x in kv_hit_rows[row]]
+                    ),
+                    kv_topk_counts=(
+                        None
+                        if kv_topk_rows is None
+                        else [int(x) for x in kv_topk_rows[row]]
+                    ),
                 )
             )
         return reqs
@@ -495,7 +517,6 @@ def _format_float(value: float, digits: int = 4) -> str:
 
 
 class PerPositionConfidenceMetrics:
-
     def __init__(
         self,
         *,
@@ -655,7 +676,6 @@ class PerPositionConfidenceMetrics:
 
 
 class ConfidenceMetricsProbe:
-
     def __init__(
         self,
         *,
@@ -838,6 +858,8 @@ class DsparkStepObservers:
         req_pool_indices: torch.Tensor,
         verify_tier_num_tokens: int,
         dp_tier_num_tokens: Optional[int],
+        kv_hit_counts: Optional[torch.Tensor] = None,
+        kv_topk_counts: Optional[torch.Tensor] = None,
     ) -> None:
         planner = self._planner
         if not proposal_folded:
@@ -925,6 +947,8 @@ class DsparkStepObservers:
                     cap_trim_lens=cap_trim_lens,
                     commit_lens=commit_lens,
                     rids=[req.rid for req in reqs],
+                    kv_hit_counts=kv_hit_counts,
+                    kv_topk_counts=kv_topk_counts,
                 )
             )
 

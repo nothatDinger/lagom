@@ -784,6 +784,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         logits_output.hidden_states = None
 
+        kv_hit_counts = kv_topk_counts = None
+        if hisparse_window is not None:
+            kv_hit_counts, kv_topk_counts = (
+                hisparse_coordinator.take_dspark_kv_residency(
+                    batch_size=bs, verify_width=verify_ids_2d.shape[1]
+                )
+            )
+
         self._observers.observe_verify_step(
             forward_ct=int(batch.forward_iter),
             reqs=batch.reqs,
@@ -805,6 +813,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            kv_hit_counts=kv_hit_counts,
+            kv_topk_counts=kv_topk_counts,
         )
 
         next_draft_input = make_next_draft_input(
