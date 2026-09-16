@@ -9,9 +9,7 @@ HOST=${HOST:-127.0.0.1}; PORT=${PORT:-30000}; TP_SIZE=${TP_SIZE:-8}
 NUM_PROMPTS=${NUM_PROMPTS:-100}; DSPARK_BLOCK_SIZE=${DSPARK_BLOCK_SIZE:-5}
 MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-flashinfer_mxfp4}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.85}
-# Long, variably sized ShareGPT prompts can otherwise fragment the small amount
-# of memory left for FlashInfer's transient fused-MoE workspace.
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+CUDA_GRAPH_MAX_BS_DECODE=${CUDA_GRAPH_MAX_BS_DECODE:-1}
 DETERMINISTIC_INFERENCE=${DETERMINISTIC_INFERENCE:-0}
 case "$DETERMINISTIC_INFERENCE" in
   1|true|TRUE|yes|YES)
@@ -30,10 +28,10 @@ while [[ -e "$OUT" ]]; do
   ((collision += 1))
 done
 mkdir -p "$OUT"
-printf 'timestamp_utc=%s\ndeterministic_inference=%s\nmodel_path=%s\ndataset_path=%s\nresults_dir=%s\nmoe_runner_backend=%s\nmem_fraction_static=%s\npytorch_cuda_alloc_conf=%s\n' \
+printf 'timestamp_utc=%s\ndeterministic_inference=%s\nmodel_path=%s\ndataset_path=%s\nresults_dir=%s\nmoe_runner_backend=%s\nmem_fraction_static=%s\ncuda_graph_max_bs_decode=%s\n' \
   "$RUN_TIMESTAMP" "$DETERMINISTIC_INFERENCE" "$MODEL_PATH" "$DATASET_PATH" \
   "$RESULTS_DIR" "$MOE_RUNNER_BACKEND" "$MEM_FRACTION_STATIC" \
-  "$PYTORCH_CUDA_ALLOC_CONF" \
+  "$CUDA_GRAPH_MAX_BS_DECODE" \
   >"$OUT/run_config.txt"
 ln -sfn "$(basename "$OUT")" "$RESULTS_ROOT/latest"
 python3 "$ROOT/scripts/deepseek_v4_csa_topk/sample_sharegpt.py" --input "$DATASET_PATH" --output "$OUT/sharegpt_first_${NUM_PROMPTS}.json" --count "$NUM_PROMPTS"
@@ -71,6 +69,7 @@ run_server() {
     --model-path "$MODEL_PATH" --tp "$TP_SIZE" --host "$HOST" --port "$PORT" \
     --moe-runner-backend "$MOE_RUNNER_BACKEND" \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
+    --cuda-graph-max-bs-decode "$CUDA_GRAPH_MAX_BS_DECODE" \
     "${deterministic_args[@]}" \
     --enable-hisparse --disable-radix-cache \
     --hisparse-config "{\"top_k\":$k,\"device_buffer_size\":$(( (DSPARK_BLOCK_SIZE + 1) * k )),\"host_to_device_ratio\":${HOST_TO_DEVICE_RATIO:-5}}" \
