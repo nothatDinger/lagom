@@ -51,8 +51,24 @@ There are two server launches per K:
 
 Mean H2D latency is the mean, over decode steps, of the sum of all layer copy
 times. `H2D / TPOT` uses milliseconds divided by milliseconds. The transfer
-curve reports layer-0 cache-miss entries (logical C4 cache tokens) per request;
-this avoids incorrectly multiplying logical token volume by the layer count.
+curve reports the physical copies summed across C4 layers in token-layer entries;
+the CSV also reports the per-layer mean in logical C4 tokens.
+
+If every `h2d_tokens_per_request` value is zero, first check prompt geometry.
+The HiSparse kernel deliberately takes a zero-copy fast path whenever the
+compressed C4 sequence length is no larger than `device_buffer_size`. With
+DSpark this experiment sizes the buffer to `(DSPARK_BLOCK_SIZE + 1) * K`, and
+one C4 entry represents four original tokens. With the default block size 5,
+cache misses therefore require sequences longer than roughly `24 * K` original
+tokens: 12,288 for K=512, 24,576 for K=1024, 49,152 for K=2048, and 98,304 for
+K=4096. Ordinary short ShareGPT conversations can legitimately produce all
+zeros. Use a long-context corpus (while keeping the same deterministic sampling
+rule for every K) when the objective is to exercise H2D misses.
+
+The analyzer now sums miss counts from every layer rather than reading layer 0
+only. It adds a `Sampling diagnostics` warning to `REPORT.md` when all measured
+requests fit in the resident buffer. New traces additionally record
+`device_buffer_size` and compressed sequence lengths for direct verification.
 
 ## Run through gpuq
 

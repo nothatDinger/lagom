@@ -10,6 +10,9 @@ Each K directory retains `benchmark.jsonl` from the perf pass and
 `benchmark_trace.jsonl` from the intrusive trace pass; only perf TPOT is reported.
 If a larger K fails, rerun `analyze.py --results-dir .../latest`; incomplete K
 groups are skipped and listed in the generated report instead of aborting analysis.
+The H2D curve is expressed in token-layer entries summed over C4 layers, with a
+per-layer logical-token mean in the CSV. `Sampling diagnostics` explains an
+all-zero result when every request fits the resident C4 device buffer.
 
 Inspect live errors with `tail -f results/deepseek_v4_csa_topk/latest/k*/server_*.err` and
 `tail -f results/deepseek_v4_csa_topk/latest/k*/client_*.err`. After completion, read

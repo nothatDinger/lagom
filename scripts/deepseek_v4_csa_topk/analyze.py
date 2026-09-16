@@ -25,7 +25,9 @@ def main() -> None:
     root = Path(args.results_dir)
     summary = []
     curves = {}
+    curves_per_layer = {}
     skipped = []
+    diagnostics = []
     for k in args.ks:
         benchmark_path = root / f"k{k}" / "benchmark.jsonl"
         trace_path = root / f"k{k}" / "h2d_trace.tp0.jsonl"
@@ -48,14 +50,30 @@ def main() -> None:
             skipped.append((k, reason))
             print(f"warning: skipping K={k}: {reason}", file=sys.stderr)
             continue
-        # Sum per-layer stalls into a decode-step latency, then average steps.
-        h2d = []
+        # A layer-0 record starts one decode/verify invocation. Aggregate both
+        # latency and physical token-entry copies across every C4 layer.
+        cycles = []
         for row in traces:
             if int(row["layer_id"]) == 0:
-                h2d.append(0.0)
-            if not h2d:
+                cycles.append(
+                    {
+                        "decode_step": int(row["decode_step"]),
+                        "h2d_ms": 0.0,
+                        "misses": [0] * len(row["miss_tokens_per_request"]),
+                        "layers": 0,
+                    }
+                )
+            if not cycles:
                 raise ValueError("trace does not start with layer 0")
-            h2d[-1] += float(row["h2d_ms"])
+            cycles[-1]["h2d_ms"] += float(row["h2d_ms"])
+            cycles[-1]["layers"] += 1
+            counts = row["miss_tokens_per_request"]
+            if len(counts) != len(cycles[-1]["misses"]):
+                raise ValueError("request count changed within one layer cycle")
+            cycles[-1]["misses"] = [
+                total + int(count) for total, count in zip(cycles[-1]["misses"], counts)
+            ]
+        h2d = [cycle["h2d_ms"] for cycle in cycles]
         tpot = float(metric["mean_tpot_ms"])
         summary.append(
             {
@@ -66,12 +84,35 @@ def main() -> None:
             }
         )
         by_step = {}
-        for row in traces:
-            if int(row["layer_id"]) != 0:
-                continue
-            counts = row["miss_tokens_per_request"]
-            by_step.setdefault(int(row["decode_step"]), []).extend(counts)
+        by_step_per_layer = {}
+        for cycle in cycles:
+            step = cycle["decode_step"]
+            by_step.setdefault(step, []).extend(cycle["misses"])
+            by_step_per_layer.setdefault(step, []).extend(
+                count / cycle["layers"] for count in cycle["misses"]
+            )
         curves[k] = {step: sum(vals) / len(vals) for step, vals in by_step.items()}
+        curves_per_layer[k] = {
+            step: sum(vals) / len(vals) for step, vals in by_step_per_layer.items()
+        }
+
+        first = traces[0]
+        buffer_size = int(first.get("device_buffer_size", first["verify_width"] * k))
+        max_tokens = max(
+            (
+                int(inp) + int(out)
+                for inp, out in zip(
+                    metric.get("input_lens", []), metric.get("output_lens", [])
+                )
+            ),
+            default=0,
+        )
+        if max_tokens and (max_tokens + 3) // 4 <= buffer_size:
+            diagnostics.append(
+                f"K={k}: all measured requests fit the C4 device buffer "
+                f"(max sequence ~= {(max_tokens + 3) // 4} C4 entries, "
+                f"buffer={buffer_size}); zero H2D misses are expected."
+            )
 
     if not summary:
         raise SystemExit(
@@ -86,9 +127,19 @@ def main() -> None:
         root / "h2d_tokens_by_step.csv", "w", newline="", encoding="utf-8"
     ) as out:
         writer = csv.writer(out)
-        writer.writerow(["k", "decode_step", "mean_h2d_tokens_per_request"])
+        writer.writerow(
+            [
+                "k",
+                "decode_step",
+                "mean_h2d_token_layer_entries_per_request",
+                "mean_h2d_tokens_per_request_per_layer",
+            ]
+        )
         for k, points in curves.items():
-            writer.writerows((k, step, value) for step, value in sorted(points.items()))
+            writer.writerows(
+                (k, step, value, curves_per_layer[k][step])
+                for step, value in sorted(points.items())
+            )
 
     width, height, pad = 900, 520, 60
     max_x = max((max(points, default=0) for points in curves.values()), default=1) or 1
@@ -102,7 +153,7 @@ def main() -> None:
         '<rect width="100%" height="100%" fill="white"/>',
         f'<path d="M {pad} {pad} V {height-pad} H {width-pad}" fill="none" stroke="black"/>',
         f'<text x="{width/2}" y="{height-12}" text-anchor="middle">Decode step</text>',
-        f'<text x="18" y="{height/2}" transform="rotate(-90 18 {height/2})" text-anchor="middle">Mean H2D transfer per request (tokens)</text>',
+        f'<text x="18" y="{height/2}" transform="rotate(-90 18 {height/2})" text-anchor="middle">Mean H2D transfer per request (token-layer entries)</text>',
     ]
     for color, (k, points) in zip(colors, curves.items()):
         coords = " ".join(
@@ -135,6 +186,12 @@ def main() -> None:
             "\n\n## Incomplete groups\n\n"
             + "\n".join(f"- K={k}: {reason}" for k, reason in skipped)
             if skipped
+            else ""
+        )
+        + (
+            "\n\n## Sampling diagnostics\n\n"
+            + "\n".join(f"- {message}" for message in diagnostics)
+            if diagnostics
             else ""
         )
         + "\n\n![H2D tokens by decode step](h2d_tokens_by_decode_step.svg)\n",

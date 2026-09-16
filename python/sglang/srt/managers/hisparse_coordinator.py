@@ -2032,6 +2032,12 @@ class HiSparseCoordinator:
             # The supplied experiment uses concurrency=1. A reused request-pool
             # slot is detected by its compressed sequence length moving back.
             current_seq_len = int(compressed_seq_lens.reshape(-1)[0].item())
+            if compressed_seq_lens.numel() == num_reqs:
+                seq_lens_per_request = compressed_seq_lens
+            else:
+                seq_lens_per_request = compressed_seq_lens.reshape(
+                    num_reqs, verify_width
+                )[:, 0]
             if layer_id == 0 and current_seq_len <= self._h2d_trace_last_seq_len:
                 self._h2d_trace_step = 0
             record = {
@@ -2043,6 +2049,10 @@ class HiSparseCoordinator:
                 "verify_width": verify_width,
                 "top_k": self.top_k,
                 "item_size_bytes": self.item_size_bytes,
+                "device_buffer_size": self.device_buffer_size,
+                "compressed_seq_lens_per_request": seq_lens_per_request.to(
+                    device="cpu", dtype=torch.int64
+                ).tolist(),
             }
             trace_path = f"{self._h2d_trace_path}.tp{torch.distributed.get_rank(group=self.tp_group)}.jsonl"
             os.makedirs(os.path.dirname(trace_path) or ".", exist_ok=True)
