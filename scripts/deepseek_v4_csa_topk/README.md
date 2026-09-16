@@ -3,8 +3,10 @@
 ## Design
 
 The controlled variable is CSA `top_k`: 512, 1024, 2048, and 4096. Every group
-uses the deterministic first `NUM_PROMPTS` records from the ShareGPT JSON array
-(100 by default), seed 0, and concurrency 1. The DSpark verify width is
+uses the same single 110,000-token random request by default, seed 0, and
+concurrency 1. The long request is intentional: it exceeds the 98,304-token
+threshold at K=4096, so all four groups exercise H2D rather than returning an
+all-zero curve. The DSpark verify width is
 `DSPARK_BLOCK_SIZE + 1` (the 0731 checkpoint default is 5 + 1); consequently the resident HiSparse buffer is set to
 `verify_width * K`, the minimum safe size for a verify window whose Top-K sets
 are disjoint.
@@ -68,9 +70,12 @@ There are two server launches per K:
    directory.
 
 Mean H2D latency is the mean, over decode steps, of the sum of all layer copy
-times. `H2D / TPOT` uses milliseconds divided by milliseconds. The transfer
-curve reports the physical copies summed across C4 layers in token-layer entries;
-the CSV also reports the per-layer mean in logical C4 tokens.
+times. `H2D / TPOT` uses milliseconds divided by milliseconds. Each verify
+transaction now emits a commit record containing its accepted-token count. The
+transfer curve uses the cumulative accepted tokens within that request as its
+x-axis, rather than incorrectly treating the decode-step number as acceptance.
+It reports physical copies summed across C4 layers in token-layer entries; the
+CSV also reports the per-layer mean in logical C4 tokens.
 
 If every `h2d_tokens_per_request` value is zero, first check prompt geometry.
 The HiSparse kernel deliberately takes a zero-copy fast path whenever the
@@ -79,9 +84,11 @@ DSpark this experiment sizes the buffer to `(DSPARK_BLOCK_SIZE + 1) * K`, and
 one C4 entry represents four original tokens. With the default block size 5,
 cache misses therefore require sequences longer than roughly `24 * K` original
 tokens: 12,288 for K=512, 24,576 for K=1024, 49,152 for K=2048, and 98,304 for
-K=4096. Ordinary short ShareGPT conversations can legitimately produce all
-zeros. Use a long-context corpus (while keeping the same deterministic sampling
-rule for every K) when the objective is to exercise H2D misses.
+K=4096. The default `DATASET_NAME=random`, `RANDOM_INPUT_LEN=110000` workload
+satisfies all four thresholds. Setting `DATASET_NAME=sharegpt` restores the
+legacy sampled ShareGPT workload, but ordinary conversations legitimately
+produce all zeros unless the supplied corpus contains prompts above these
+thresholds.
 
 The analyzer now sums miss counts from every layer rather than reading layer 0
 only. It adds a `Sampling diagnostics` warning to `REPORT.md` when all measured
@@ -90,8 +97,8 @@ requests fit in the resident buffer. New traces additionally record
 
 ## Run through gpuq
 
-From the repository root, copy or source `env.example`, set both required
-path variables, and submit the single entry point with your site's gpuq syntax:
+From the repository root, copy or source `env.example`, set `MODEL_PATH`, and
+submit the single entry point with your site's gpuq syntax:
 
 ```bash
 source scripts/deepseek_v4_csa_topk/env.example
@@ -99,9 +106,10 @@ source scripts/deepseek_v4_csa_topk/env.example
 gpuq scripts/deepseek_v4_csa_topk/gpuq_entry.sh
 ```
 
-`MODEL_PATH` and `DATASET_PATH` are mandatory environment variables. `MODEL_PATH`
-must point to DeepSeek-V4-Flash-0731, whose bundled DSpark draft head is loaded
-from the same checkpoint; do not set `--speculative-draft-model-path`.
+`MODEL_PATH` must point to DeepSeek-V4-Flash-0731, whose bundled DSpark draft
+head is loaded from the same checkpoint; do not set
+`--speculative-draft-model-path`. `DATASET_PATH` is required only when
+`DATASET_NAME=sharegpt`.
 `SERVER_EXTRA_ARGS` is the supported way to add hardware/checkpoint
 specific SGLang flags without editing the experiment. Run one gpuq allocation
 with enough GPUs for `TP_SIZE`; do not run the four groups as independent jobs,
@@ -151,7 +159,7 @@ After it exits:
 ```bash
 cat results/deepseek_v4_csa_topk/latest/REPORT.md
 column -s, -t results/deepseek_v4_csa_topk/latest/summary.csv
-column -s, -t results/deepseek_v4_csa_topk/latest/h2d_tokens_by_step.csv | less
+column -s, -t results/deepseek_v4_csa_topk/latest/h2d_tokens_by_accepted_tokens.csv | less
 find -L results/deepseek_v4_csa_topk/latest -name '*.err' -size +0 -print
 ```
 
