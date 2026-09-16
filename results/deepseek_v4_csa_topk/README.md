@@ -5,7 +5,8 @@ Each invocation creates a timestamped `YYYYmmddTHHMMSSZ_det_off` child directory
 and updates the `latest` symlink.
 Timestamp collisions receive a numeric suffix instead of overwriting an older run.
 No measurements are checked in because this checkout has no GPU. The completed job writes
-`summary.csv`, `h2d_tokens_by_step.csv`, `h2d_tokens_by_decode_step.svg`, and `REPORT.md` in that child directory.
+`summary.csv`, `h2d_tokens_by_accepted_tokens.csv`,
+`h2d_tokens_by_accepted_tokens.svg`, and `REPORT.md` in that child directory.
 Each K directory retains `benchmark.jsonl` from the perf pass and
 `benchmark_trace.jsonl` from the intrusive trace pass; only perf TPOT is reported.
 If a larger K fails, rerun `analyze.py --results-dir .../latest`; incomplete K

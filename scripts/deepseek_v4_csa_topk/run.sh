@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-: "${MODEL_PATH:?set MODEL_PATH}" "${DATASET_PATH:?set DATASET_PATH}"
+: "${MODEL_PATH:?set MODEL_PATH}"
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-RESULTS_ROOT=${RESULTS_DIR:-"$ROOT/results/deepseek_v4_csa_topk"}
+RESULTS_DIR=${RESULTS_DIR:-"$ROOT/results"}
+RESULTS_ROOT="$RESULTS_DIR/deepseek_v4_csa_topk"
 HOST=${HOST:-127.0.0.1}; PORT=${PORT:-30000}; TP_SIZE=${TP_SIZE:-8}
-NUM_PROMPTS=${NUM_PROMPTS:-100}; DSPARK_BLOCK_SIZE=${DSPARK_BLOCK_SIZE:-5}
+NUM_PROMPTS=${NUM_PROMPTS:-1}; DSPARK_BLOCK_SIZE=${DSPARK_BLOCK_SIZE:-5}
+DATASET_NAME=${DATASET_NAME:-random}
+RANDOM_INPUT_LEN=${RANDOM_INPUT_LEN:-110000}
+RANDOM_OUTPUT_LEN=${RANDOM_OUTPUT_LEN:-512}
+if [[ "$DATASET_NAME" == sharegpt ]]; then
+  : "${DATASET_PATH:?set DATASET_PATH when DATASET_NAME=sharegpt}"
+fi
 MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-flashinfer_mxfp4}
+MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.85}
+CUDA_GRAPH_MAX_BS_DECODE=${CUDA_GRAPH_MAX_BS_DECODE:-1}
 DETERMINISTIC_INFERENCE=${DETERMINISTIC_INFERENCE:-0}
 case "$DETERMINISTIC_INFERENCE" in
   1|true|TRUE|yes|YES)
@@ -25,11 +34,21 @@ while [[ -e "$OUT" ]]; do
   ((collision += 1))
 done
 mkdir -p "$OUT"
-printf 'timestamp_utc=%s\ndeterministic_inference=%s\nmodel_path=%s\ndataset_path=%s\nmoe_runner_backend=%s\n' \
-  "$RUN_TIMESTAMP" "$DETERMINISTIC_INFERENCE" "$MODEL_PATH" "$DATASET_PATH" \
-  "$MOE_RUNNER_BACKEND" >"$OUT/run_config.txt"
+printf 'timestamp_utc=%s\ndeterministic_inference=%s\nmodel_path=%s\ndataset_name=%s\ndataset_path=%s\nrandom_input_len=%s\nrandom_output_len=%s\nresults_dir=%s\nmoe_runner_backend=%s\nmem_fraction_static=%s\ncuda_graph_max_bs_decode=%s\n' \
+  "$RUN_TIMESTAMP" "$DETERMINISTIC_INFERENCE" "$MODEL_PATH" "$DATASET_NAME" \
+  "${DATASET_PATH:-}" "$RANDOM_INPUT_LEN" "$RANDOM_OUTPUT_LEN" \
+  "$RESULTS_DIR" "$MOE_RUNNER_BACKEND" "$MEM_FRACTION_STATIC" \
+  "$CUDA_GRAPH_MAX_BS_DECODE" \
+  >"$OUT/run_config.txt"
 ln -sfn "$(basename "$OUT")" "$RESULTS_ROOT/latest"
-python3 "$ROOT/scripts/deepseek_v4_csa_topk/sample_sharegpt.py" --input "$DATASET_PATH" --output "$OUT/sharegpt_first_${NUM_PROMPTS}.json" --count "$NUM_PROMPTS"
+benchmark_dataset_args=(--dataset-name random --random-input-len "$RANDOM_INPUT_LEN" --random-output-len "$RANDOM_OUTPUT_LEN" --random-range-ratio 0)
+if [[ "$DATASET_NAME" == sharegpt ]]; then
+  python3 "$ROOT/scripts/deepseek_v4_csa_topk/sample_sharegpt.py" --input "$DATASET_PATH" --output "$OUT/sharegpt_first_${NUM_PROMPTS}.json" --count "$NUM_PROMPTS"
+  benchmark_dataset_args=(--dataset-name sharegpt --dataset-path "$OUT/sharegpt_first_${NUM_PROMPTS}.json")
+elif [[ "$DATASET_NAME" != random ]]; then
+  echo "DATASET_NAME must be random or sharegpt" >&2
+  exit 2
+fi
 
 server_pid=""
 current_k="-"; current_mode="setup"; current_state="starting"
@@ -63,6 +82,8 @@ run_server() {
   env "${trace_env[@]}" python3 -m sglang.launch_server \
     --model-path "$MODEL_PATH" --tp "$TP_SIZE" --host "$HOST" --port "$PORT" \
     --moe-runner-backend "$MOE_RUNNER_BACKEND" \
+    --mem-fraction-static "$MEM_FRACTION_STATIC" \
+    --cuda-graph-max-bs-decode "$CUDA_GRAPH_MAX_BS_DECODE" \
     "${deterministic_args[@]}" \
     --enable-hisparse --disable-radix-cache \
     --hisparse-config "{\"top_k\":$k,\"device_buffer_size\":$(( (DSPARK_BLOCK_SIZE + 1) * k )),\"host_to_device_ratio\":${HOST_TO_DEVICE_RATIO:-5}}" \
@@ -91,7 +112,7 @@ benchmark() {
   rm -f "$output_file"
   current_k=$k; current_mode=$mode; current_state=benchmark_running; write_state
   python3 -m sglang.benchmark.serving --backend sglang --host "$HOST" --port "$PORT" \
-    --dataset-name sharegpt --dataset-path "$OUT/sharegpt_first_${NUM_PROMPTS}.json" \
+    "${benchmark_dataset_args[@]}" \
     --num-prompts "$NUM_PROMPTS" --max-concurrency 1 --seed 0 \
     --output-file "$output_file" --output-details \
     >"$OUT/k$k/client_${mode}.log" 2>"$OUT/k$k/client_${mode}.err"

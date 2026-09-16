@@ -268,6 +268,7 @@ class HiSparseCoordinator:
         self._h2d_trace_path = envs.SGLANG_HISPARSE_H2D_TRACE_PATH.get()
         self._h2d_trace_step = 0
         self._h2d_trace_last_seq_len = -1
+        self._h2d_trace_accepted_tokens: Dict[int, int] = {}
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
         self.is_dsv4_hisparse = isinstance(
@@ -1192,9 +1193,9 @@ class HiSparseCoordinator:
         Returns:
             Device KV cache indices for the selected tokens.  Shape: (num_reqs, top_k)
         """
-        assert (
-            not self.is_dsv4_hisparse
-        ), "naive_load_topk is not implemented for dsv4 hisparse"
+        assert not self.is_dsv4_hisparse, (
+            "naive_load_topk is not implemented for dsv4 hisparse"
+        )
         num_reqs = req_pool_indices.size(0)
         top_k_indices = torch.full(
             (num_reqs, self.top_k), -1, dtype=torch.int32, device=self.device
@@ -1209,9 +1210,9 @@ class HiSparseCoordinator:
             req_idx = int(req_pool_indices[i].item())
             selected_tokens = top_k_tokens[i, :top_n].to(dtype=torch.int64)
 
-            assert torch.all(
-                selected_tokens >= 0
-            ), f"Req {req_idx}: selected tokens contain negative positions"
+            assert torch.all(selected_tokens >= 0), (
+                f"Req {req_idx}: selected tokens contain negative positions"
+            )
             assert torch.all(selected_tokens < seq_len), (
                 f"Req {req_idx}: selected tokens {selected_tokens.tolist()} "
                 f"out of range for seq_len={seq_len}"
@@ -2038,8 +2039,11 @@ class HiSparseCoordinator:
                 seq_lens_per_request = compressed_seq_lens.reshape(
                     num_reqs, verify_width
                 )[:, 0]
-            if layer_id == 0 and current_seq_len <= self._h2d_trace_last_seq_len:
+            # C4 length legitimately stays equal while one to three accepted
+            # tokens accumulate. Only a decrease denotes a reused request slot.
+            if layer_id == 0 and current_seq_len < self._h2d_trace_last_seq_len:
                 self._h2d_trace_step = 0
+                self._h2d_trace_accepted_tokens.clear()
             record = {
                 "decode_step": self._h2d_trace_step,
                 "layer_id": layer_id,
@@ -2357,6 +2361,30 @@ class HiSparseCoordinator:
         if window.compressed_locs.numel() == 0:
             return
         commit_cpu = commit_lens.to("cpu").tolist()
+        if getattr(self, "_h2d_trace_path", ""):
+            cumulative = []
+            for req_idx, accepted_tokens in zip(
+                window.req_pool_indices_cpu, commit_cpu
+            ):
+                total = self._h2d_trace_accepted_tokens.get(req_idx, 0) + int(
+                    accepted_tokens
+                )
+                self._h2d_trace_accepted_tokens[req_idx] = total
+                cumulative.append(total)
+            trace_path = f"{self._h2d_trace_path}.tp{torch.distributed.get_rank(group=self.tp_group)}.jsonl"
+            os.makedirs(os.path.dirname(trace_path) or ".", exist_ok=True)
+            with open(trace_path, "a", encoding="utf-8") as trace_file:
+                trace_file.write(
+                    json.dumps(
+                        {
+                            "event": "commit",
+                            "decode_step": max(0, self._h2d_trace_step - 1),
+                            "accepted_tokens": [int(value) for value in commit_cpu],
+                            "cumulative_accepted_tokens": cumulative,
+                        }
+                    )
+                    + "\n"
+                )
         accepted = speculative_accepted_c4_indices(
             window, commit_cpu, self.compress_ratio
         )
