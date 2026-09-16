@@ -7,9 +7,12 @@ RESULTS_ROOT=${RESULTS_DIR:-"$ROOT/results/deepseek_v4_csa_topk"}
 HOST=${HOST:-127.0.0.1}; PORT=${PORT:-30000}; TP_SIZE=${TP_SIZE:-8}
 NUM_PROMPTS=${NUM_PROMPTS:-100}; DSPARK_BLOCK_SIZE=${DSPARK_BLOCK_SIZE:-5}
 MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-flashinfer_mxfp4}
-DETERMINISTIC_INFERENCE=${DETERMINISTIC_INFERENCE:-1}
+DETERMINISTIC_INFERENCE=${DETERMINISTIC_INFERENCE:-0}
 case "$DETERMINISTIC_INFERENCE" in
-  1|true|TRUE|yes|YES) deterministic_label=det_on; deterministic_args=(--enable-deterministic-inference) ;;
+  1|true|TRUE|yes|YES)
+    echo "DETERMINISTIC_INFERENCE=1 is unsupported for DeepSeek V4: the model requires attention_backend=dsv4, but dsv4 is not a supported deterministic attention backend in this SGLang version." >&2
+    exit 2
+    ;;
   0|false|FALSE|no|NO) deterministic_label=det_off; deterministic_args=() ;;
   *) echo "DETERMINISTIC_INFERENCE must be 1/0, true/false, or yes/no" >&2; exit 2 ;;
 esac

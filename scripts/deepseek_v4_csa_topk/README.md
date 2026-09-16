@@ -4,16 +4,18 @@
 
 The controlled variable is CSA `top_k`: 512, 1024, 2048, and 4096. Every group
 uses the deterministic first `NUM_PROMPTS` records from the ShareGPT JSON array
-(100 by default), seed 0, and concurrency 1. SGLang's deterministic inference
-mode is controlled by `DETERMINISTIC_INFERENCE` (enabled by default). The DSpark verify width is
+(100 by default), seed 0, and concurrency 1. The DSpark verify width is
 `DSPARK_BLOCK_SIZE + 1` (the 0731 checkpoint default is 5 + 1); consequently the resident HiSparse buffer is set to
 `verify_width * K`, the minimum safe size for a verify window whose Top-K sets
 are disjoint.
 
-The deterministic-inference setting is applied consistently to both the
-performance and trace launches, so all four K groups in one run use the same
-execution mode. Set `DETERMINISTIC_INFERENCE=0` for a non-deterministic control
-run; do not add the corresponding CLI flag through `SERVER_EXTRA_ARGS`.
+`DETERMINISTIC_INFERENCE` defaults to 0 and must remain disabled for this model
+on the current SGLang version. DeepSeek V4 unconditionally selects the `dsv4`
+attention backend, while deterministic inference accepts only `ascend`, `fa3`,
+`fa4`, `flashinfer`, and `triton`. The runner rejects a true value before model
+startup with an actionable error instead of consuming a GPU allocation and then
+failing in server-argument resolution. Do not add
+`--enable-deterministic-inference` through `SERVER_EXTRA_ARGS`.
 The server always receives `--disable-radix-cache`, which is a mandatory
 HiSparse constraint; omitting it causes SGLang argument validation to fail
 before the model workers start.
@@ -27,20 +29,13 @@ are known to use a different compatible weight layout.
 
 ### Deterministic mode and the MXFP4 runner
 
-`--enable-deterministic-inference` and
-`--moe-runner-backend=flashinfer_mxfp4` are compatible configuration options in
-this SGLang tree: deterministic-mode argument resolution changes the sampling,
-attention, and collective choices but does not replace or reject the explicitly
-selected MoE runner. The MXFP4 implementation dispatches separately on SM90,
-SM100, and SM120. On SM90 it requires FlashInfer with the mixed-input MXFP4
-helpers (FlashInfer PR #3084, version 0.6.11 or newer); a missing helper produces
-an explicit startup error rather than silently falling back to Triton.
-
-Here, "compatible" means the server supports and can launch the combination; it
-does not mean results from different GPU architectures or different FlashInfer
-versions are bitwise identical. Compare deterministic and non-deterministic runs
-only on the same node, container, checkpoint, and backend version. Check
-`run_config.txt` and the server log before using the measurements.
+The reported error is an attention-backend incompatibility, not an MXFP4 MoE
+runner failure. `flashinfer_mxfp4` remains the correct runner for the 0731 FP4
+weights and dispatches separately on SM90, SM100, and SM120. On SM90 it requires
+FlashInfer's mixed-input MXFP4 helpers (PR #3084, version 0.6.11 or newer).
+Deterministic inference cannot be enabled merely by changing the MoE runner;
+SGLang must first add deterministic support for the specialized `dsv4`
+attention backend.
 
 There are two server launches per K:
 
@@ -79,7 +74,7 @@ with enough GPUs for `TP_SIZE`; do not run the four groups as independent jobs,
 because sequential execution keeps the machine and software environment fixed.
 
 Every invocation creates a new directory named
-`YYYYmmddTHHMMSSZ_det_on` or `YYYYmmddTHHMMSSZ_det_off` under
+`YYYYmmddTHHMMSSZ_det_off` under
 `results/deepseek_v4_csa_topk`. The `latest` symlink points to the newest run.
 If two jobs use the same timestamp and mode, a numeric suffix prevents overwrite.
 `RUN_TIMESTAMP` can be supplied by a job scheduler to override the UTC timestamp,
