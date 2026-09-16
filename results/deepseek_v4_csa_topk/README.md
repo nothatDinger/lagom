@@ -8,6 +8,8 @@ No measurements are checked in because this checkout has no GPU. The completed j
 `summary.csv`, `h2d_tokens_by_step.csv`, `h2d_tokens_by_decode_step.svg`, and `REPORT.md` in that child directory.
 Each K directory retains `benchmark.jsonl` from the perf pass and
 `benchmark_trace.jsonl` from the intrusive trace pass; only perf TPOT is reported.
+If a larger K fails, rerun `analyze.py --results-dir .../latest`; incomplete K
+groups are skipped and listed in the generated report instead of aborting analysis.
 
 Inspect live errors with `tail -f results/deepseek_v4_csa_topk/latest/k*/server_*.err` and
 `tail -f results/deepseek_v4_csa_topk/latest/k*/client_*.err`. After completion, read

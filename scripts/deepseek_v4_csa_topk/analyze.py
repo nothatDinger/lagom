@@ -4,6 +4,7 @@
 import argparse
 import csv
 import json
+import sys
 from pathlib import Path
 
 KS = (512, 1024, 2048, 4096)
@@ -19,17 +20,34 @@ def last_json(path: Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", default="results/deepseek_v4_csa_topk")
+    parser.add_argument("--ks", type=int, nargs="+", default=KS)
     args = parser.parse_args()
     root = Path(args.results_dir)
     summary = []
     curves = {}
-    for k in KS:
-        metric = last_json(root / f"k{k}" / "benchmark.jsonl")
-        traces = [
-            json.loads(x)
-            for x in (root / f"k{k}" / "h2d_trace.tp0.jsonl").read_text().splitlines()
-            if x.strip()
+    skipped = []
+    for k in args.ks:
+        benchmark_path = root / f"k{k}" / "benchmark.jsonl"
+        trace_path = root / f"k{k}" / "h2d_trace.tp0.jsonl"
+        missing = [
+            str(path.relative_to(root))
+            for path in (benchmark_path, trace_path)
+            if not path.is_file()
         ]
+        if missing:
+            reason = f"missing {', '.join(missing)}"
+            skipped.append((k, reason))
+            print(f"warning: skipping K={k}: {reason}", file=sys.stderr)
+            continue
+        metric = last_json(benchmark_path)
+        traces = [
+            json.loads(x) for x in trace_path.read_text().splitlines() if x.strip()
+        ]
+        if not traces:
+            reason = f"empty {trace_path.relative_to(root)}"
+            skipped.append((k, reason))
+            print(f"warning: skipping K={k}: {reason}", file=sys.stderr)
+            continue
         # Sum per-layer stalls into a decode-step latency, then average steps.
         h2d = []
         for row in traces:
@@ -54,6 +72,11 @@ def main() -> None:
             counts = row["miss_tokens_per_request"]
             by_step.setdefault(int(row["decode_step"]), []).extend(counts)
         curves[k] = {step: sum(vals) / len(vals) for step, vals in by_step.items()}
+
+    if not summary:
+        raise SystemExit(
+            "no complete K groups found; each group needs benchmark.jsonl and h2d_trace.tp0.jsonl"
+        )
 
     with open(root / "summary.csv", "w", newline="", encoding="utf-8") as out:
         writer = csv.DictWriter(out, fieldnames=summary[0].keys())
@@ -108,6 +131,12 @@ def main() -> None:
     (root / "REPORT.md").write_text(
         "# DeepSeek V4 CSA Top-K experiment\n\n"
         + "\n".join(table)
+        + (
+            "\n\n## Incomplete groups\n\n"
+            + "\n".join(f"- K={k}: {reason}" for k, reason in skipped)
+            if skipped
+            else ""
+        )
         + "\n\n![H2D tokens by decode step](h2d_tokens_by_decode_step.svg)\n",
         encoding="utf-8",
     )

@@ -106,6 +106,22 @@ column -s, -t results/deepseek_v4_csa_topk/latest/h2d_tokens_by_step.csv | less
 find -L results/deepseek_v4_csa_topk/latest -name '*.err' -size +0 -print
 ```
 
+### Generate a partial report after a failed K group
+
+The analyzer skips incomplete groups and records them under `Incomplete groups`
+in `REPORT.md`. For example, if K=4096 exits because there is not enough free
+GPU memory but K=512/1024/2048 completed, run:
+
+```bash
+python3 scripts/deepseek_v4_csa_topk/analyze.py \
+  --results-dir results/deepseek_v4_csa_topk/latest
+```
+
+It discovers the three complete groups, emits their summary/curve, and marks
+K=4096 as missing. To explicitly analyze only the successful groups, use
+`--ks 512 1024 2048`. A group is complete only when both `benchmark.jsonl` and
+`h2d_trace.tp0.jsonl` exist and the trace contains at least one record.
+
 The SVG beside the CSV files is the requested mean per-request H2D-token curve.
 Each `k*/server_*.err` contains startup/runtime exceptions, each
 `k*/client_*.err` contains workload failures, and the corresponding `.log`
