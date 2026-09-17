@@ -2358,8 +2358,6 @@ class HiSparseCoordinator:
         self, window: HiSparseDSparkWindow, commit_lens: torch.Tensor
     ) -> None:
         """Back up accepted C4 entries, then reset fixed scratch metadata."""
-        if window.compressed_locs.numel() == 0:
-            return
         commit_cpu = commit_lens.to("cpu").tolist()
         if getattr(self, "_h2d_trace_path", ""):
             cumulative = []
@@ -2385,6 +2383,12 @@ class HiSparseCoordinator:
                     )
                     + "\n"
                 )
+        # An H2D trace cycle is emitted even when all of its selected entries
+        # are already resident and the verify window consequently has no
+        # scratch mappings. Keep its commit record paired with that cycle;
+        # only the cache-backup and mapping cleanup below are unnecessary.
+        if window.compressed_locs.numel() == 0:
+            return
         accepted = speculative_accepted_c4_indices(
             window, commit_cpu, self.compress_ratio
         )

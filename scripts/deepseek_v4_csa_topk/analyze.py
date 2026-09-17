@@ -68,9 +68,25 @@ def aggregate_trace_cycles(traces: list[dict]) -> list[dict]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--results-dir", default="results/deepseek_v4_csa_topk")
-    parser.add_argument("--ks", type=int, nargs="+", default=KS)
+    parser = argparse.ArgumentParser(
+        description="Generate CSV, SVG, and Markdown reports from a CSA Top-K run."
+    )
+    parser.add_argument(
+        "--results-dir",
+        default="results/deepseek_v4_csa_topk",
+        help=(
+            "run directory containing k<K>/benchmark.jsonl and "
+            "k<K>/h2d_trace.tp0.jsonl (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--ks",
+        type=int,
+        nargs="+",
+        default=KS,
+        metavar="K",
+        help="Top-K groups to analyze (default: 512 1024 2048 4096)",
+    )
     args = parser.parse_args()
     root = Path(args.results_dir)
     summary = []
