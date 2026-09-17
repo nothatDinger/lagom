@@ -17,6 +17,56 @@ def last_json(path: Path) -> dict:
     return rows[-1]
 
 
+def aggregate_trace_cycles(traces: list[dict]) -> list[dict]:
+    """Combine layer records and bind each commit to its trace occurrence.
+
+    ``decode_step`` restarts when a request-pool slot is reused, so it is not a
+    file-wide identifier.  Commit records must be associated in stream order
+    rather than collapsed into a dictionary keyed only by that value.
+    """
+    cycles = []
+    for row in traces:
+        if row.get("event") == "commit":
+            step = int(row["decode_step"])
+            if not cycles or cycles[-1]["commit"] is not None:
+                raise ValueError(
+                    f"commit record for decode step {step} has no preceding H2D cycle"
+                )
+            cycle = cycles[-1]
+            if cycle["decode_step"] != step:
+                raise ValueError(
+                    "commit/H2D decode-step mismatch: "
+                    f"commit={step}, H2D={cycle['decode_step']}"
+                )
+            cycle["commit"] = row
+            continue
+
+        if int(row["layer_id"]) == 0:
+            cycles.append(
+                {
+                    "decode_step": int(row["decode_step"]),
+                    "h2d_ms": 0.0,
+                    "misses": [0] * len(row["miss_tokens_per_request"]),
+                    "layers": 0,
+                    "commit": None,
+                }
+            )
+        if not cycles:
+            raise ValueError("trace does not start with layer 0")
+        cycle = cycles[-1]
+        if cycle["commit"] is not None:
+            raise ValueError("H2D layer record follows a commit without a new layer 0")
+        cycle["h2d_ms"] += float(row["h2d_ms"])
+        cycle["layers"] += 1
+        counts = row["miss_tokens_per_request"]
+        if len(counts) != len(cycle["misses"]):
+            raise ValueError("request count changed within one layer cycle")
+        cycle["misses"] = [
+            total + int(count) for total, count in zip(cycle["misses"], counts)
+        ]
+    return cycles
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", default="results/deepseek_v4_csa_topk")
@@ -52,27 +102,7 @@ def main() -> None:
             continue
         # A layer-0 record starts one decode/verify invocation. Aggregate both
         # latency and physical token-entry copies across every C4 layer.
-        cycles = []
-        for row in traces:
-            if int(row["layer_id"]) == 0:
-                cycles.append(
-                    {
-                        "decode_step": int(row["decode_step"]),
-                        "h2d_ms": 0.0,
-                        "misses": [0] * len(row["miss_tokens_per_request"]),
-                        "layers": 0,
-                    }
-                )
-            if not cycles:
-                raise ValueError("trace does not start with layer 0")
-            cycles[-1]["h2d_ms"] += float(row["h2d_ms"])
-            cycles[-1]["layers"] += 1
-            counts = row["miss_tokens_per_request"]
-            if len(counts) != len(cycles[-1]["misses"]):
-                raise ValueError("request count changed within one layer cycle")
-            cycles[-1]["misses"] = [
-                total + int(count) for total, count in zip(cycles[-1]["misses"], counts)
-            ]
+        cycles = aggregate_trace_cycles(traces)
         h2d = [cycle["h2d_ms"] for cycle in cycles]
         tpot = float(metric["mean_tpot_ms"])
         summary.append(
@@ -83,17 +113,33 @@ def main() -> None:
                 "h2d_over_tpot": (sum(h2d) / len(h2d)) / tpot,
             }
         )
-        by_step = {}
-        by_step_per_layer = {}
+        by_accepted = {}
+        by_accepted_per_layer = {}
         for cycle in cycles:
-            step = cycle["decode_step"]
-            by_step.setdefault(step, []).extend(cycle["misses"])
-            by_step_per_layer.setdefault(step, []).extend(
-                count / cycle["layers"] for count in cycle["misses"]
-            )
-        curves[k] = {step: sum(vals) / len(vals) for step, vals in by_step.items()}
+            commit = cycle["commit"]
+            if commit is None:
+                raise ValueError(
+                    "trace lacks commit acceptance records; rerun the trace pass "
+                    "with the current instrumentation"
+                )
+            accepted = commit["cumulative_accepted_tokens"]
+            if len(accepted) != len(cycle["misses"]):
+                raise ValueError(
+                    "request count changed between H2D and commit records at "
+                    f"decode step {cycle['decode_step']}: "
+                    f"H2D={len(cycle['misses'])}, commit={len(accepted)}"
+                )
+            for accepted_tokens, misses in zip(accepted, cycle["misses"]):
+                by_accepted.setdefault(int(accepted_tokens), []).append(misses)
+                by_accepted_per_layer.setdefault(int(accepted_tokens), []).append(
+                    misses / cycle["layers"]
+                )
+        curves[k] = {
+            accepted: sum(vals) / len(vals) for accepted, vals in by_accepted.items()
+        }
         curves_per_layer[k] = {
-            step: sum(vals) / len(vals) for step, vals in by_step_per_layer.items()
+            accepted: sum(vals) / len(vals)
+            for accepted, vals in by_accepted_per_layer.items()
         }
 
         first = traces[0]
@@ -124,21 +170,21 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(summary)
     with open(
-        root / "h2d_tokens_by_step.csv", "w", newline="", encoding="utf-8"
+        root / "h2d_tokens_by_accepted_tokens.csv", "w", newline="", encoding="utf-8"
     ) as out:
         writer = csv.writer(out)
         writer.writerow(
             [
                 "k",
-                "decode_step",
+                "cumulative_accepted_tokens",
                 "mean_h2d_token_layer_entries_per_request",
                 "mean_h2d_tokens_per_request_per_layer",
             ]
         )
         for k, points in curves.items():
             writer.writerows(
-                (k, step, value, curves_per_layer[k][step])
-                for step, value in sorted(points.items())
+                (k, accepted, value, curves_per_layer[k][accepted])
+                for accepted, value in sorted(points.items())
             )
 
     width, height, pad = 900, 520, 60
@@ -151,23 +197,23 @@ def main() -> None:
     svg = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">',
         '<rect width="100%" height="100%" fill="white"/>',
-        f'<path d="M {pad} {pad} V {height-pad} H {width-pad}" fill="none" stroke="black"/>',
-        f'<text x="{width/2}" y="{height-12}" text-anchor="middle">Decode step</text>',
-        f'<text x="18" y="{height/2}" transform="rotate(-90 18 {height/2})" text-anchor="middle">Mean H2D transfer per request (token-layer entries)</text>',
+        f'<path d="M {pad} {pad} V {height - pad} H {width - pad}" fill="none" stroke="black"/>',
+        f'<text x="{width / 2}" y="{height - 12}" text-anchor="middle">Cumulative accepted tokens in request</text>',
+        f'<text x="18" y="{height / 2}" transform="rotate(-90 18 {height / 2})" text-anchor="middle">Mean H2D transfer per request (token-layer entries)</text>',
     ]
     for color, (k, points) in zip(colors, curves.items()):
         coords = " ".join(
-            f"{pad + step/max_x*(width-2*pad):.1f},{height-pad-value/max_y*(height-2*pad):.1f}"
-            for step, value in sorted(points.items())
+            f"{pad + accepted / max_x * (width - 2 * pad):.1f},{height - pad - value / max_y * (height - 2 * pad):.1f}"
+            for accepted, value in sorted(points.items())
         )
         svg.append(
             f'<polyline points="{coords}" fill="none" stroke="{color}" stroke-width="2"/>'
         )
         svg.append(
-            f'<text x="{width-pad-80}" y="{pad+20*list(curves).index(k)}" fill="{color}">K={k}</text>'
+            f'<text x="{width - pad - 80}" y="{pad + 20 * list(curves).index(k)}" fill="{color}">K={k}</text>'
         )
     svg.append("</svg>")
-    (root / "h2d_tokens_by_decode_step.svg").write_text(
+    (root / "h2d_tokens_by_accepted_tokens.svg").write_text(
         "\n".join(svg), encoding="utf-8"
     )
 
@@ -176,7 +222,7 @@ def main() -> None:
         "|---:|---:|---:|---:|",
     ]
     table += [
-        f'| {r["k"]} | {r["mean_h2d_ms"]:.4f} | {r["mean_tpot_ms"]:.4f} | {r["h2d_over_tpot"]:.4f} |'
+        f"| {r['k']} | {r['mean_h2d_ms']:.4f} | {r['mean_tpot_ms']:.4f} | {r['h2d_over_tpot']:.4f} |"
         for r in summary
     ]
     (root / "REPORT.md").write_text(
@@ -194,7 +240,7 @@ def main() -> None:
             if diagnostics
             else ""
         )
-        + "\n\n![H2D tokens by decode step](h2d_tokens_by_decode_step.svg)\n",
+        + "\n\n![H2D tokens by accepted tokens](h2d_tokens_by_accepted_tokens.svg)\n",
         encoding="utf-8",
     )
 
