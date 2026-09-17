@@ -11,9 +11,13 @@ def input_files(path: Path) -> list[Path]:
         return [path]
     if not path.is_dir():
         raise FileNotFoundError(f"LongBench dataset path does not exist: {path}")
-    files = sorted(path.rglob("*.jsonl")) + sorted(path.rglob("*.parquet"))
+    files = (
+        sorted(path.rglob("*.jsonl"))
+        + sorted(path.rglob("*.parquet"))
+        + sorted(path.rglob("*.json"))
+    )
     if not files:
-        raise ValueError(f"no .jsonl or .parquet files found under {path}")
+        raise ValueError(f"no .jsonl, .parquet, or .json files found under {path}")
     return files
 
 
@@ -22,6 +26,10 @@ def read_rows(path: Path):
         import pandas as pd
 
         yield from pd.read_parquet(path).to_dict(orient="records")
+        return
+    if path.suffix == ".json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        yield from data if isinstance(data, list) else [data]
         return
     with path.open(encoding="utf-8") as src:
         for line in src:
