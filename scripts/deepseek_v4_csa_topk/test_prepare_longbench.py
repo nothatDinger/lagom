@@ -39,3 +39,31 @@ def test_prepare_jsonl(tmp_path, variant, row, expected):
     prepared = json.loads(output.read_text(encoding="utf-8"))
     assert expected in prepared[0]["conversations"][0]["value"]
     assert prepared[0]["conversations"][1]["value"]
+
+
+def test_prepare_json_array(tmp_path):
+    source = tmp_path / "dataset" / "data.json"
+    source.parent.mkdir()
+    source.write_text(
+        json.dumps(
+            [
+                {
+                    "context": "document",
+                    "question": "Which?",
+                    "choice_A": "one",
+                    "choice_B": "two",
+                    "choice_C": "three",
+                    "choice_D": "four",
+                    "answer": "B",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "prepared.json"
+
+    prepare(source.parent, output, "longbench_v2", 1)
+
+    prepared = json.loads(output.read_text(encoding="utf-8"))
+    assert "Question: Which?" in prepared[0]["conversations"][0]["value"]
+    assert prepared[0]["conversations"][1]["value"] == "B"
