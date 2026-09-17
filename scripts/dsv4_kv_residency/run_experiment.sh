@@ -49,6 +49,7 @@ python3 -m sglang.launch_server "${server_args[@]}" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 python3 "$ROOT/scripts/dsv4_kv_residency/collect.py" \
   --base-url "http://$HOST:$PORT" --dataset "$DATASET_PATH" \
+  --dataset-name "${DATASET_NAME:-sharegpt}" \
   --sample-count "${SAMPLE_COUNT:-100}" --sample-method "${SAMPLE_METHOD:-first}" \
   --seed "${RANDOM_SEED:-0}" --max-new-tokens "${MAX_NEW_TOKENS:-256}" \
   --output "$OUT/raw_records.json" 2>&1 | tee "$CLIENT_LOG"
