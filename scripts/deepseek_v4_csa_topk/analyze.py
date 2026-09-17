@@ -17,6 +17,56 @@ def last_json(path: Path) -> dict:
     return rows[-1]
 
 
+def aggregate_trace_cycles(traces: list[dict]) -> list[dict]:
+    """Combine layer records and bind each commit to its trace occurrence.
+
+    ``decode_step`` restarts when a request-pool slot is reused, so it is not a
+    file-wide identifier.  Commit records must be associated in stream order
+    rather than collapsed into a dictionary keyed only by that value.
+    """
+    cycles = []
+    for row in traces:
+        if row.get("event") == "commit":
+            step = int(row["decode_step"])
+            if not cycles or cycles[-1]["commit"] is not None:
+                raise ValueError(
+                    f"commit record for decode step {step} has no preceding H2D cycle"
+                )
+            cycle = cycles[-1]
+            if cycle["decode_step"] != step:
+                raise ValueError(
+                    "commit/H2D decode-step mismatch: "
+                    f"commit={step}, H2D={cycle['decode_step']}"
+                )
+            cycle["commit"] = row
+            continue
+
+        if int(row["layer_id"]) == 0:
+            cycles.append(
+                {
+                    "decode_step": int(row["decode_step"]),
+                    "h2d_ms": 0.0,
+                    "misses": [0] * len(row["miss_tokens_per_request"]),
+                    "layers": 0,
+                    "commit": None,
+                }
+            )
+        if not cycles:
+            raise ValueError("trace does not start with layer 0")
+        cycle = cycles[-1]
+        if cycle["commit"] is not None:
+            raise ValueError("H2D layer record follows a commit without a new layer 0")
+        cycle["h2d_ms"] += float(row["h2d_ms"])
+        cycle["layers"] += 1
+        counts = row["miss_tokens_per_request"]
+        if len(counts) != len(cycle["misses"]):
+            raise ValueError("request count changed within one layer cycle")
+        cycle["misses"] = [
+            total + int(count) for total, count in zip(cycle["misses"], counts)
+        ]
+    return cycles
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", default="results/deepseek_v4_csa_topk")
@@ -50,35 +100,9 @@ def main() -> None:
             skipped.append((k, reason))
             print(f"warning: skipping K={k}: {reason}", file=sys.stderr)
             continue
-        commit_rows = {
-            int(row["decode_step"]): row
-            for row in traces
-            if row.get("event") == "commit"
-        }
-        layer_rows = [row for row in traces if row.get("event") != "commit"]
         # A layer-0 record starts one decode/verify invocation. Aggregate both
         # latency and physical token-entry copies across every C4 layer.
-        cycles = []
-        for row in layer_rows:
-            if int(row["layer_id"]) == 0:
-                cycles.append(
-                    {
-                        "decode_step": int(row["decode_step"]),
-                        "h2d_ms": 0.0,
-                        "misses": [0] * len(row["miss_tokens_per_request"]),
-                        "layers": 0,
-                    }
-                )
-            if not cycles:
-                raise ValueError("trace does not start with layer 0")
-            cycles[-1]["h2d_ms"] += float(row["h2d_ms"])
-            cycles[-1]["layers"] += 1
-            counts = row["miss_tokens_per_request"]
-            if len(counts) != len(cycles[-1]["misses"]):
-                raise ValueError("request count changed within one layer cycle")
-            cycles[-1]["misses"] = [
-                total + int(count) for total, count in zip(cycles[-1]["misses"], counts)
-            ]
+        cycles = aggregate_trace_cycles(traces)
         h2d = [cycle["h2d_ms"] for cycle in cycles]
         tpot = float(metric["mean_tpot_ms"])
         summary.append(
@@ -92,8 +116,7 @@ def main() -> None:
         by_accepted = {}
         by_accepted_per_layer = {}
         for cycle in cycles:
-            step = cycle["decode_step"]
-            commit = commit_rows.get(step)
+            commit = cycle["commit"]
             if commit is None:
                 raise ValueError(
                     "trace lacks commit acceptance records; rerun the trace pass "
@@ -101,7 +124,11 @@ def main() -> None:
                 )
             accepted = commit["cumulative_accepted_tokens"]
             if len(accepted) != len(cycle["misses"]):
-                raise ValueError("request count changed between H2D and commit records")
+                raise ValueError(
+                    "request count changed between H2D and commit records at "
+                    f"decode step {cycle['decode_step']}: "
+                    f"H2D={len(cycle['misses'])}, commit={len(accepted)}"
+                )
             for accepted_tokens, misses in zip(accepted, cycle["misses"]):
                 by_accepted.setdefault(int(accepted_tokens), []).append(misses)
                 by_accepted_per_layer.setdefault(int(accepted_tokens), []).append(
