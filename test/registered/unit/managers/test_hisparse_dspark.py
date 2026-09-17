@@ -194,6 +194,7 @@ def test_dspark_empty_scratch_window_still_records_trace_commit(monkeypatch, tmp
         "decode_step": 3,
         "accepted_tokens": [2],
         "cumulative_accepted_tokens": [5],
+        "request_pool_indices": [7],
     }
 
 

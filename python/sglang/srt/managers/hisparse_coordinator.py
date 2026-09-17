@@ -2029,16 +2029,29 @@ class HiSparseCoordinator:
             h2d_end.synchronize()
             # This intentionally synchronizes and copies the counters to host.
             # Use a separate profiling pass; never use its TPOT as the result.
-            counts = miss_count.to(device="cpu", dtype=torch.int64).tolist()
+            # ``req_pool_indices`` can be a padded execution bucket even when
+            # the scheduler/commit transaction contains fewer live requests.
+            # The planner masks those rows with ``num_real_reqs``; do not leak
+            # their zero counters into the trace and create H2D/commit geometry
+            # mismatches downstream.
+            real_num_reqs = min(int(self.num_real_reqs.item()), num_reqs)
+            counts = (
+                miss_count[:real_num_reqs].to(device="cpu", dtype=torch.int64).tolist()
+            )
+            request_pool_indices = (
+                req_pool_indices[:real_num_reqs]
+                .to(device="cpu", dtype=torch.int64)
+                .tolist()
+            )
             # The supplied experiment uses concurrency=1. A reused request-pool
             # slot is detected by its compressed sequence length moving back.
             current_seq_len = int(compressed_seq_lens.reshape(-1)[0].item())
             if compressed_seq_lens.numel() == num_reqs:
-                seq_lens_per_request = compressed_seq_lens
+                seq_lens_per_request = compressed_seq_lens[:real_num_reqs]
             else:
                 seq_lens_per_request = compressed_seq_lens.reshape(
                     num_reqs, verify_width
-                )[:, 0]
+                )[:real_num_reqs, 0]
             # C4 length legitimately stays equal while one to three accepted
             # tokens accumulate. Only a decrease denotes a reused request slot.
             if layer_id == 0 and current_seq_len < self._h2d_trace_last_seq_len:
@@ -2049,7 +2062,8 @@ class HiSparseCoordinator:
                 "layer_id": layer_id,
                 "h2d_ms": h2d_start.elapsed_time(h2d_end),
                 "miss_tokens_per_request": counts,
-                "num_requests": num_reqs,
+                "request_pool_indices": request_pool_indices,
+                "num_requests": real_num_reqs,
                 "verify_width": verify_width,
                 "top_k": self.top_k,
                 "item_size_bytes": self.item_size_bytes,
@@ -2379,6 +2393,7 @@ class HiSparseCoordinator:
                             "decode_step": max(0, self._h2d_trace_step - 1),
                             "accepted_tokens": [int(value) for value in commit_cpu],
                             "cumulative_accepted_tokens": cumulative,
+                            "request_pool_indices": window.req_pool_indices_cpu,
                         }
                     )
                     + "\n"

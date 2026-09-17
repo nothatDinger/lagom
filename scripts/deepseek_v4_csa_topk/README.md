@@ -154,6 +154,26 @@ counts from that file: update to the current code and rerun the **trace pass**
 directory. Rerunning only `analyze.py` against the old trace will produce the
 same error.
 
+An analyzer exception happens during the final post-processing step and does
+not by itself mean that the GPU benchmark or trace pass stopped early. Because
+`run.sh` uses fail-fast shell settings, an analyzer exception marks
+`run_state.env` as `state=failed` even when every K directory already contains
+complete benchmark and trace files. Check the inputs before rerunning the costly
+experiment:
+
+```bash
+cat results/deepseek_v4_csa_topk/latest/run_state.env
+find -L results/deepseek_v4_csa_topk/latest -maxdepth 2 \
+  \( -name benchmark.jsonl -o -name h2d_trace.tp0.jsonl \) -size +0 -print
+```
+
+Older traces can also contain extra zero-valued request rows from padded
+execution buckets. The analyzer safely discards only those trailing zero rows.
+Current instrumentation records request-pool identities and excludes padding,
+so it can align H2D and commit data explicitly. A count mismatch involving a
+nonzero unmatched row remains an error because assigning that transfer to a
+request would fabricate data; regenerate that trace with the current code.
+
 ## Run through gpuq
 
 From the repository root, copy or source `env.example`, set `MODEL_PATH`, and
