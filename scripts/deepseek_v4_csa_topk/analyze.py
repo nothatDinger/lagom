@@ -49,6 +49,7 @@ def aggregate_trace_cycles(traces: list[dict]) -> list[dict]:
                     "misses": [0] * len(row["miss_tokens_per_request"]),
                     "layers": 0,
                     "commit": None,
+                    "request_pool_indices": row.get("request_pool_indices"),
                 }
             )
         if not cycles:
@@ -67,10 +68,62 @@ def aggregate_trace_cycles(traces: list[dict]) -> list[dict]:
     return cycles
 
 
+def align_cycle_requests(cycle: dict) -> tuple[list[int], list[int]]:
+    """Align H2D counters with commit values, tolerating legacy padded rows."""
+    commit = cycle["commit"]
+    misses = [int(value) for value in cycle["misses"]]
+    accepted = [int(value) for value in commit["cumulative_accepted_tokens"]]
+    h2d_ids = cycle.get("request_pool_indices")
+    commit_ids = commit.get("request_pool_indices")
+
+    if h2d_ids is not None and commit_ids is not None:
+        if len(h2d_ids) != len(misses) or len(commit_ids) != len(accepted):
+            raise ValueError("request identifiers do not match their trace values")
+        misses_by_id = dict(zip(h2d_ids, misses))
+        if len(misses_by_id) != len(h2d_ids) or set(misses_by_id) != set(commit_ids):
+            raise ValueError(
+                "request identities changed between H2D and commit records at "
+                f"decode step {cycle['decode_step']}: "
+                f"H2D={h2d_ids}, commit={commit_ids}"
+            )
+        return [misses_by_id[req_id] for req_id in commit_ids], accepted
+
+    if len(misses) > len(accepted) and not any(misses[len(accepted) :]):
+        # Older traces included zero counters for padded execution-bucket rows.
+        # Live requests occupy the leading rows, and the planner guarantees
+        # that padded rows cannot report a miss.
+        misses = misses[: len(accepted)]
+    if len(accepted) != len(misses):
+        raise ValueError(
+            "request count changed between H2D and commit records at "
+            f"decode step {cycle['decode_step']}: "
+            f"H2D={len(misses)}, commit={len(accepted)}. If this is an old "
+            "trace, regenerate it with current instrumentation; nonzero "
+            "unmatched rows cannot be assigned safely."
+        )
+    return misses, accepted
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--results-dir", default="results/deepseek_v4_csa_topk")
-    parser.add_argument("--ks", type=int, nargs="+", default=KS)
+    parser = argparse.ArgumentParser(
+        description="Generate CSV, SVG, and Markdown reports from a CSA Top-K run."
+    )
+    parser.add_argument(
+        "--results-dir",
+        default="results/deepseek_v4_csa_topk",
+        help=(
+            "run directory containing k<K>/benchmark.jsonl and "
+            "k<K>/h2d_trace.tp0.jsonl (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--ks",
+        type=int,
+        nargs="+",
+        default=KS,
+        metavar="K",
+        help="Top-K groups to analyze (default: 512 1024 2048 4096)",
+    )
     args = parser.parse_args()
     root = Path(args.results_dir)
     summary = []
@@ -122,17 +175,11 @@ def main() -> None:
                     "trace lacks commit acceptance records; rerun the trace pass "
                     "with the current instrumentation"
                 )
-            accepted = commit["cumulative_accepted_tokens"]
-            if len(accepted) != len(cycle["misses"]):
-                raise ValueError(
-                    "request count changed between H2D and commit records at "
-                    f"decode step {cycle['decode_step']}: "
-                    f"H2D={len(cycle['misses'])}, commit={len(accepted)}"
-                )
-            for accepted_tokens, misses in zip(accepted, cycle["misses"]):
-                by_accepted.setdefault(int(accepted_tokens), []).append(misses)
+            misses, accepted = align_cycle_requests(cycle)
+            for accepted_tokens, miss_count in zip(accepted, misses):
+                by_accepted.setdefault(int(accepted_tokens), []).append(miss_count)
                 by_accepted_per_layer.setdefault(int(accepted_tokens), []).append(
-                    misses / cycle["layers"]
+                    miss_count / cycle["layers"]
                 )
         curves[k] = {
             accepted: sum(vals) / len(vals) for accepted, vals in by_accepted.items()

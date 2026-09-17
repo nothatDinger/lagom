@@ -71,3 +71,27 @@ def test_layers_are_aggregated_before_their_commit():
     assert cycle["layers"] == 2
     assert cycle["misses"] == [6]
     assert cycle["commit"]["cumulative_accepted_tokens"] == [6]
+
+
+def test_legacy_padded_zero_request_rows_are_ignored():
+    cycle = {
+        "decode_step": 8,
+        "misses": [11, 0, 0],
+        "commit": {"cumulative_accepted_tokens": [5]},
+    }
+
+    assert ANALYZE.align_cycle_requests(cycle) == ([11], [5])
+
+
+def test_request_ids_align_values_in_commit_order():
+    cycle = {
+        "decode_step": 2,
+        "misses": [7, 3],
+        "request_pool_indices": [20, 10],
+        "commit": {
+            "cumulative_accepted_tokens": [4, 9],
+            "request_pool_indices": [10, 20],
+        },
+    }
+
+    assert ANALYZE.align_cycle_requests(cycle) == ([3, 7], [4, 9])
