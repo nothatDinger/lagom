@@ -77,6 +77,11 @@ x-axis, rather than incorrectly treating the decode-step number as acceptance.
 It reports physical copies summed across C4 layers in token-layer entries; the
 CSV also reports the per-layer mean in logical C4 tokens.
 
+Commit records are also written when a verify window needs no scratch mapping
+(for example, when every selected entry is already resident). This keeps every
+H2D cycle paired with acceptance data; traces produced before this fix can lack
+those records and must be regenerated.
+
 If every `h2d_tokens_per_request` value is zero, first check prompt geometry.
 The HiSparse kernel deliberately takes a zero-copy fast path whenever the
 compressed C4 sequence length is no larger than `device_buffer_size`. With
@@ -94,6 +99,60 @@ The analyzer now sums miss counts from every layer rather than reading layer 0
 only. It adds a `Sampling diagnostics` warning to `REPORT.md` when all measured
 requests fit in the resident buffer. New traces additionally record
 `device_buffer_size` and compressed sequence lengths for direct verification.
+
+## Run the analyzer
+
+Run the analyzer from the repository root after the trace run has finished.
+Pass the timestamped run directory (or the `latest` symlink), not its parent:
+
+```bash
+python3 scripts/deepseek_v4_csa_topk/analyze.py \
+  --results-dir results/deepseek_v4_csa_topk/latest
+```
+
+The input directory must contain one subdirectory per Top-K value. For example,
+a complete default run has this layout:
+
+```text
+results/deepseek_v4_csa_topk/latest/
+├── k512/benchmark.jsonl
+├── k512/h2d_trace.tp0.jsonl
+├── k1024/benchmark.jsonl
+├── k1024/h2d_trace.tp0.jsonl
+├── k2048/benchmark.jsonl
+├── k2048/h2d_trace.tp0.jsonl
+├── k4096/benchmark.jsonl
+└── k4096/h2d_trace.tp0.jsonl
+```
+
+To analyze only selected completed groups, list them after `--ks`:
+
+```bash
+python3 scripts/deepseek_v4_csa_topk/analyze.py \
+  --results-dir results/deepseek_v4_csa_topk/latest \
+  --ks 512 1024 2048
+```
+
+The command writes or replaces these files inside the selected run directory:
+
+- `REPORT.md`: summary table, incomplete groups, and sampling diagnostics;
+- `summary.csv`: mean H2D latency, TPOT, and their ratio;
+- `h2d_tokens_by_accepted_tokens.csv`: transfer data by cumulative accepted
+  tokens;
+- `h2d_tokens_by_accepted_tokens.svg`: plot referenced by `REPORT.md`.
+
+Inspect all command-line options with:
+
+```bash
+python3 scripts/deepseek_v4_csa_topk/analyze.py --help
+```
+
+If the command reports `trace lacks commit acceptance records`, the trace was
+created with old instrumentation. The analyzer cannot reconstruct acceptance
+counts from that file: update to the current code and rerun the **trace pass**
+(running `gpuq_entry.sh`/`run.sh` creates a fresh run), then analyze the new run
+directory. Rerunning only `analyze.py` against the old trace will produce the
+same error.
 
 ## Run through gpuq
 
