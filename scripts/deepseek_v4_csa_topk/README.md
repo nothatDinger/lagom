@@ -77,6 +77,11 @@ x-axis, rather than incorrectly treating the decode-step number as acceptance.
 It reports physical copies summed across C4 layers in token-layer entries; the
 CSV also reports the per-layer mean in logical C4 tokens.
 
+Commit records are also written when a verify window needs no scratch mapping
+(for example, when every selected entry is already resident). This keeps every
+H2D cycle paired with acceptance data; traces produced before this fix can lack
+those records and must be regenerated.
+
 If every `h2d_tokens_per_request` value is zero, first check prompt geometry.
 The HiSparse kernel deliberately takes a zero-copy fast path whenever the
 compressed C4 sequence length is no larger than `device_buffer_size`. With
@@ -95,6 +100,80 @@ only. It adds a `Sampling diagnostics` warning to `REPORT.md` when all measured
 requests fit in the resident buffer. New traces additionally record
 `device_buffer_size` and compressed sequence lengths for direct verification.
 
+## Run the analyzer
+
+Run the analyzer from the repository root after the trace run has finished.
+Pass the timestamped run directory (or the `latest` symlink), not its parent:
+
+```bash
+python3 scripts/deepseek_v4_csa_topk/analyze.py \
+  --results-dir results/deepseek_v4_csa_topk/latest
+```
+
+The input directory must contain one subdirectory per Top-K value. For example,
+a complete default run has this layout:
+
+```text
+results/deepseek_v4_csa_topk/latest/
+├── k512/benchmark.jsonl
+├── k512/h2d_trace.tp0.jsonl
+├── k1024/benchmark.jsonl
+├── k1024/h2d_trace.tp0.jsonl
+├── k2048/benchmark.jsonl
+├── k2048/h2d_trace.tp0.jsonl
+├── k4096/benchmark.jsonl
+└── k4096/h2d_trace.tp0.jsonl
+```
+
+To analyze only selected completed groups, list them after `--ks`:
+
+```bash
+python3 scripts/deepseek_v4_csa_topk/analyze.py \
+  --results-dir results/deepseek_v4_csa_topk/latest \
+  --ks 512 1024 2048
+```
+
+The command writes or replaces these files inside the selected run directory:
+
+- `REPORT.md`: summary table, incomplete groups, and sampling diagnostics;
+- `summary.csv`: mean H2D latency, TPOT, and their ratio;
+- `h2d_tokens_by_accepted_tokens.csv`: transfer data by cumulative accepted
+  tokens;
+- `h2d_tokens_by_accepted_tokens.svg`: plot referenced by `REPORT.md`.
+
+Inspect all command-line options with:
+
+```bash
+python3 scripts/deepseek_v4_csa_topk/analyze.py --help
+```
+
+If the command reports `trace lacks commit acceptance records`, the trace was
+created with old instrumentation. The analyzer cannot reconstruct acceptance
+counts from that file: update to the current code and rerun the **trace pass**
+(running `gpuq_entry.sh`/`run.sh` creates a fresh run), then analyze the new run
+directory. Rerunning only `analyze.py` against the old trace will produce the
+same error.
+
+An analyzer exception happens during the final post-processing step and does
+not by itself mean that the GPU benchmark or trace pass stopped early. Because
+`run.sh` uses fail-fast shell settings, an analyzer exception marks
+`run_state.env` as `state=failed` even when every K directory already contains
+complete benchmark and trace files. Check the inputs before rerunning the costly
+experiment:
+
+```bash
+cat results/deepseek_v4_csa_topk/latest/run_state.env
+find -L results/deepseek_v4_csa_topk/latest -maxdepth 2 \
+  \( -name benchmark.jsonl -o -name h2d_trace.tp0.jsonl \) -size +0 -print
+```
+
+Older traces can also contain extra zero-valued request rows from padded
+execution buckets. The analyzer safely discards only those trailing zero rows.
+Current instrumentation records request-pool identities and excludes padding,
+so it can align H2D and commit data explicitly. A count mismatch involving a
+nonzero unmatched row remains an error because assigning that transfer to a
+request would fabricate data; regenerate that trace with the current code.
+
 ## Run through gpuq
 
 From the repository root, copy or source `env.example`, set `MODEL_PATH`, and
@@ -108,8 +187,9 @@ gpuq scripts/deepseek_v4_csa_topk/gpuq_entry.sh
 
 `MODEL_PATH` must point to DeepSeek-V4-Flash-0731, whose bundled DSpark draft
 head is loaded from the same checkpoint; do not set
-`--speculative-draft-model-path`. `DATASET_PATH` is required only when
-`DATASET_NAME=sharegpt`.
+`--speculative-draft-model-path`. `DATASET_PATH` is required for ShareGPT and
+LongBench; it may select a LongBench file or directory. LongBench-v2 otherwise
+uses the machine-local default described below.
 `SERVER_EXTRA_ARGS` is the supported way to add hardware/checkpoint
 specific SGLang flags without editing the experiment. Run one gpuq allocation
 with enough GPUs for `TP_SIZE`; do not run the four groups as independent jobs,
@@ -125,6 +205,31 @@ If two jobs use the same timestamp and mode, a numeric suffix prevents overwrite
 and `RESULTS_DIR` changes the parent directory rather than the timestamped run
 directory. `run_config.txt` records the mode, input and output paths, MoE
 runner, static-memory fraction, and decode CUDA graph limit used for the run.
+
+### Run LongBench workloads
+
+Set `DATASET_NAME=longbench` for LongBench or `DATASET_NAME=longbench_v2` (the
+alias `longbench-v2` is also accepted) for LongBench-v2. `DATASET_PATH` may be
+a JSONL/Parquet file or a repository directory; the runner searches directories
+recursively and deterministically takes the first `NUM_PROMPTS` records. For
+LongBench-v2 on the target machine, the default path is
+`/home/jovyan/td69032/LongBench-v2`:
+
+```bash
+export DATASET_NAME=longbench_v2
+export DATASET_PATH=/home/jovyan/td69032/LongBench-v2
+export NUM_PROMPTS=10
+export LONGBENCH_OUTPUT_LEN=512
+scripts/deepseek_v4_csa_topk/run.sh
+```
+
+The runner converts either dataset to a private ShareGPT-format file in the run
+directory, so the perf and trace passes consume identical prompts. The fixed
+`LONGBENCH_OUTPUT_LEN` defaults to 512 tokens; change it when the experiment
+requires a different decode length. LongBench expects records with `context`,
+`input`, and `answers`; LongBench-v2 expects `context`, `question`, four
+`choice_*` fields, and `answer`. Reading Parquet requires pandas and a supported
+Parquet engine such as PyArrow.
 
 ## Monitor and inspect
 
