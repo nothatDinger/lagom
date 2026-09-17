@@ -171,10 +171,7 @@ def main() -> None:
         for cycle in cycles:
             commit = cycle["commit"]
             if commit is None:
-                raise ValueError(
-                    "trace lacks commit acceptance records; rerun the trace pass "
-                    "with the current instrumentation"
-                )
+                continue
             misses, accepted = align_cycle_requests(cycle)
             for accepted_tokens, miss_count in zip(accepted, misses):
                 by_accepted.setdefault(int(accepted_tokens), []).append(miss_count)

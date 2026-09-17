@@ -10,8 +10,13 @@ NUM_PROMPTS=${NUM_PROMPTS:-1}; DSPARK_BLOCK_SIZE=${DSPARK_BLOCK_SIZE:-5}
 DATASET_NAME=${DATASET_NAME:-random}
 RANDOM_INPUT_LEN=${RANDOM_INPUT_LEN:-110000}
 RANDOM_OUTPUT_LEN=${RANDOM_OUTPUT_LEN:-512}
+LONGBENCH_OUTPUT_LEN=${LONGBENCH_OUTPUT_LEN:-512}
 if [[ "$DATASET_NAME" == sharegpt ]]; then
   : "${DATASET_PATH:?set DATASET_PATH when DATASET_NAME=sharegpt}"
+elif [[ "$DATASET_NAME" == longbench ]]; then
+  : "${DATASET_PATH:?set DATASET_PATH when DATASET_NAME=longbench}"
+elif [[ "$DATASET_NAME" == longbench_v2 || "$DATASET_NAME" == longbench-v2 ]]; then
+  DATASET_PATH=${DATASET_PATH:-/home/jovyan/td69032/LongBench-v2}
 fi
 MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-flashinfer_mxfp4}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.85}
@@ -34,9 +39,9 @@ while [[ -e "$OUT" ]]; do
   ((collision += 1))
 done
 mkdir -p "$OUT"
-printf 'timestamp_utc=%s\ndeterministic_inference=%s\nmodel_path=%s\ndataset_name=%s\ndataset_path=%s\nrandom_input_len=%s\nrandom_output_len=%s\nresults_dir=%s\nmoe_runner_backend=%s\nmem_fraction_static=%s\ncuda_graph_max_bs_decode=%s\n' \
+printf 'timestamp_utc=%s\ndeterministic_inference=%s\nmodel_path=%s\ndataset_name=%s\ndataset_path=%s\nrandom_input_len=%s\nrandom_output_len=%s\nlongbench_output_len=%s\nresults_dir=%s\nmoe_runner_backend=%s\nmem_fraction_static=%s\ncuda_graph_max_bs_decode=%s\n' \
   "$RUN_TIMESTAMP" "$DETERMINISTIC_INFERENCE" "$MODEL_PATH" "$DATASET_NAME" \
-  "${DATASET_PATH:-}" "$RANDOM_INPUT_LEN" "$RANDOM_OUTPUT_LEN" \
+  "${DATASET_PATH:-}" "$RANDOM_INPUT_LEN" "$RANDOM_OUTPUT_LEN" "$LONGBENCH_OUTPUT_LEN" \
   "$RESULTS_DIR" "$MOE_RUNNER_BACKEND" "$MEM_FRACTION_STATIC" \
   "$CUDA_GRAPH_MAX_BS_DECODE" \
   >"$OUT/run_config.txt"
@@ -45,8 +50,16 @@ benchmark_dataset_args=(--dataset-name random --random-input-len "$RANDOM_INPUT_
 if [[ "$DATASET_NAME" == sharegpt ]]; then
   python3 "$ROOT/scripts/deepseek_v4_csa_topk/sample_sharegpt.py" --input "$DATASET_PATH" --output "$OUT/sharegpt_first_${NUM_PROMPTS}.json" --count "$NUM_PROMPTS"
   benchmark_dataset_args=(--dataset-name sharegpt --dataset-path "$OUT/sharegpt_first_${NUM_PROMPTS}.json")
+elif [[ "$DATASET_NAME" == longbench || "$DATASET_NAME" == longbench_v2 || "$DATASET_NAME" == longbench-v2 ]]; then
+  longbench_variant=$DATASET_NAME
+  [[ "$longbench_variant" != longbench-v2 ]] || longbench_variant=longbench_v2
+  prepared_dataset="$OUT/${longbench_variant}_first_${NUM_PROMPTS}.json"
+  python3 "$ROOT/scripts/deepseek_v4_csa_topk/prepare_longbench.py" \
+    --input "$DATASET_PATH" --output "$prepared_dataset" \
+    --variant "$longbench_variant" --count "$NUM_PROMPTS"
+  benchmark_dataset_args=(--dataset-name sharegpt --dataset-path "$prepared_dataset" --sharegpt-output-len "$LONGBENCH_OUTPUT_LEN")
 elif [[ "$DATASET_NAME" != random ]]; then
-  echo "DATASET_NAME must be random or sharegpt" >&2
+  echo "DATASET_NAME must be random, sharegpt, longbench, or longbench_v2" >&2
   exit 2
 fi
 

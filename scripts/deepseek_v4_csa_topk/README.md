@@ -187,8 +187,9 @@ gpuq scripts/deepseek_v4_csa_topk/gpuq_entry.sh
 
 `MODEL_PATH` must point to DeepSeek-V4-Flash-0731, whose bundled DSpark draft
 head is loaded from the same checkpoint; do not set
-`--speculative-draft-model-path`. `DATASET_PATH` is required only when
-`DATASET_NAME=sharegpt`.
+`--speculative-draft-model-path`. `DATASET_PATH` is required for ShareGPT and
+LongBench; it may select a LongBench file or directory. LongBench-v2 otherwise
+uses the machine-local default described below.
 `SERVER_EXTRA_ARGS` is the supported way to add hardware/checkpoint
 specific SGLang flags without editing the experiment. Run one gpuq allocation
 with enough GPUs for `TP_SIZE`; do not run the four groups as independent jobs,
@@ -204,6 +205,31 @@ If two jobs use the same timestamp and mode, a numeric suffix prevents overwrite
 and `RESULTS_DIR` changes the parent directory rather than the timestamped run
 directory. `run_config.txt` records the mode, input and output paths, MoE
 runner, static-memory fraction, and decode CUDA graph limit used for the run.
+
+### Run LongBench workloads
+
+Set `DATASET_NAME=longbench` for LongBench or `DATASET_NAME=longbench_v2` (the
+alias `longbench-v2` is also accepted) for LongBench-v2. `DATASET_PATH` may be
+a JSONL/Parquet file or a repository directory; the runner searches directories
+recursively and deterministically takes the first `NUM_PROMPTS` records. For
+LongBench-v2 on the target machine, the default path is
+`/home/jovyan/td69032/LongBench-v2`:
+
+```bash
+export DATASET_NAME=longbench_v2
+export DATASET_PATH=/home/jovyan/td69032/LongBench-v2
+export NUM_PROMPTS=10
+export LONGBENCH_OUTPUT_LEN=512
+scripts/deepseek_v4_csa_topk/run.sh
+```
+
+The runner converts either dataset to a private ShareGPT-format file in the run
+directory, so the perf and trace passes consume identical prompts. The fixed
+`LONGBENCH_OUTPUT_LEN` defaults to 512 tokens; change it when the experiment
+requires a different decode length. LongBench expects records with `context`,
+`input`, and `answers`; LongBench-v2 expects `context`, `question`, four
+`choice_*` fields, and `answer`. Reading Parquet requires pandas and a supported
+Parquet engine such as PyArrow.
 
 ## Monitor and inspect
 
