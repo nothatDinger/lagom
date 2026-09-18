@@ -8,8 +8,8 @@ Counters are accumulated across CSA layers before the ratio is calculated.
 The gpuq entry point accepts the same environment variable names as the KV
 residency job (`MODEL_PATH`, `RANDOM_INPUT_LEN`, `RANDOM_OUTPUT_LEN`, and
 `NUM_PROMPTS`). Each run is written to its own UTC timestamp directory under
-`${RESULTS_DIR:-results}/scripts/dspark_verfication_step_similarity/`, for
-example `results/scripts/dspark_verfication_step_similarity/20260918_143015/`.
+`${RESULTS_DIR:-results}/dspark_verfication_step_similarity/`, for example
+`results/dspark_verfication_step_similarity/20260918_143015/`.
 Set `RUN_TIMESTAMP` explicitly when a stable run identifier is needed.
 
 The existing residency collector is reused, including its ShareGPT, LongBench,
