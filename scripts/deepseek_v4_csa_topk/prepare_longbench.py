@@ -51,6 +51,8 @@ def format_row(row: dict, variant: str) -> tuple[str, str]:
 
 
 def prepare(input_path: Path, output_path: Path, variant: str, count: int) -> None:
+    if count < 0:
+        raise ValueError("count must be non-negative")
     selected = []
     for path in input_files(input_path):
         for row in read_rows(path):
@@ -63,11 +65,11 @@ def prepare(input_path: Path, output_path: Path, variant: str, count: int) -> No
                     ]
                 }
             )
-            if len(selected) == count:
+            if count and len(selected) == count:
                 break
-        if len(selected) == count:
+        if count and len(selected) == count:
             break
-    if len(selected) < count:
+    if count and len(selected) < count:
         raise ValueError(f"dataset has only {len(selected)} rows, need {count}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(selected, ensure_ascii=False), encoding="utf-8")
@@ -80,7 +82,9 @@ def main() -> None:
     parser.add_argument(
         "--variant", choices=("longbench", "longbench_v2"), required=True
     )
-    parser.add_argument("--count", type=int, default=1)
+    parser.add_argument(
+        "--count", type=int, default=1, help="number of rows; 0 writes all rows"
+    )
     args = parser.parse_args()
     prepare(args.input, args.output, args.variant, args.count)
 

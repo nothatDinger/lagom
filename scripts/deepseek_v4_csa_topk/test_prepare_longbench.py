@@ -67,3 +67,17 @@ def test_prepare_json_array(tmp_path):
     prepared = json.loads(output.read_text(encoding="utf-8"))
     assert "Question: Which?" in prepared[0]["conversations"][0]["value"]
     assert prepared[0]["conversations"][1]["value"] == "B"
+
+
+def test_prepare_zero_count_writes_all_rows(tmp_path):
+    source = tmp_path / "data.jsonl"
+    rows = [
+        {"context": f"document {i}", "input": "summarize", "answers": ["ok"]}
+        for i in range(3)
+    ]
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    output = tmp_path / "prepared.json"
+
+    prepare(source, output, "longbench", 0)
+
+    assert len(json.loads(output.read_text(encoding="utf-8"))) == 3

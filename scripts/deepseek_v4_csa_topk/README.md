@@ -187,9 +187,23 @@ gpuq scripts/deepseek_v4_csa_topk/gpuq_entry.sh
 
 `MODEL_PATH` must point to DeepSeek-V4-Flash-0731, whose bundled DSpark draft
 head is loaded from the same checkpoint; do not set
-`--speculative-draft-model-path`. `DATASET_PATH` is required for ShareGPT and
-LongBench; it may select a LongBench file or directory. LongBench-v2 otherwise
-uses the machine-local default described below.
+`--speculative-draft-model-path`. Set `DATASET_PATH` to a local ShareGPT JSON
+file when `DATASET_NAME=random` on an offline node. Random mode samples real
+token sequences from ShareGPT before repeating or truncating them to
+`RANDOM_INPUT_LEN`; without a valid local JSON file, the benchmark downloads
+the default corpus from Hugging Face. `DATASET_PATH` remains required for the
+explicit ShareGPT and LongBench modes; it may select a LongBench file or
+directory. LongBench-v2 otherwise uses the machine-local default described
+below.
+`REQUEST_INPUT_LENGTH_LIMIT_MODE` passes the server's optional 128K-token
+admission policy and accepts `none` (default), `filter`, or `truncate`.
+For LongBench workloads, `filter` is also applied by the benchmark client while
+it selects samples. Oversized prompts are skipped before the first
+`NUM_PROMPTS` eligible rows are sent, rather than being rejected by the server.
+The client accounts for the fixed `LONGBENCH_OUTPUT_LEN` separately, so the
+input-token boundary remains exactly 131,072 tokens.
+To make replacement rows available, filter mode converts the complete local
+LongBench dataset instead of only the first `NUM_PROMPTS` source rows.
 `SERVER_EXTRA_ARGS` is the supported way to add hardware/checkpoint
 specific SGLang flags without editing the experiment. Run one gpuq allocation
 with enough GPUs for `TP_SIZE`; do not run the four groups as independent jobs,
@@ -205,6 +219,11 @@ If two jobs use the same timestamp and mode, a numeric suffix prevents overwrite
 and `RESULTS_DIR` changes the parent directory rather than the timestamped run
 directory. `run_config.txt` records the mode, input and output paths, MoE
 runner, static-memory fraction, and decode CUDA graph limit used for the run.
+After every perf or trace server exits, the runner waits
+`SERVER_RESTART_DELAY` seconds (default 5) before reusing `PORT`. This avoids a
+bind race during perf-to-trace transitions, including when gpuq assigns `PORT`
+instead of using the example value. Increase the delay if the host retains the
+listener longer; set it to `0` only when immediate port reuse is known to work.
 
 ### Run LongBench workloads
 
