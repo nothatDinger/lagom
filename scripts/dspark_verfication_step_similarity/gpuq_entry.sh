@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RESULTS_DIR="${RESULTS_DIR:-$ROOT/results}"
 [[ "$RESULTS_DIR" == /* ]] || RESULTS_DIR="$ROOT/$RESULTS_DIR"
 RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}"
-OUT="$RESULTS_DIR/scripts/dspark_verfication_step_similarity/$RUN_TIMESTAMP"
+OUT="$RESULTS_DIR/dspark_verfication_step_similarity/$RUN_TIMESTAMP"
 mkdir -p "$OUT"
 printf 'Experiment output: %s\n' "$OUT"
 
@@ -15,7 +15,6 @@ printf 'Experiment output: %s\n' "$OUT"
 : "${RANDOM_OUTPUT_LEN:=512}" "${NUM_PROMPTS:=100}"
 : "${SERVER_RESTART_DELAY:=5}" "${HOST:=127.0.0.1}"
 : "${MOE_RUNNER_BACKEND:=flashinfer_mxfp4}"
-: "${HISPARSE_CONFIG:={\"top_k\":2048,\"host_to_device_ratio\":5}}"
 
 export SGLANG_DSPARK_DEBUG_DUMP=core,reqs
 export SGLANG_DSPARK_RECORD_VERIFICATION_STEP_SIMILARITY=1
@@ -31,7 +30,6 @@ server_args=(
   --trust-remote-code
   --speculative-algorithm DSPARK
   --enable-hisparse
-  --hisparse-config "$HISPARSE_CONFIG"
   --disable-radix-cache
   --disable-cuda-graph
   --moe-runner-backend "$MOE_RUNNER_BACKEND"
