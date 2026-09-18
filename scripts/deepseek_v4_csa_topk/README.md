@@ -212,6 +212,11 @@ If two jobs use the same timestamp and mode, a numeric suffix prevents overwrite
 and `RESULTS_DIR` changes the parent directory rather than the timestamped run
 directory. `run_config.txt` records the mode, input and output paths, MoE
 runner, static-memory fraction, and decode CUDA graph limit used for the run.
+After every perf or trace server exits, the runner waits
+`SERVER_RESTART_DELAY` seconds (default 5) before reusing `PORT`. This avoids a
+bind race during perf-to-trace transitions, including when gpuq assigns `PORT`
+instead of using the example value. Increase the delay if the host retains the
+listener longer; set it to `0` only when immediate port reuse is known to work.
 
 ### Run LongBench workloads
 

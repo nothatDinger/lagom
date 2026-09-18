@@ -44,10 +44,10 @@ while [[ -e "$OUT" ]]; do
   ((collision += 1))
 done
 mkdir -p "$OUT"
-printf 'timestamp_utc=%s\ndeterministic_inference=%s\nmodel_path=%s\ndataset_name=%s\ndataset_path=%s\nrandom_input_len=%s\nrandom_output_len=%s\nlongbench_output_len=%s\nrequest_input_length_limit_mode=%s\nresults_dir=%s\nmoe_runner_backend=%s\nmem_fraction_static=%s\ncuda_graph_max_bs_decode=%s\n' \
+printf 'timestamp_utc=%s\ndeterministic_inference=%s\nmodel_path=%s\ndataset_name=%s\ndataset_path=%s\nrandom_input_len=%s\nrandom_output_len=%s\nlongbench_output_len=%s\nrequest_input_length_limit_mode=%s\nserver_restart_delay=%s\nresults_dir=%s\nmoe_runner_backend=%s\nmem_fraction_static=%s\ncuda_graph_max_bs_decode=%s\n' \
   "$RUN_TIMESTAMP" "$DETERMINISTIC_INFERENCE" "$MODEL_PATH" "$DATASET_NAME" \
   "${DATASET_PATH:-}" "$RANDOM_INPUT_LEN" "$RANDOM_OUTPUT_LEN" "$LONGBENCH_OUTPUT_LEN" \
-  "$REQUEST_INPUT_LENGTH_LIMIT_MODE" "$RESULTS_DIR" "$MOE_RUNNER_BACKEND" "$MEM_FRACTION_STATIC" \
+  "$REQUEST_INPUT_LENGTH_LIMIT_MODE" "$SERVER_RESTART_DELAY" "$RESULTS_DIR" "$MOE_RUNNER_BACKEND" "$MEM_FRACTION_STATIC" \
   "$CUDA_GRAPH_MAX_BS_DECODE" \
   >"$OUT/run_config.txt"
 ln -sfn "$(basename "$OUT")" "$RESULTS_ROOT/latest"
@@ -61,10 +61,20 @@ elif [[ "$DATASET_NAME" == longbench || "$DATASET_NAME" == longbench_v2 || "$DAT
   longbench_variant=$DATASET_NAME
   [[ "$longbench_variant" != longbench-v2 ]] || longbench_variant=longbench_v2
   prepared_dataset="$OUT/${longbench_variant}_first_${NUM_PROMPTS}.json"
+  prepare_count=$NUM_PROMPTS
+  # The client needs later rows available in order to replace samples rejected
+  # by its 128K input-token filter.
+  [[ "$REQUEST_INPUT_LENGTH_LIMIT_MODE" != filter ]] || prepare_count=0
   python3 "$ROOT/scripts/deepseek_v4_csa_topk/prepare_longbench.py" \
     --input "$DATASET_PATH" --output "$prepared_dataset" \
-    --variant "$longbench_variant" --count "$NUM_PROMPTS"
+    --variant "$longbench_variant" --count "$prepare_count"
   benchmark_dataset_args=(--dataset-name sharegpt --dataset-path "$prepared_dataset" --sharegpt-output-len "$LONGBENCH_OUTPUT_LEN")
+  if [[ "$REQUEST_INPUT_LENGTH_LIMIT_MODE" == filter ]]; then
+    # ShareGPT's loader keeps scanning after an oversized row, so apply the
+    # admission policy before selecting NUM_PROMPTS rather than letting the
+    # server reject (for example) LongBench-v2's 273K-token first sample.
+    benchmark_dataset_args+=(--sharegpt-context-len "$((REQUEST_INPUT_LENGTH_LIMIT + LONGBENCH_OUTPUT_LEN))")
+  fi
 elif [[ "$DATASET_NAME" != random ]]; then
   echo "DATASET_NAME must be random, sharegpt, longbench, or longbench_v2" >&2
   exit 2
@@ -80,6 +90,14 @@ write_state() {
   mv "$tmp" "$OUT/run_state.env"
 }
 cleanup() { [[ -z "$server_pid" ]] || kill "$server_pid" 2>/dev/null || true; }
+stop_server() {
+  cleanup
+  [[ -z "$server_pid" ]] || wait "$server_pid" 2>/dev/null || true
+  server_pid=""
+  # launch_server can otherwise race the previous listener's teardown on the
+  # scheduler-assigned PORT when switching between perf and trace.
+  sleep "$SERVER_RESTART_DELAY"
+}
 on_exit() {
   local status=$?
   cleanup
@@ -141,8 +159,8 @@ benchmark() {
 
 for k in 512 1024 2048 4096; do
   rm -f "$OUT/k$k/h2d_trace.tp"*.jsonl
-  run_server "$k" perf; benchmark "$k" perf; cleanup; wait "$server_pid" 2>/dev/null || true; server_pid=""
-  run_server "$k" trace; benchmark "$k" trace; cleanup; wait "$server_pid" 2>/dev/null || true; server_pid=""
+  run_server "$k" perf; benchmark "$k" perf; stop_server
+  run_server "$k" trace; benchmark "$k" trace; stop_server
 done
 current_state=analyzing; current_k="-"; current_mode="analysis"; server_pid=""; write_state
 python3 "$ROOT/scripts/deepseek_v4_csa_topk/analyze.py" --results-dir "$OUT"
