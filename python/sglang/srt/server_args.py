@@ -1458,6 +1458,18 @@ class ServerArgs:
         "Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
         NS("serving"),
     ] = False
+    request_input_length_limit_mode: A[
+        str,
+        Arg(
+            help=(
+                "Limit each tokenized request input to 128K tokens. 'filter' "
+                "rejects inputs over the limit, 'truncate' keeps the first 128K "
+                "tokens, and 'none' disables this additional limit."
+            ),
+            choices=["none", "filter", "truncate"],
+        ),
+        NS("serving"),
+    ] = "none"
 
     # -------------------------------------------------------------------------
     # Streaming
