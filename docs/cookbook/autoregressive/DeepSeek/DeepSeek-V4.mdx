@@ -602,4 +602,61 @@ Larger blocks can improve decode latency when acceptance stays high, but they al
 
 For every candidate, compare with the same recipe without `--speculative-algorithm DSPARK`. Restart the server between the DSpark and non-speculative legs, keep the request corpus, sampling, concurrency, and warmup identical, and give each `bench_serving` leg its own `--flush-cache`. Leave `--speculative-draft-attention-backend` unset unless a separate profiling run justifies an override.
 
+#### Measure confidence-filter boundary tokens
+
+You can collect token-level records to answer three questions: how confident the draft was about filtered tokens, how often target verification would accept tokens near the filter boundary, and—when DeepSeek-V4 HiSparse is active—the CSA cache-miss rate for those boundary tokens. Collection synchronizes small GPU tensors to the host, so use it only in an isolated experiment.
+
+Run the same fixed request corpus at least three times, changing only the output path and random seed. Use `cap-accept`, rather than `compact`, for this experiment: it applies the scheduler's acceptance cap while retaining the full target-verification rows needed for counterfactual acceptance labels. The scripts under `scripts/dspark_filter_experiment` keep configuration and execution code together, and write generated records, logs, benchmark output, SPS artifacts, and reports under `results/dspark_filter_experiment`.
+
+Pass the model and dataset paths only through environment variables. Tune other defaults in `scripts/dspark_filter_experiment/config.sh` or override them in the environment:
+
+```bash Command
+export MODEL_PATH=deepseek-ai/DeepSeek-V4-Flash-0731
+export DATASET_PATH=/path/to/ShareGPT_V3_unfiltered_cleaned_split.json
+export DATASET_NAME=sharegpt
+export DATASET_SAMPLING=head
+export DATASET_SAMPLE_SIZE=100
+export NUM_PROMPTS=100
+
+bash scripts/dspark_filter_experiment/profile_sps.sh
+bash scripts/dspark_filter_experiment/run_experiment.sh
+```
+
+When GPUs are allocated through GPUQ, submit `scripts/dspark_filter_experiment/gpuq_job.sh` as one queued job. Keeping SPS profiling and all experiment repetitions in one job ensures that the server and benchmark client share the allocation:
+
+```bash Command
+gpuq <site allocation flags> -- \
+  env MODEL_PATH=deepseek-ai/DeepSeek-V4-Flash-0731 \
+      DATASET_PATH=/path/to/ShareGPT_V3_unfiltered_cleaned_split.json \
+      TP_SIZE=4 \
+    bash scripts/dspark_filter_experiment/gpuq_job.sh
+```
+
+GPUQ flags differ between clusters, so replace `<site allocation flags>` with your installation's GPU count, queue, and timeout flags. If GPUQ already exports the variables, submit only the payload script. Set `EXPERIMENT_ENV_SETUP_SCRIPT` to a shell script when the non-interactive job must activate a virtual environment. The payload prints `CUDA_VISIBLE_DEVICES`, changes to the repository root, profiles SPS, runs all repetitions, and leaves every artifact under `results/dspark_filter_experiment`.
+
+The SPS table is required for a meaningful dynamic boundary; an uninitialized table degenerates to verify-all. `DATASET_SAMPLING=head` selects the first `DATASET_SAMPLE_SIZE` rows before starting any repetition, so the example always tests the same first 100 ShareGPT records. Set it to `random` for a reproducible sample controlled by `DATASET_SAMPLE_SEED`, or `all` to use the complete JSON array. The prepared dataset is saved under `results/dspark_filter_experiment/datasets`.
+
+The scripts restart the server for every run, remove stale JSONL output, use request seeds starting at `BASE_SEED`, and keep all other settings fixed. Override `TP_SIZE`, `RUN_COUNT`, `NUM_PROMPTS`, `MAX_CONCURRENCY`, `REQUEST_RATE`, or `EDGE_MARGIN` before running. Use `EXTRA_SERVER_ARGS`, `EXTRA_SPS_ARGS`, and `EXTRA_BENCH_ARGS` for flags without dedicated variables; for example, export `EXTRA_SERVER_ARGS="--enable-hisparse"` to collect DeepSeek-V4 CSA misses.
+
+DeepSeek-V4 cold startup can exceed 15 minutes while loading weights, autotuning, and capturing graphs. The scripts wait 30 minutes by default; set `SERVER_READY_TIMEOUT_SECONDS=3600` for a one-hour limit. On an early exit or timeout they print the last 200 server-log lines, which contain the actionable error hidden by the old generic health-check message. Shutdown sends SIGTERM and waits up to 120 seconds before SIGKILL so multiprocessing workers can release semaphores and shared memory. Treat Python `resource_tracker` leaked-semaphore/shared-memory warnings as shutdown symptoms and inspect the preceding server-log tail for the root cause.
+
+The SPS profiler requires its server to report exactly `SGLANG_SIMULATE_ACC_LEN=1.0`; `profile_sps.sh` now exports that value automatically together with `SGLANG_DSPARK_ENABLE_SPS_RECORD=1`. Both variables are scoped to the profiling script, so the subsequent filter-boundary runs still measure real acceptance rather than simulated acceptance.
+
+The profiling wrapper uses the profiler's `all` subcommand. The `run` subcommand creates only raw `.records.jsonl` and `.rounds.jsonl` measurements; it does not fit or create `sps/dspark-sps.json`, so it cannot be followed directly by `run_experiment.sh`. The wrapper also verifies that the fitted table exists before reporting success.
+
+After the workload finishes, the experiment script automatically summarizes every repetition with this equivalent command:
+
+```bash Command
+python scripts/analyze_dspark_filter.py \
+  results/dspark_filter_experiment/raw/run-1.jsonl \
+  results/dspark_filter_experiment/raw/run-2.jsonl \
+  results/dspark_filter_experiment/raw/run-3.jsonl \
+  --margin 0.02 \
+  --output results/dspark_filter_experiment/reports/summary.json
+```
+
+`filtered_confidence_mean` reports the confidence head's conditional token score, while `filtered_survival_mean` reports the cumulative probability used for prefix scheduling. For each request, the effective boundary is the midpoint between the last retained and first filtered survival score. `--margin` selects filtered tokens whose survival score is within that absolute distance of the boundary. `edge_target_accept_rate` is the target model's counterfactual acceptance rate for that set.
+
+`edge_csa_cache_miss_rate` is populated only while DeepSeek-V4 HiSparse is active. It is the request's CSA lookup miss rate accumulated across sparse target-verification layers and associated with each selected boundary token from that request. `edge_csa_samples` is therefore the number of boundary-token observations, not the raw lookup denominator. A `null` rate or zero samples means that the run did not expose CSA residency observations; do not treat it as a zero miss rate. Compare the per-run JSON summaries and report the mean and spread across repetitions rather than pooling away run-to-run variation.
+
 DSpark currently requires CUDA, `pp_size == 1`, and DP Attention disabled. It is not compatible with PD disaggregation on current SGLang releases; selecting a prefill or decode role in the Playground automatically removes the inherited DSpark flags. The DP-Attention and MI355X Flash Official recipes therefore run target-only. If a larger draft block or concurrency causes graph-capture OOM, lower `--mem-fraction-static`, the draft block size, or the configured maximum running requests, then rerun both performance and accuracy gates.
