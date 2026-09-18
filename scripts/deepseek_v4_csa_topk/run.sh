@@ -12,16 +12,10 @@ RANDOM_INPUT_LEN=${RANDOM_INPUT_LEN:-110000}
 RANDOM_OUTPUT_LEN=${RANDOM_OUTPUT_LEN:-512}
 LONGBENCH_OUTPUT_LEN=${LONGBENCH_OUTPUT_LEN:-512}
 REQUEST_INPUT_LENGTH_LIMIT_MODE=${REQUEST_INPUT_LENGTH_LIMIT_MODE:-none}
-REQUEST_INPUT_LENGTH_LIMIT=131072
-SERVER_RESTART_DELAY=${SERVER_RESTART_DELAY:-5}
 case "$REQUEST_INPUT_LENGTH_LIMIT_MODE" in
   none|filter|truncate) ;;
   *) echo "REQUEST_INPUT_LENGTH_LIMIT_MODE must be none, filter, or truncate" >&2; exit 2 ;;
 esac
-if ! [[ "$SERVER_RESTART_DELAY" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-  echo "SERVER_RESTART_DELAY must be a non-negative number" >&2
-  exit 2
-fi
 if [[ "$DATASET_NAME" == sharegpt ]]; then
   : "${DATASET_PATH:?set DATASET_PATH when DATASET_NAME=sharegpt}"
 elif [[ "$DATASET_NAME" == longbench ]]; then

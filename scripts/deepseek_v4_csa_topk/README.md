@@ -197,13 +197,6 @@ directory. LongBench-v2 otherwise uses the machine-local default described
 below.
 `REQUEST_INPUT_LENGTH_LIMIT_MODE` passes the server's optional 128K-token
 admission policy and accepts `none` (default), `filter`, or `truncate`.
-For LongBench workloads, `filter` is also applied by the benchmark client while
-it selects samples. Oversized prompts are skipped before the first
-`NUM_PROMPTS` eligible rows are sent, rather than being rejected by the server.
-The client accounts for the fixed `LONGBENCH_OUTPUT_LEN` separately, so the
-input-token boundary remains exactly 131,072 tokens.
-To make replacement rows available, filter mode converts the complete local
-LongBench dataset instead of only the first `NUM_PROMPTS` source rows.
 `SERVER_EXTRA_ARGS` is the supported way to add hardware/checkpoint
 specific SGLang flags without editing the experiment. Run one gpuq allocation
 with enough GPUs for `TP_SIZE`; do not run the four groups as independent jobs,
