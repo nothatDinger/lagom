@@ -187,9 +187,16 @@ gpuq scripts/deepseek_v4_csa_topk/gpuq_entry.sh
 
 `MODEL_PATH` must point to DeepSeek-V4-Flash-0731, whose bundled DSpark draft
 head is loaded from the same checkpoint; do not set
-`--speculative-draft-model-path`. `DATASET_PATH` is required for ShareGPT and
-LongBench; it may select a LongBench file or directory. LongBench-v2 otherwise
-uses the machine-local default described below.
+`--speculative-draft-model-path`. Set `DATASET_PATH` to a local ShareGPT JSON
+file when `DATASET_NAME=random` on an offline node. Random mode samples real
+token sequences from ShareGPT before repeating or truncating them to
+`RANDOM_INPUT_LEN`; without a valid local JSON file, the benchmark downloads
+the default corpus from Hugging Face. `DATASET_PATH` remains required for the
+explicit ShareGPT and LongBench modes; it may select a LongBench file or
+directory. LongBench-v2 otherwise uses the machine-local default described
+below.
+`REQUEST_INPUT_LENGTH_LIMIT_MODE` passes the server's optional 128K-token
+admission policy and accepts `none` (default), `filter`, or `truncate`.
 `SERVER_EXTRA_ARGS` is the supported way to add hardware/checkpoint
 specific SGLang flags without editing the experiment. Run one gpuq allocation
 with enough GPUs for `TP_SIZE`; do not run the four groups as independent jobs,
