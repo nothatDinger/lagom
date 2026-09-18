@@ -174,6 +174,17 @@ LongBench-v2 contains very long contexts (up to 2M words). Consider:
 2. **Batch Size**: Use smaller batch sizes for longer contexts
 3. **Parallel Processing**: Adjust `num_threads` based on available resources
 
+When `SGLANG_REQUEST_INPUT_LENGTH_LIMIT_MODE=filter`, the evaluation client
+applies `SGLANG_REQUEST_INPUT_LENGTH_LIMIT` before selecting `num_examples`.
+For example, the following configuration skips inputs over 128K tokens and
+continues scanning the dataset until it has selected the requested number of
+eligible examples:
+
+```bash
+export SGLANG_REQUEST_INPUT_LENGTH_LIMIT=131072
+export SGLANG_REQUEST_INPUT_LENGTH_LIMIT_MODE=filter
+```
+
 ### Evaluation Time
 
 - Full evaluation (503 examples) can take several hours
