@@ -264,8 +264,13 @@ class HiSparseCoordinator:
         # free" floor. Produces garbage output; benchmarking only.
         self.skip_io = envs.SGLANG_DEBUG_HISPARSE_SKIP_IO.get()
         self.record_dspark_kv_residency = envs.SGLANG_DSPARK_RECORD_KV_RESIDENCY.get()
+        self.record_dspark_verification_step_similarity = (
+            envs.SGLANG_DSPARK_RECORD_VERIFICATION_STEP_SIMILARITY.get()
+        )
         self._dspark_kv_hits: Optional[torch.Tensor] = None
         self._dspark_kv_totals: Optional[torch.Tensor] = None
+        self._dspark_similarity_intersections: Optional[torch.Tensor] = None
+        self._dspark_similarity_unions: Optional[torch.Tensor] = None
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
         self.is_dsv4_hisparse = isinstance(
@@ -683,6 +688,30 @@ class HiSparseCoordinator:
             hits.view(batch_size, verify_width)[:, 1:],
             totals.view(batch_size, verify_width)[:, 1:],
         )
+
+    def take_dspark_verification_step_similarity(
+        self, *, batch_size: int, verify_width: int
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Return and clear CSA Top-K pairwise set sizes for draft rows.
+
+        The leading verify row is the already committed anchor, so the returned
+        matrices cover only the ``verify_width - 1`` draft-token rows. Values
+        are sums over all observed CSA layers; their ratio is Jaccard overlap.
+        """
+        intersections = self._dspark_similarity_intersections
+        unions = self._dspark_similarity_unions
+        self._dspark_similarity_intersections = None
+        self._dspark_similarity_unions = None
+        draft_width = verify_width - 1
+        expected_shape = (batch_size, draft_width, draft_width)
+        if (
+            intersections is None
+            or unions is None
+            or tuple(intersections.shape) != expected_shape
+            or tuple(unions.shape) != expected_shape
+        ):
+            return None, None
+        return intersections, unions
 
     def _init_shared_index_prefetch(
         self,
@@ -2101,6 +2130,46 @@ class HiSparseCoordinator:
                 self._dspark_kv_hits = self._dspark_kv_hits + hits
                 self._dspark_kv_totals = self._dspark_kv_totals + totals
 
+        if self.record_dspark_verification_step_similarity:
+            if verify_lens_cpu is None:
+                width = top_k_result.size(0) // batch_size
+                row_counts = [width] * batch_size
+            else:
+                row_counts = verify_lens_cpu
+            rows = top_k_result[: sum(row_counts), : self.top_k]
+            draft_width = self._speculative_verify_width - 1
+            intersections = torch.zeros(
+                (batch_size, draft_width, draft_width),
+                dtype=torch.int64,
+                device=rows.device,
+            )
+            unions = torch.zeros_like(intersections)
+            offset = 0
+            for req, row_count in enumerate(row_counts):
+                # Row zero is the committed anchor used to start verification;
+                # the remaining rows correspond one-to-one with draft tokens.
+                draft_rows = rows[offset + 1 : offset + row_count]
+                offset += row_count
+                valid = draft_rows >= 0
+                valid_counts = valid.sum(dim=-1)
+                for left in range(draft_rows.size(0)):
+                    for right in range(left, draft_rows.size(0)):
+                        intersection = (
+                            torch.isin(draft_rows[left], draft_rows[right])
+                            & valid[left]
+                        ).sum()
+                        union = valid_counts[left] + valid_counts[right] - intersection
+                        intersections[req, left, right] = intersection
+                        intersections[req, right, left] = intersection
+                        unions[req, left, right] = union
+                        unions[req, right, left] = union
+            if self._dspark_similarity_intersections is None:
+                self._dspark_similarity_intersections = intersections
+                self._dspark_similarity_unions = unions
+            else:
+                self._dspark_similarity_intersections.add_(intersections)
+                self._dspark_similarity_unions.add_(unions)
+
         if verify_lens_cpu is None:
             if top_k_result.size(0) % batch_size != 0:
                 raise ValueError(
@@ -2217,6 +2286,9 @@ class HiSparseCoordinator:
         if self.record_dspark_kv_residency:
             self._dspark_kv_hits = None
             self._dspark_kv_totals = None
+        if self.record_dspark_verification_step_similarity:
+            self._dspark_similarity_intersections = None
+            self._dspark_similarity_unions = None
         if self._has_pending_dspark_commit:
             # Commit copies may have been issued by another producer stream.
             # A stream dependency preserves overlap without a CPU-wide barrier.

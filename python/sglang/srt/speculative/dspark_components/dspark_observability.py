@@ -91,6 +91,8 @@ class ReqDetail(msgspec.Struct, omit_defaults=True):
     survival: Optional[list[float]] = None
     kv_hit_counts: Optional[list[int]] = None
     kv_topk_counts: Optional[list[int]] = None
+    csa_topk_intersections: Optional[list[list[int]]] = None
+    csa_topk_unions: Optional[list[list[int]]] = None
 
 
 class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
@@ -137,6 +139,8 @@ class DecodeStepObservation(msgspec.Struct):
     rids: Optional[list[str]]
     kv_hit_counts: Optional[torch.Tensor] = None
     kv_topk_counts: Optional[torch.Tensor] = None
+    similarity_intersections: Optional[torch.Tensor] = None
+    similarity_unions: Optional[torch.Tensor] = None
 
 
 class _PendingStep(msgspec.Struct):
@@ -336,6 +340,9 @@ class DsparkInfoDumper:
         if obs.kv_hit_counts is not None:
             tensors["kv_hit_counts"] = obs.kv_hit_counts
             tensors["kv_topk_counts"] = obs.kv_topk_counts
+        if obs.similarity_intersections is not None:
+            tensors["similarity_intersections"] = obs.similarity_intersections
+            tensors["similarity_unions"] = obs.similarity_unions
         return FutureTensors.device_to_host(tensors, d2h_stream=self._d2h_stream)
 
     def _drain_pending(self) -> None:
@@ -462,6 +469,11 @@ class DsparkInfoDumper:
         if kv_hit_rows is not None:
             kv_hit_rows = kv_hit_rows.tolist()
             kv_topk_rows = kv_topk_rows.tolist()
+        similarity_intersections = host.get("similarity_intersections")
+        similarity_unions = host.get("similarity_unions")
+        if similarity_intersections is not None:
+            similarity_intersections = similarity_intersections.tolist()
+            similarity_unions = similarity_unions.tolist()
 
         reqs: list[ReqDetail] = []
         for row in range(bs):
@@ -500,6 +512,14 @@ class DsparkInfoDumper:
                         None
                         if kv_topk_rows is None
                         else [int(x) for x in kv_topk_rows[row]]
+                    ),
+                    csa_topk_intersections=(
+                        None
+                        if similarity_intersections is None
+                        else similarity_intersections[row]
+                    ),
+                    csa_topk_unions=(
+                        None if similarity_unions is None else similarity_unions[row]
                     ),
                 )
             )
@@ -860,6 +880,8 @@ class DsparkStepObservers:
         dp_tier_num_tokens: Optional[int],
         kv_hit_counts: Optional[torch.Tensor] = None,
         kv_topk_counts: Optional[torch.Tensor] = None,
+        similarity_intersections: Optional[torch.Tensor] = None,
+        similarity_unions: Optional[torch.Tensor] = None,
     ) -> None:
         planner = self._planner
         if not proposal_folded:
@@ -949,6 +971,8 @@ class DsparkStepObservers:
                     rids=[req.rid for req in reqs],
                     kv_hit_counts=kv_hit_counts,
                     kv_topk_counts=kv_topk_counts,
+                    similarity_intersections=similarity_intersections,
+                    similarity_unions=similarity_unions,
                 )
             )
 

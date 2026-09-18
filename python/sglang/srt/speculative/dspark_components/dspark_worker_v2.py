@@ -785,9 +785,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         logits_output.hidden_states = None
 
         kv_hit_counts = kv_topk_counts = None
+        similarity_intersections = similarity_unions = None
         if hisparse_window is not None:
             kv_hit_counts, kv_topk_counts = (
                 hisparse_coordinator.take_dspark_kv_residency(
+                    batch_size=bs, verify_width=verify_ids_2d.shape[1]
+                )
+            )
+            similarity_intersections, similarity_unions = (
+                hisparse_coordinator.take_dspark_verification_step_similarity(
                     batch_size=bs, verify_width=verify_ids_2d.shape[1]
                 )
             )
@@ -815,6 +821,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
             kv_hit_counts=kv_hit_counts,
             kv_topk_counts=kv_topk_counts,
+            similarity_intersections=similarity_intersections,
+            similarity_unions=similarity_unions,
         )
 
         next_draft_input = make_next_draft_input(

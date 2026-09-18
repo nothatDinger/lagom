@@ -457,6 +457,9 @@ class Envs:
     # Experiment-only probe: retain pre-swap CSA Top-K residency counts for
     # each DSpark verify row. The counts are exported by the DSpark info dump.
     SGLANG_DSPARK_RECORD_KV_RESIDENCY = EnvBool(False)
+    # Experiment-only probe: compute pairwise Jaccard numerators and
+    # denominators for the draft-token CSA Top-K sets in each verify step.
+    SGLANG_DSPARK_RECORD_VERIFICATION_STEP_SIMILARITY = EnvBool(False)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
