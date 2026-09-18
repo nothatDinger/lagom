@@ -43,6 +43,42 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_request_input_length_limit_cli(self):
+        disabled = ServerArgs(model_path="dummy")
+        self.assertEqual(disabled.request_input_length_limit, 128 * 1024)
+        self.assertEqual(disabled.request_input_length_limit_mode, "filter")
+
+        for mode in ("filter", "truncate"):
+            parsed = prepare_server_args(
+                [
+                    "--model-path",
+                    "dummy",
+                    "--request-input-length-limit",
+                    "4096",
+                    "--request-input-length-limit-mode",
+                    mode,
+                ]
+            )
+            self.assertEqual(parsed.request_input_length_limit, 4096)
+            self.assertEqual(parsed.request_input_length_limit_mode, mode)
+
+    def test_request_input_length_limit_environment(self):
+        with (
+            envs.SGLANG_REQUEST_INPUT_LENGTH_LIMIT.override(2048),
+            envs.SGLANG_REQUEST_INPUT_LENGTH_LIMIT_MODE.override("truncate"),
+        ):
+            server_args = ServerArgs(model_path="dummy")
+
+        self.assertEqual(server_args.request_input_length_limit, 2048)
+        self.assertEqual(server_args.request_input_length_limit_mode, "truncate")
+
+    def test_request_input_length_limit_validation(self):
+        with self.assertRaisesRegex(ValueError, "must be non-negative"):
+            ServerArgs(model_path="dummy", request_input_length_limit=-1)
+
+        with self.assertRaisesRegex(ValueError, "must be one of"):
+            ServerArgs(model_path="dummy", request_input_length_limit_mode="invalid")
+
     def test_return_hidden_states_mode_configuration(self):
         disabled = ServerArgs(model_path="dummy")
         self.assertFalse(disabled.enable_return_hidden_states)

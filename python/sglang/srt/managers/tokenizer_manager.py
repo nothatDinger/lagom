@@ -418,6 +418,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.enable_lora = get_lora().enable_lora
         self.enable_trace = server_args.enable_trace
         self.allow_auto_truncate = server_args.allow_auto_truncate
+        self.request_input_length_limit = server_args.request_input_length_limit
+        self.request_input_length_limit_mode = (
+            server_args.request_input_length_limit_mode
+        )
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.preferred_sampling_params = get_serving().preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
@@ -1197,6 +1201,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
+        if (
+            input_ids is not None
+            and self.request_input_length_limit > 0
+            and len(input_ids) > self.request_input_length_limit
+        ):
+            if self.request_input_length_limit_mode == "truncate":
+                logger.warning(
+                    "The request input (%s tokens) exceeds the configured input "
+                    "limit (%s tokens). Truncating the input.",
+                    len(input_ids),
+                    self.request_input_length_limit,
+                )
+                del input_ids[self.request_input_length_limit :]
+            else:
+                raise ValueError(
+                    f"The request input ({len(input_ids)} tokens) exceeds the "
+                    "configured input limit "
+                    f"({self.request_input_length_limit} tokens)."
+                )
+
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0

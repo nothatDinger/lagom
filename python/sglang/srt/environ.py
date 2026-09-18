@@ -311,6 +311,10 @@ class Envs:
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
     # Override parsed request fields from headers.
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
+    # Maximum tokenized input length accepted at ingress and how overflow is
+    # handled. Set the limit to 0 to disable this guard.
+    SGLANG_REQUEST_INPUT_LENGTH_LIMIT = EnvInt(128 * 1024)
+    SGLANG_REQUEST_INPUT_LENGTH_LIMIT_MODE = EnvStr("filter")
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is

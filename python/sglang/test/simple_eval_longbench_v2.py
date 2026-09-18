@@ -14,6 +14,8 @@ from typing import Any, Dict, List, Optional
 
 from transformers import AutoTokenizer
 
+from sglang.srt.environ import envs
+
 from sglang.test import simple_eval_common as common
 from sglang.test.simple_eval_common import (
     ANSWER_PATTERN_MULTICHOICE,
@@ -130,18 +132,41 @@ class LongBenchV2Eval(Eval):
             num_threads: Number of threads for parallel processing
             n_repeats: Number of times to repeat evaluation for error bars
             categories: List of task categories to include (None for all)
-            max_context_length: Maximum context length in characters
-            min_context_length: Minimum context length in characters
+            max_context_length: Maximum context length in tokens
+            min_context_length: Minimum context length in tokens
         """
         self.tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
         self.min_context_length = min_context_length
         self.max_context_length = max_context_length
+        request_limit = envs.SGLANG_REQUEST_INPUT_LENGTH_LIMIT.get()
+        request_limit_mode = envs.SGLANG_REQUEST_INPUT_LENGTH_LIMIT_MODE.get()
+        if request_limit_mode == "filter" and request_limit > 0:
+            self.max_context_length = (
+                request_limit
+                if self.max_context_length is None
+                else min(self.max_context_length, request_limit)
+            )
         # Load dataset based on data source type
         examples = self._load_dataset(data_source)
 
         # Apply filtering
         if categories:
             examples = [ex for ex in examples if ex.get("category") in categories]
+
+        # Filter before taking num_examples. LongBench-v2 is ordered and its
+        # first entries can exceed 128K tokens; slicing first would still send
+        # those oversized requests and return fewer than the requested count.
+        if self.min_context_length is not None or self.max_context_length is not None:
+            examples = [
+                example
+                for example in examples
+                if self._check_context_length(
+                    format_longbench_v2_question(example),
+                    self.tokenizer,
+                    self.min_context_length,
+                    self.max_context_length,
+                )
+            ]
 
         # Sample examples if specified
         if num_examples:
@@ -163,9 +188,10 @@ class LongBenchV2Eval(Eval):
         print(f"Loaded {len(self.examples)} examples from LongBench-v2")
         if categories:
             print(f"Filtered to categories: {categories}")
-        if min_context_length or max_context_length:
+        if self.min_context_length is not None or self.max_context_length is not None:
             print(
-                f"Context length filter: {min_context_length}-{max_context_length} characters"
+                "Context length filter: "
+                f"{self.min_context_length}-{self.max_context_length} tokens"
             )
 
     def _load_dataset(self, data_source: str) -> List[Dict[str, Any]]:
@@ -258,7 +284,7 @@ class LongBenchV2Eval(Eval):
         min_length: Optional[int],
         max_length: Optional[int],
     ) -> bool:
-        """Filter examples by context length measured in characters."""
+        """Filter examples by tokenized context length."""
         input_ids = tokenizer.encode(formatted_question)
         context_length = len(input_ids)
 
@@ -275,16 +301,6 @@ class LongBenchV2Eval(Eval):
         def fn(row: dict):
             # Format the question using official template
             formatted_question = format_longbench_v2_question(row)
-
-            if self.min_context_length or self.max_context_length:
-                if not self._check_context_length(
-                    formatted_question,
-                    self.tokenizer,
-                    self.min_context_length,
-                    self.max_context_length,
-                ):
-                    # Skip this example
-                    return None
 
             prompt_messages = [
                 sampler._pack_message(content=formatted_question, role="user")

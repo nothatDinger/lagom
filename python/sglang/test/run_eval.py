@@ -518,12 +518,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-context-length",
         type=int,
-        help="Maximum context length in characters for LongBench-v2",
+        help="Maximum context length in tokens for LongBench-v2. In filter mode, SGLANG_REQUEST_INPUT_LENGTH_LIMIT is also applied.",
     )
     parser.add_argument(
         "--min-context-length",
         type=int,
-        help="Minimum context length in characters for LongBench-v2",
+        help="Minimum context length in tokens for LongBench-v2",
     )
     parser.add_argument(
         "--num-shots",
