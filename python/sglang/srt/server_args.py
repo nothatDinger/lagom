@@ -1458,6 +1458,25 @@ class ServerArgs:
         "Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
         NS("serving"),
     ] = False
+    request_input_length_limit: A[
+        int,
+        Arg(
+            help="Maximum request input length in tokens. Defaults to SGLANG_REQUEST_INPUT_LENGTH_LIMIT (128K); set to 0 to disable the limit.",
+        ),
+        NS("serving"),
+    ] = dataclasses.field(
+        default_factory=envs.SGLANG_REQUEST_INPUT_LENGTH_LIMIT.get
+    )
+    request_input_length_limit_mode: A[
+        Literal["filter", "truncate"],
+        Arg(
+            help="How to handle inputs over --request-input-length-limit. Defaults to SGLANG_REQUEST_INPUT_LENGTH_LIMIT_MODE ('filter').",
+            choices=["filter", "truncate"],
+        ),
+        NS("serving"),
+    ] = dataclasses.field(
+        default_factory=envs.SGLANG_REQUEST_INPUT_LENGTH_LIMIT_MODE.get
+    )
 
     # -------------------------------------------------------------------------
     # Streaming
@@ -3619,6 +3638,7 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        self._handle_request_input_length_limit()
         self._handle_moe_runner_backend_alias()
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
@@ -3790,6 +3810,14 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+
+    def _handle_request_input_length_limit(self):
+        if self.request_input_length_limit < 0:
+            raise ValueError("request_input_length_limit must be non-negative")
+        if self.request_input_length_limit_mode not in ("filter", "truncate"):
+            raise ValueError(
+                "request_input_length_limit_mode must be one of: filter, truncate"
+            )
 
     def _handle_moe_runner_backend_alias(self):
         if self.moe_runner_backend != "megamoe":
