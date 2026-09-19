@@ -11,8 +11,9 @@ set -Eeuo pipefail
   --env "PATH=/home/jovyan/td69032/lagom/.venv/bin:$PATH" \
   --env DETERMINISTIC_INFERENCE=0 \
   --env MODEL_PATH=/mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-0731/ \
-  --env DATASET_NAME=random \
-  --env DATASET_PATH=/home/jovyan/td69032/ShareGPT_V3_unfiltered_cleaned_split.json \
+  --env DATASET_NAME=longbench_v2 \
+  --env DATASET_PATH=/home/jovyan/td69032/LongBench-v2/data.parquet \
+  --env LONGBENCH_CONTEXT_LEN=131072 \
   --env RANDOM_INPUT_LEN=128000 \
   --env RANDOM_OUTPUT_LEN=512 \
   --env NUM_PROMPTS=100 \

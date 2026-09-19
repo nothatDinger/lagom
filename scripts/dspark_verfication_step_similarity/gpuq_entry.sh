@@ -16,6 +16,12 @@ printf 'Experiment output: %s\n' "$OUT"
 : "${SERVER_RESTART_DELAY:=5}" "${HOST:=127.0.0.1}"
 : "${MOE_RUNNER_BACKEND:=flashinfer_mxfp4}"
 
+# The benchmark CLI spells this dataset with an underscore, while the dataset
+# and some of our older experiment scripts use a hyphen.
+if [[ "$DATASET_NAME" == "longbench-v2" ]]; then
+  DATASET_NAME=longbench_v2
+fi
+
 export SGLANG_DSPARK_DEBUG_DUMP=core,reqs
 export SGLANG_DSPARK_RECORD_VERIFICATION_STEP_SIMILARITY=1
 if [[ "${DETERMINISTIC_INFERENCE:-0}" == "1" ]]; then
@@ -50,12 +56,25 @@ BASE_URL="http://$HOST:$PORT"
 python3 "$ROOT/scripts/dspark_verfication_step_similarity/dump_records.py" prepare \
   --base-url "$BASE_URL" --restart-delay "$SERVER_RESTART_DELAY"
 
-python3 -m sglang.benchmark.serving \
+benchmark_args=(
   --backend sglang --host "$HOST" --port "$PORT" --model "$MODEL_PATH" \
   --dataset-name "$DATASET_NAME" --dataset-path "${DATASET_PATH:-}" \
   --random-input-len "$RANDOM_INPUT_LEN" --random-output-len "$RANDOM_OUTPUT_LEN" \
   --random-range-ratio 0 --num-prompts "$NUM_PROMPTS" \
-  --output-file "$OUT/benchmark.jsonl" 2>&1 | tee "$OUT/client.log"
+  --output-file "$OUT/benchmark.jsonl"
+)
+if [[ "$DATASET_NAME" == "longbench_v2" ]]; then
+  [[ -n "${DATASET_PATH:-}" ]] || {
+    echo "DATASET_PATH is required for the longbench_v2 gpuq workload" >&2
+    exit 2
+  }
+  benchmark_args+=(--sharegpt-output-len "$RANDOM_OUTPUT_LEN")
+  if [[ -n "${LONGBENCH_CONTEXT_LEN:-}" ]]; then
+    benchmark_args+=(--sharegpt-context-len "$LONGBENCH_CONTEXT_LEN")
+  fi
+fi
+python3 -m sglang.benchmark.serving "${benchmark_args[@]}" \
+  2>&1 | tee "$OUT/client.log"
 
 python3 "$ROOT/scripts/dspark_verfication_step_similarity/dump_records.py" dump \
   --base-url "$BASE_URL" --output "$OUT/raw_records.json" \
