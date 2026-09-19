@@ -1,6 +1,8 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
+import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, NamedTuple, Optional, Tuple, Union
 
@@ -263,6 +265,10 @@ class HiSparseCoordinator:
         # Timing probe: skip the host->device KV bytes to measure the "IO is
         # free" floor. Produces garbage output; benchmarking only.
         self.skip_io = envs.SGLANG_DEBUG_HISPARSE_SKIP_IO.get()
+        self._h2d_trace_path = envs.SGLANG_HISPARSE_H2D_TRACE_PATH.get()
+        self._h2d_trace_step = 0
+        self._h2d_trace_last_seq_len = -1
+        self._h2d_trace_accepted_tokens: Dict[int, int] = {}
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
         self.is_dsv4_hisparse = isinstance(
@@ -1905,9 +1911,11 @@ class HiSparseCoordinator:
                 self._submit_previous_prefetch(
                     req_pool_indices,
                     compressed_seq_lens,
-                    top_k_result
-                    if prefetch_candidates is None
-                    else prefetch_candidates,
+                    (
+                        top_k_result
+                        if prefetch_candidates is None
+                        else prefetch_candidates
+                    ),
                     layer_id,
                 )
             elif self.prefetcher_name == "ema" and prefetch_candidates is not None:
@@ -1999,6 +2007,11 @@ class HiSparseCoordinator:
             skip_io=True,
             verify_width=verify_width,
         )
+        trace_this_call = bool(self._h2d_trace_path)
+        if trace_this_call:
+            h2d_start = device_module.Event(enable_timing=True)
+            h2d_end = device_module.Event(enable_timing=True)
+            h2d_start.record()
         copy_cache_planned_mla(
             miss_src=miss_src,
             miss_dst=miss_dst,
@@ -2011,6 +2024,62 @@ class HiSparseCoordinator:
             is_dsv4_layout=True,
             skip_io=self.skip_io,
         )
+        if trace_this_call:
+            h2d_end.record()
+            h2d_end.synchronize()
+            # This intentionally synchronizes and copies the counters to host.
+            # Use a separate profiling pass; never use its TPOT as the result.
+            # ``req_pool_indices`` can be a padded execution bucket even when
+            # the scheduler/commit transaction contains fewer live requests.
+            # The planner masks those rows with ``num_real_reqs``; do not leak
+            # their zero counters into the trace and create H2D/commit geometry
+            # mismatches downstream.
+            real_num_reqs = min(int(self.num_real_reqs.item()), num_reqs)
+            counts = (
+                miss_count[:real_num_reqs].to(device="cpu", dtype=torch.int64).tolist()
+            )
+            request_pool_indices = (
+                req_pool_indices[:real_num_reqs]
+                .to(device="cpu", dtype=torch.int64)
+                .tolist()
+            )
+            # The supplied experiment uses concurrency=1. A reused request-pool
+            # slot is detected by its compressed sequence length moving back.
+            current_seq_len = int(compressed_seq_lens.reshape(-1)[0].item())
+            if compressed_seq_lens.numel() == num_reqs:
+                seq_lens_per_request = compressed_seq_lens[:real_num_reqs]
+            else:
+                seq_lens_per_request = compressed_seq_lens.reshape(
+                    num_reqs, verify_width
+                )[:real_num_reqs, 0]
+            # C4 length legitimately stays equal while one to three accepted
+            # tokens accumulate. Only a decrease denotes a reused request slot.
+            if layer_id == 0 and current_seq_len < self._h2d_trace_last_seq_len:
+                self._h2d_trace_step = 0
+                self._h2d_trace_accepted_tokens.clear()
+            record = {
+                "decode_step": self._h2d_trace_step,
+                "layer_id": layer_id,
+                "h2d_ms": h2d_start.elapsed_time(h2d_end),
+                "miss_tokens_per_request": counts,
+                "request_pool_indices": request_pool_indices,
+                "num_requests": real_num_reqs,
+                "verify_width": verify_width,
+                "top_k": self.top_k,
+                "item_size_bytes": self.item_size_bytes,
+                "device_buffer_size": self.device_buffer_size,
+                "compressed_seq_lens_per_request": seq_lens_per_request.to(
+                    device="cpu", dtype=torch.int64
+                ).tolist(),
+            }
+            trace_path = f"{self._h2d_trace_path}.tp{torch.distributed.get_rank(group=self.tp_group)}.jsonl"
+            os.makedirs(os.path.dirname(trace_path) or ".", exist_ok=True)
+            with open(trace_path, "a", encoding="utf-8") as trace_file:
+                trace_file.write(json.dumps(record) + "\n")
+            if layer_id == self.mem_pool_device.layer_num - 1:
+                self._h2d_trace_step += 1
+            if layer_id == 0:
+                self._h2d_trace_last_seq_len = current_seq_len
         return output_buffer
 
     def swap_in_selected_pages_spec(
@@ -2303,9 +2372,38 @@ class HiSparseCoordinator:
         self, window: HiSparseDSparkWindow, commit_lens: torch.Tensor
     ) -> None:
         """Back up accepted C4 entries, then reset fixed scratch metadata."""
+        commit_cpu = commit_lens.to("cpu").tolist()
+        if getattr(self, "_h2d_trace_path", ""):
+            cumulative = []
+            for req_idx, accepted_tokens in zip(
+                window.req_pool_indices_cpu, commit_cpu
+            ):
+                total = self._h2d_trace_accepted_tokens.get(req_idx, 0) + int(
+                    accepted_tokens
+                )
+                self._h2d_trace_accepted_tokens[req_idx] = total
+                cumulative.append(total)
+            trace_path = f"{self._h2d_trace_path}.tp{torch.distributed.get_rank(group=self.tp_group)}.jsonl"
+            os.makedirs(os.path.dirname(trace_path) or ".", exist_ok=True)
+            with open(trace_path, "a", encoding="utf-8") as trace_file:
+                trace_file.write(
+                    json.dumps(
+                        {
+                            "event": "commit",
+                            "decode_step": max(0, self._h2d_trace_step - 1),
+                            "accepted_tokens": [int(value) for value in commit_cpu],
+                            "cumulative_accepted_tokens": cumulative,
+                            "request_pool_indices": window.req_pool_indices_cpu,
+                        }
+                    )
+                    + "\n"
+                )
+        # An H2D trace cycle is emitted even when all of its selected entries
+        # are already resident and the verify window consequently has no
+        # scratch mappings. Keep its commit record paired with that cycle;
+        # only the cache-backup and mapping cleanup below are unnecessary.
         if window.compressed_locs.numel() == 0:
             return
-        commit_cpu = commit_lens.to("cpu").tolist()
         accepted = speculative_accepted_c4_indices(
             window, commit_cpu, self.compress_ratio
         )

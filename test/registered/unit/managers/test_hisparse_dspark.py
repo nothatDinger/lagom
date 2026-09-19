@@ -1,3 +1,4 @@
+import json
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -165,6 +166,36 @@ def test_dspark_all_rejected_rollback_records_cross_stream_event(monkeypatch):
 
     event.wait.assert_called_once_with(consumer_stream)
     assert not coordinator._has_pending_dspark_commit
+
+
+def test_dspark_empty_scratch_window_still_records_trace_commit(monkeypatch, tmp_path):
+    """A resident-only H2D cycle still needs matching acceptance metadata."""
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator._h2d_trace_path = str(tmp_path / "h2d_trace")
+    coordinator._h2d_trace_step = 4
+    coordinator._h2d_trace_accepted_tokens = {7: 3}
+    coordinator.tp_group = object()
+    window = HiSparseDSparkWindow(
+        compressed_locs=torch.empty(0, dtype=torch.int64),
+        device_locs=torch.empty(0, dtype=torch.int64),
+        previous_device_mapping=torch.empty(0, dtype=torch.int64),
+        req_offsets=[],
+        req_pool_indices_cpu=[7],
+        c4_positions=[],
+        prefix_lens_cpu=[0],
+    )
+
+    coordinator.commit_dspark_verify_window(window, torch.tensor([2]))
+
+    record = json.loads((tmp_path / "h2d_trace.tp0.jsonl").read_text())
+    assert record == {
+        "event": "commit",
+        "decode_step": 3,
+        "accepted_tokens": [2],
+        "cumulative_accepted_tokens": [5],
+        "request_pool_indices": [7],
+    }
 
 
 @pytest.mark.parametrize(
