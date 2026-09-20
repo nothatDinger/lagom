@@ -59,6 +59,8 @@ struct Prefill1Params {
   const R2T_T* r2t_ptr;  // [num_reqs, stride_r2t]
   const F2S_T* f2s_ptr;  // [num_full_slots], full_loc -> swa_loc
   int64_t stride_r2t;
+  int64_t num_r2t_rows;
+  int64_t num_full_slots;
   uint32_t num_c;
   uint32_t num_w;
   uint32_t num_c_padded;
@@ -273,6 +275,17 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
   const auto compute_c128_loc = [&](int64_t rid, int32_t position) {
     return static_cast<int32_t>(rid * params.ring_size + position % params.ring_size);
   };
+  const auto valid_request_position = [&](int64_t rid, int32_t position) {
+    return rid >= 0 && rid < params.num_r2t_rows && position >= 0 && position < params.stride_r2t;
+  };
+  const auto load_state_loc = [&](const R2T_T* mapping, int32_t position, int64_t& state_loc) {
+    const auto raw_loc = static_cast<int64_t>(mapping[position]);
+    if (raw_loc < 0 || raw_loc >= params.num_full_slots) return false;
+    state_loc = params.f2s_ptr[raw_loc];
+    // Slot zero is the reserved padding mapping and is valid. Negative or
+    // stale mappings must never be converted into a C4 buffer address.
+    return state_loc >= 0 && state_loc < params.num_full_slots;
+  };
 
   if (!plan_c.is_invalid()) {  // 1. in bound. 2. not masked
     if (plan_c.buffer_len > 0) {
@@ -283,16 +296,19 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
       const auto position_1 = static_cast<int32_t>(plan_c.seq_len - 1);
       // only used for c4, harmless for c128
       const auto position_0 = max(position_1 - params.compress_ratio, 0);
-      if (params.compress_ratio == 128) {
+      if (!valid_request_position(rid, position_0) || !valid_request_position(rid, position_1)) {
+        plan_c = PlanC::invalid();
+      } else if (params.compress_ratio == 128) {
         plan_c.read_page_0 = compute_c128_loc(rid, position_0) / 128;
         plan_c.read_page_1 = compute_c128_loc(rid, position_1) / 128;
       } else {
-        const auto raw_loc_0 = mapping[position_0];
-        const auto raw_loc_1 = mapping[position_1];
-        const auto state_loc_0 = params.f2s_ptr[raw_loc_0];
-        const auto state_loc_1 = params.f2s_ptr[raw_loc_1];
-        plan_c.read_page_0 = compute_loc(state_loc_0) / params.compress_ratio;
-        plan_c.read_page_1 = compute_loc(state_loc_1) / params.compress_ratio;
+        int64_t state_loc_0, state_loc_1;
+        if (!load_state_loc(mapping, position_0, state_loc_0) || !load_state_loc(mapping, position_1, state_loc_1)) {
+          plan_c = PlanC::invalid();
+        } else {
+          plan_c.read_page_0 = compute_loc(state_loc_0) / params.compress_ratio;
+          plan_c.read_page_1 = compute_loc(state_loc_1) / params.compress_ratio;
+        }
       }
       params.plan_c[idx] = plan_c;
     }
@@ -307,11 +323,17 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
     // `seq_len` (`write_loc`) may not be aligned here
     const auto position = static_cast<int32_t>(plan_w.write_loc - 1);
     plan_w.ragged_id = ragged_id;
-    if (params.compress_ratio == 128) {
+    if (!valid_request_position(rid, position)) {
+      plan_w = PlanW::invalid();
+    } else if (params.compress_ratio == 128) {
       plan_w.write_loc = compute_c128_loc(rid, position);
     } else {
-      const auto raw_loc = mapping[position];
-      plan_w.write_loc = compute_loc(params.f2s_ptr[raw_loc]);
+      int64_t state_loc;
+      if (!load_state_loc(mapping, position, state_loc)) {
+        plan_w = PlanW::invalid();
+      } else {
+        plan_w.write_loc = compute_loc(state_loc);
+      }
     }
     params.plan_w[idx] = plan_w;
   } else if (idx < params.num_w_padded) {
@@ -547,6 +569,8 @@ inline PrefillPlan plan_compress_prefill(
         .r2t_ptr = r2t_ptr,
         .f2s_ptr = f2s_ptr,
         .stride_r2t = req_to_token.stride(0),
+        .num_r2t_rows = req_to_token.size(0),
+        .num_full_slots = full_to_state.numel(),
         .num_c = num_q_tokens,
         .num_w = num_q_tokens,
         .num_c_padded = num_q_tokens,
@@ -623,6 +647,8 @@ inline PrefillPlan plan_compress_prefill(
       .r2t_ptr = r2t_ptr,
       .f2s_ptr = f2s_ptr,
       .stride_r2t = req_to_token.size(1),
+      .num_r2t_rows = req_to_token.size(0),
+      .num_full_slots = full_to_state.numel(),
       .num_c = counter_c,
       .num_w = counter_w,
       .num_c_padded = num_c_padded,

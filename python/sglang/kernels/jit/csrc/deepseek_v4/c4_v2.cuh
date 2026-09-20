@@ -50,6 +50,7 @@ struct Compress4DecodeParams {
   const void* __restrict__ score_bias;
   const PlanD* __restrict__ plan_d;
   uint32_t batch_size;
+  uint32_t num_buffer_pages;
 };
 
 struct Compress4PrefillParams {
@@ -61,6 +62,7 @@ struct Compress4PrefillParams {
   const PlanW* __restrict__ plan_w;
   uint32_t num_compress;
   uint32_t num_write;
+  uint32_t num_buffer_pages;
 };
 
 template <int64_t kHeadDim_>
@@ -266,6 +268,11 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
   if (global_bid >= params.batch_size) return;
 
   const auto plan = params.plan_d[global_bid];
+  const auto should_compress = plan.seq_len % 4 == 0;
+  if (plan.write_loc < 0 || plan.write_loc >= params.num_buffer_pages * 4 ||
+      (should_compress && (plan.read_page_0 < 0 || plan.read_page_0 >= params.num_buffer_pages ||
+                           plan.read_page_1 < 0 || plan.read_page_1 >= params.num_buffer_pages)))
+    return;
   const auto kv_input = static_cast<const InputFloat*>(params.kv_input) + split_offset;
   const auto kv_output = static_cast<OutFloat*>(params.kv_output) + split_offset;
   const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
@@ -273,13 +280,15 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
 
   const auto kv_src = kv_input + global_bid * Trait::kElementSize;
   const auto kv_out = kv_output + global_bid * Trait::kHeadDim;
-  const auto kv_buf_0 = kv_buffer + plan.read_page_0 * Trait::kPageElementSize;
-  const auto kv_buf_1 = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
+  const auto read_page_0 = should_compress ? plan.read_page_0 : 0;
+  const auto read_page_1 = should_compress ? plan.read_page_1 : 0;
+  const auto kv_buf_0 = kv_buffer + read_page_0 * Trait::kPageElementSize;
+  const auto kv_buf_1 = kv_buffer + read_page_1 * Trait::kPageElementSize;
   const auto kv_dst = kv_buffer + plan.write_loc * Trait::kElementSize;
 
   PDLWaitPrimary<kUsePDL>();
   c4_write_decode<Trait, BufferFloat, InputFloat>(kv_dst, kv_src);
-  if (plan.seq_len % 4 == 0) {
+  if (should_compress) {
     const auto need_overlap = plan.seq_len > 4;
     c4_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(
         kv_buf_0, kv_buf_1, kv_src, kv_out, score_bias, need_overlap, 8);
@@ -305,12 +314,21 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
   const auto score_bias = static_cast<const InputFloat*>(params.score_bias) + split_offset;
   if (plan.is_invalid()) return;
 
+  const bool need_overlap = plan.seq_len > 4;
+  // Avoid even forming an out-of-range pointer. read_page_0 is consumed only
+  // for an overlapping prefix; read_page_1 is consumed only past four buffered
+  // elements. The remaining elements come directly from the ragged input.
+  if ((need_overlap && plan.buffer_len > 0 && (plan.read_page_0 < 0 || plan.read_page_0 >= params.num_buffer_pages)) ||
+      (plan.buffer_len > 4 && (plan.read_page_1 < 0 || plan.read_page_1 >= params.num_buffer_pages)))
+    return;
+
   const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
   // Compact output: one row per compress plan, indexed by `global_pid`.
   const auto kv_out = kv_output + global_pid * Trait::kHeadDim;
-  const auto kv_buf_0 = kv_buffer + plan.read_page_0 * Trait::kPageElementSize;
-  const auto kv_buf_1 = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
-  const bool need_overlap = plan.seq_len > 4;
+  const auto read_page_0 = need_overlap && plan.buffer_len > 0 ? plan.read_page_0 : 0;
+  const auto read_page_1 = plan.buffer_len > 4 ? plan.read_page_1 : 0;
+  const auto kv_buf_0 = kv_buffer + read_page_0 * Trait::kPageElementSize;
+  const auto kv_buf_1 = kv_buffer + read_page_1 * Trait::kPageElementSize;
   PDLWaitPrimary<kUsePDL>();
   c4_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(
       kv_buf_0, kv_buf_1, kv_src, kv_out, score_bias, need_overlap, plan.buffer_len);
@@ -335,6 +353,7 @@ WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParam
   const auto kv_input = static_cast<const InputFloat*>(params.kv_input) + split_offset;
   const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
   if (plan.is_invalid()) return;
+  if (plan.write_loc < 0 || plan.write_loc >= params.num_buffer_pages * 4) return;
 
   // each warp will handle a contiguous region
   const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
@@ -423,6 +442,7 @@ struct FlashCompress4Kernel {
         .score_bias = ape.data_ptr(),
         .plan_d = plan_d,
         .batch_size = batch_size,
+        .num_buffer_pages = static_cast<uint32_t>(kv_buffer.size(0)),
     };
     const uint32_t num_blocks = div_ceil(batch_size * kNumSplit, kWarpsPerBlock);
     LaunchKernel(num_blocks, kBlockSize, device_.unwrap())  //
@@ -475,6 +495,7 @@ struct FlashCompress4Kernel {
         .plan_w = plan_w,
         .num_compress = num_c,
         .num_write = num_w,
+        .num_buffer_pages = static_cast<uint32_t>(kv_buffer.size(0)),
     };
     RuntimeCheck(num_q_tokens >= num_w, "invalid prefill plan: num_q < num_w");
     if (const auto num_c_blocks = div_ceil(num_c * kNumSplit, kWarpsPerBlock)) {
