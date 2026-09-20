@@ -190,6 +190,18 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         ):
             self.merge_and_sort_free()
 
+        if num_new_pages is None:
+            num_new_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=self.page_size,
+                prefix_lens=prefix_lens_cpu,
+            )
+        # Check capacity before launching the allocation kernel.  The kernel
+        # indexes free_pages directly, so discovering exhaustion afterwards can
+        # turn an ordinary admission-control miss into an illegal GPU access.
+        if num_new_pages > len(self.free_pages):
+            return None
+
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
@@ -206,15 +218,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
-
-        if num_new_pages is None:
-            num_new_pages = get_num_new_pages(
-                seq_lens=seq_lens_cpu,
-                page_size=self.page_size,
-                prefix_lens=prefix_lens_cpu,
-            )
-        if num_new_pages > len(self.free_pages):
-            return None
 
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
@@ -234,6 +237,15 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.need_sort and bs > len(self.free_pages):
             self.merge_and_sort_free()
 
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            decode=True,
+        )
+        # alloc_decode_kernel also reads free_pages without bounds checks.
+        if num_new_pages > len(self.free_pages):
+            return None
+
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
         alloc_decode_kernel[(bs,)](
             seq_lens,
@@ -246,14 +258,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
-
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu,
-            page_size=self.page_size,
-            decode=True,
-        )
-        if num_new_pages > len(self.free_pages):
-            return None
 
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
