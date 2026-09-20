@@ -382,6 +382,11 @@ class InputFormat(Enum):
 
 _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 
+# This is an admission-control limit rather than a model context limit. Keeping it
+# separate lets operators protect models with contexts larger than 128K without
+# changing the context advertised by the model.
+REQUEST_INPUT_LENGTH_LIMIT = 128 * 1024
+
 
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
@@ -418,6 +423,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.enable_lora = get_lora().enable_lora
         self.enable_trace = server_args.enable_trace
         self.allow_auto_truncate = server_args.allow_auto_truncate
+        self.request_input_length_limit_mode = getattr(
+            server_args, "request_input_length_limit_mode", "none"
+        )
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.preferred_sampling_params = get_serving().preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
@@ -1198,6 +1206,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
+        input_length_limit_mode = getattr(
+            self, "request_input_length_limit_mode", "none"
+        )
+        if len(input_ids) > REQUEST_INPUT_LENGTH_LIMIT:
+            if input_length_limit_mode == "truncate":
+                logger.warning(
+                    "The input (%s tokens) exceeds the configured 128K-token "
+                    "request limit. Truncating the input.",
+                    len(input_ids),
+                )
+                del input_ids[REQUEST_INPUT_LENGTH_LIMIT:]
+            elif input_length_limit_mode == "filter":
+                raise ValueError(
+                    f"The input ({len(input_ids)} tokens) exceeds the configured "
+                    f"request input limit ({REQUEST_INPUT_LENGTH_LIMIT} tokens)."
+                )
+
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
