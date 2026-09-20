@@ -2011,7 +2011,26 @@ class HiSparseCoordinator:
             is_dsv4_layout=True,
             skip_io=self.skip_io,
         )
+        if getattr(self, "_dspark_filter_misses", None) is not None:
+            self._dspark_filter_misses[:num_reqs].add_(miss_count)
+            self._dspark_filter_lookups += verify_width * self.top_k
         return output_buffer
+
+    def begin_dspark_filter_experiment(self, num_reqs: int) -> None:
+        """Start accumulating CSA lookup misses across verify layers."""
+        self._dspark_filter_misses = torch.zeros(
+            num_reqs, dtype=torch.int64, device=self.device
+        )
+        self._dspark_filter_lookups = 0
+
+    def take_dspark_filter_miss_rates(self) -> Optional[torch.Tensor]:
+        misses = getattr(self, "_dspark_filter_misses", None)
+        lookups = getattr(self, "_dspark_filter_lookups", 0)
+        self._dspark_filter_misses = None
+        self._dspark_filter_lookups = 0
+        if misses is None or lookups == 0:
+            return None
+        return misses.to(torch.float32) / lookups
 
     def swap_in_selected_pages_spec(
         self,

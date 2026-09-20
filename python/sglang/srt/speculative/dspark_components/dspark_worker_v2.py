@@ -662,6 +662,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         hisparse_committed = False
+        csa_cache_miss = None
+        if (
+            hisparse_window is not None
+            and envs.SGLANG_DSPARK_FILTER_EXPERIMENT_PATH.get()
+        ):
+            hisparse_coordinator.begin_dspark_filter_experiment(bs)
         try:
             # Must stay ahead of the target verify launch below.
             grammar_tree = (
@@ -734,6 +740,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
             )
+            if hisparse_window is not None:
+                csa_cache_miss = hisparse_coordinator.take_dspark_filter_miss_rates()
             if batch.return_logprob:
                 compute_spec_logprobs(
                     batch,
@@ -805,6 +813,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            csa_cache_miss=csa_cache_miss,
         )
 
         next_draft_input = make_next_draft_input(
