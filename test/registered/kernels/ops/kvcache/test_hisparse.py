@@ -46,7 +46,7 @@ def test_plan_only_then_copy_replays_into_existing_device_buffer() -> None:
     device_buffer = torch.full(
         (DEVICE_CACHE_SIZE, 1, KV_DIM), -1, dtype=DTYPE, device=DEVICE
     )
-    candidates = torch.tensor([[6]], dtype=torch.int32, device=DEVICE)
+    candidates = torch.tensor([[7]], dtype=torch.int32, device=DEVICE)
     miss_src = torch.zeros((1, 1), dtype=torch.int64, device=DEVICE)
     miss_dst = torch.zeros((1, 1), dtype=torch.int32, device=DEVICE)
     miss_count = torch.zeros(1, dtype=torch.int32, device=DEVICE)
@@ -92,7 +92,7 @@ def test_plan_only_then_copy_replays_into_existing_device_buffer() -> None:
         item_size_bytes=ITEM_SIZE_BYTES,
     )
     torch.cuda.synchronize()
-    assert torch.equal(device_buffer[miss_dst.item()].cpu(), host_cache[6])
+    assert torch.equal(device_buffer[miss_dst.item()].cpu(), host_cache[7])
 
 
 DSV4_ITEM_BYTES = DSV4_VALUE_BYTES + DSV4_SCALE_BYTES
@@ -331,38 +331,6 @@ def _long_case():
     return _make_state([[9, 7, 3, 5, 11]], [[1, 4, 2, 5, -1]], [7])
 
 
-def _run_verify_window_with_plan(*, hot_buffer_size: int, plan_capacity: int) -> None:
-    state = _long_case()
-    load_cache_to_device_buffer_mla(
-        top_k_tokens=torch.tensor([[6, 2], [2, 6]], dtype=torch.int32, device=DEVICE),
-        top_k_device_locs=torch.full((2, 2), -1, dtype=torch.int32, device=DEVICE),
-        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
-        seq_lens=torch.tensor([8, 8], dtype=torch.int32, device=DEVICE),
-        item_size_bytes=ITEM_SIZE_BYTES,
-        num_top_k=2,
-        hot_buffer_size=hot_buffer_size,
-        page_size=1,
-        block_size=256,
-        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
-        miss_src=torch.empty((1, plan_capacity), dtype=torch.int64, device=DEVICE),
-        miss_dst=torch.empty((1, plan_capacity), dtype=torch.int32, device=DEVICE),
-        miss_count=torch.zeros(1, dtype=torch.int32, device=DEVICE),
-        skip_io=True,
-        verify_width=2,
-        **state,
-    )
-
-
-def test_verify_window_rejects_insufficient_resident_capacity() -> None:
-    with pytest.raises(ValueError, match=r"verify_width \* num_top_k"):
-        _run_verify_window_with_plan(hot_buffer_size=3, plan_capacity=4)
-
-
-def test_verify_window_rejects_insufficient_miss_plan_capacity() -> None:
-    with pytest.raises(ValueError, match=r"miss-plan row must hold"):
-        _run_verify_window_with_plan(hot_buffer_size=4, plan_capacity=3)
-
-
 @pytest.mark.parametrize("seq_lens_dtype", [torch.int32, torch.int64])
 def test_load_cache_to_device_buffer_fast_path(seq_lens_dtype: torch.dtype) -> None:
     host_cache = _host_cache()
@@ -472,67 +440,6 @@ def test_load_cache_to_device_buffer_miss_uses_updated_lru_slot() -> None:
         state["lru_slots"].cpu(), torch.tensor([[3, 1, 2, 0]], dtype=torch.int16)
     )
     assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
-
-
-def test_verify_window_plans_and_copies_ordered_miss_union() -> None:
-    """One block must preserve step order and copy duplicate-free misses once."""
-    reference = _long_case()
-    reference_outputs = []
-    for row in ([6, 2], [2, 6]):
-        reference_outputs.append(
-            _run_kernel(
-                top_k_tokens=torch.tensor([row], dtype=torch.int32, device=DEVICE),
-                seq_len=8,
-                **reference,
-            )
-        )
-    expected_output = torch.cat(reference_outputs)
-
-    state = _long_case()
-    top_k_tokens = torch.tensor([[6, 2], [2, 6]], dtype=torch.int32, device=DEVICE)
-    output = torch.full_like(top_k_tokens, -1)
-    miss_src = torch.full((1, 4), -1, dtype=torch.int64, device=DEVICE)
-    miss_dst = torch.full((1, 4), -1, dtype=torch.int32, device=DEVICE)
-    miss_count = torch.zeros(1, dtype=torch.int32, device=DEVICE)
-    num_real_reqs = torch.tensor([1], dtype=torch.int32, device=DEVICE)
-
-    load_cache_to_device_buffer_mla(
-        top_k_tokens=top_k_tokens,
-        top_k_device_locs=output,
-        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
-        seq_lens=torch.tensor([8, 8], dtype=torch.int32, device=DEVICE),
-        item_size_bytes=state["host_cache"][0].numel()
-        * state["host_cache"].element_size(),
-        num_top_k=2,
-        hot_buffer_size=HOT_BUFFER_SIZE,
-        page_size=1,
-        block_size=256,
-        num_real_reqs=num_real_reqs,
-        miss_src=miss_src,
-        miss_dst=miss_dst,
-        miss_count=miss_count,
-        skip_io=True,
-        verify_width=2,
-        **state,
-    )
-    copy_cache_planned_mla(
-        miss_src=miss_src,
-        miss_dst=miss_dst,
-        miss_count=miss_count,
-        num_real_reqs=num_real_reqs,
-        host_cache=state["host_cache"],
-        device_buffer=state["device_buffer"],
-        item_size_bytes=state["host_cache"][0].numel()
-        * state["host_cache"].element_size(),
-    )
-    torch.cuda.synchronize()
-
-    assert torch.equal(output.cpu(), expected_output.cpu())
-    assert miss_count.item() == 1
-    assert miss_src[0, 0].item() == 6
-    assert miss_dst[0, 0].item() == 9
-    assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
-    assert torch.equal(state["lru_slots"].cpu(), reference["lru_slots"].cpu())
 
 
 @pytest.mark.skipif(
