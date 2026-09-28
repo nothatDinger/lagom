@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +29,54 @@ def test_legacy_config_is_unchanged():
     )
     assert config.prefetcher is None
     assert config.prefetcher_config == {}
+
+
+def test_force_h2d_each_step_uses_top_k_sized_device_buffer():
+    config = _config(
+        '{"top_k":128,"device_buffer_size":512,"force_h2d_each_step":true}'
+    )
+    assert config.force_h2d_each_step is True
+    assert config.device_buffer_size == 128
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", None])
+def test_force_h2d_each_step_requires_boolean(value):
+    with pytest.raises(ValueError, match="force_h2d_each_step must be a boolean"):
+        _config(json.dumps({"force_h2d_each_step": value}))
+
+
+def test_force_h2d_each_step_overrides_dspark_verify_buffer_requirement():
+    config = _config('{"top_k":2048,"force_h2d_each_step":true}')
+    resolve_dspark_device_buffer_size(
+        config,
+        raw_hisparse_config='{"top_k":2048,"force_h2d_each_step":true}',
+        verify_width=6,
+        effective_top_k=512,
+    )
+    assert config.device_buffer_size == 512
+
+
+def test_force_h2d_invalidation_preserves_hot_buffer_allocation():
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator.force_h2d_each_step = True
+    coordinator.req_device_buffer_tokens = torch.arange(24).view(2, 3, 4)
+    coordinator.req_device_buffer_token_locs = torch.arange(24).view(2, 3, 4)
+    coordinator.lru_slots = torch.arange(24, dtype=torch.int16).view(2, 3, 4)
+    coordinator._lru_init = torch.arange(4, dtype=torch.int16)
+    physical_hot_buffer = torch.full((2, 3, 4), 7)
+    coordinator.mem_pool_device = SimpleNamespace(kv_buffer=physical_hot_buffer)
+
+    coordinator._invalidate_hot_buffer_residency(torch.tensor([0, 2]), layer_id=1)
+
+    assert torch.all(coordinator.req_device_buffer_tokens[1, [0, 2]] == -1)
+    assert torch.all(coordinator.req_device_buffer_token_locs[1, [0, 2]] == -1)
+    assert torch.equal(
+        coordinator.lru_slots[1, [0, 2]],
+        coordinator._lru_init.expand(2, -1),
+    )
+    assert torch.all(physical_hot_buffer == 7)
 
 
 def test_dspark_defaults_device_buffer_to_verify_union_upper_bound():
