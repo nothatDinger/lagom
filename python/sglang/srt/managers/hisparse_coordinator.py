@@ -1457,13 +1457,14 @@ class HiSparseCoordinator:
     def _invalidate_hot_buffer_residency(
         self, req_pool_indices: torch.Tensor, layer_id: int
     ) -> None:
-        """Forget hot-buffer contents without releasing their physical storage."""
+        """Forget resident token identities while retaining physical slot mappings."""
         if not self.force_h2d_each_step:
             return
         tokens = self.req_device_buffer_tokens[layer_id]
-        token_locs = self.req_device_buffer_token_locs[layer_id]
         tokens.index_fill_(0, req_pool_indices, -1)
-        token_locs.index_fill_(0, req_pool_indices, -1)
+        # req_device_buffer_token_locs is not residency metadata: it maps each
+        # logical hot-buffer slot to its allocated physical device location.
+        # Clearing it would make the swap-in kernel copy to device location -1.
         self.lru_slots[layer_id, req_pool_indices] = self._lru_init
 
     def _consume_previous_prefetch(

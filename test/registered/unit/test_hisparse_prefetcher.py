@@ -72,11 +72,12 @@ def test_force_h2d_invalidation_preserves_hot_buffer_allocation():
     coordinator._lru_init = torch.arange(4, dtype=torch.int16)
     physical_hot_buffer = torch.full((2, 3, 4), 7)
     coordinator.mem_pool_device = SimpleNamespace(kv_buffer=physical_hot_buffer)
+    physical_slot_mapping = coordinator.req_device_buffer_token_locs.clone()
 
     coordinator._invalidate_hot_buffer_residency(torch.tensor([0, 2]), layer_id=1)
 
     assert torch.all(coordinator.req_device_buffer_tokens[1, [0, 2]] == -1)
-    assert torch.all(coordinator.req_device_buffer_token_locs[1, [0, 2]] == -1)
+    assert torch.equal(coordinator.req_device_buffer_token_locs, physical_slot_mapping)
     assert torch.equal(
         coordinator.lru_slots[1, [0, 2]],
         coordinator._lru_init.expand(2, -1),
