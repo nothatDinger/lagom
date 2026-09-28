@@ -148,22 +148,36 @@ def resolve_dspark_device_buffer_size(
     worst case their Top-K sets are disjoint, so every returned device location
     remains stable only when the resident buffer can hold ``verify_width * K``.
     An omitted device_buffer_size adopts that safe bound; an explicit value is
-    never silently changed.
+    never silently changed in normal mode.  The force-H2D experiment is the one
+    exception: parsing first reduces the buffer to Top-K, then DSPARK promotes
+    it to this union bound because all verify rows are consumed after planning.
     """
     if verify_width <= 0 or effective_top_k <= 0:
         raise ValueError(
             "DSPARK HiSparse verify_width and effective_top_k must be positive, "
             f"got verify_width={verify_width}, effective_top_k={effective_top_k}"
         )
+    required = verify_width * effective_top_k
     if config.force_h2d_each_step:
-        config.device_buffer_size = effective_top_k
+        # One DSPARK verification step contains ``verify_width`` Top-K rows.
+        # They are planned before attention runs, so their returned locations
+        # must remain resident together.  The experiment still invalidates the
+        # previous verification step, but cannot shrink this step's live union.
+        config.device_buffer_size = required
+        logger.info(
+            "HiSparse force-H2D uses a %d-entry DSPARK verify buffer "
+            "(%d verify rows * %d Top-K); residency is invalidated once "
+            "before the complete verify window.",
+            required,
+            verify_width,
+            effective_top_k,
+        )
         return config
 
     explicit_device_buffer_size = (
         raw_hisparse_config is not None
         and "device_buffer_size" in json.loads(raw_hisparse_config)
     )
-    required = verify_width * effective_top_k
     if explicit_device_buffer_size and config.device_buffer_size < required:
         raise ValueError(
             "HiSparse + DSPARK requires device_buffer_size >= verify_width * "

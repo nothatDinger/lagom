@@ -45,15 +45,20 @@ def test_force_h2d_each_step_requires_boolean(value):
         _config(json.dumps({"force_h2d_each_step": value}))
 
 
-def test_force_h2d_each_step_overrides_dspark_verify_buffer_requirement():
-    config = _config('{"top_k":2048,"force_h2d_each_step":true}')
+def test_force_h2d_each_step_keeps_dspark_verify_union_capacity():
+    config = _config(
+        '{"top_k":512,"device_buffer_size":512,"force_h2d_each_step":true}'
+    )
+    assert config.device_buffer_size == 512
     resolve_dspark_device_buffer_size(
         config,
-        raw_hisparse_config='{"top_k":2048,"force_h2d_each_step":true}',
+        raw_hisparse_config=(
+            '{"top_k":512,"device_buffer_size":512,"force_h2d_each_step":true}'
+        ),
         verify_width=6,
         effective_top_k=512,
     )
-    assert config.device_buffer_size == 512
+    assert config.device_buffer_size == 3072
 
 
 def test_force_h2d_invalidation_preserves_hot_buffer_allocation():
