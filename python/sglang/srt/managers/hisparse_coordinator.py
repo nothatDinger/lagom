@@ -253,11 +253,13 @@ class HiSparseCoordinator:
         pp_size: int = 1,
         is_speculative: bool = False,
         speculative_verify_width: int = 0,
+        force_h2d_each_step: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.top_k = top_k
         self.device_buffer_size = device_buffer_size
+        self.force_h2d_each_step = force_h2d_each_step
         self.device = device
         self.swap_in_block_size = swap_in_block_size
         # Timing probe: skip the host->device KV bytes to measure the "IO is
@@ -1452,6 +1454,18 @@ class HiSparseCoordinator:
         )
         return top_k_indices
 
+    def _invalidate_hot_buffer_residency(
+        self, req_pool_indices: torch.Tensor, layer_id: int
+    ) -> None:
+        """Forget hot-buffer contents without releasing their physical storage."""
+        if not self.force_h2d_each_step:
+            return
+        tokens = self.req_device_buffer_tokens[layer_id]
+        token_locs = self.req_device_buffer_token_locs[layer_id]
+        tokens.index_fill_(0, req_pool_indices, -1)
+        token_locs.index_fill_(0, req_pool_indices, -1)
+        self.lru_slots[layer_id, req_pool_indices] = self._lru_init
+
     def _consume_previous_prefetch(
         self,
         req_pool_indices: torch.Tensor,
@@ -1894,6 +1908,7 @@ class HiSparseCoordinator:
             req_pool_indices_cpu,
             committed_lens_cpu,
         )
+        self._invalidate_hot_buffer_residency(req_pool_indices, layer_id)
         if not self.enable_prefetch:
             result = self._run_swap_in_kernel(
                 req_pool_indices,
@@ -1964,6 +1979,7 @@ class HiSparseCoordinator:
         output_buffer: torch.Tensor,
     ) -> torch.Tensor:
         """Resolve one verify window, then copy its ordered miss union once."""
+        self._invalidate_hot_buffer_residency(req_pool_indices, layer_id)
         if not self.is_dsv4_hisparse:
             raise RuntimeError("one-shot verify swap-in requires DeepSeek-V4 C4")
         if verify_width <= 0 or verify_width > self._speculative_verify_width:
