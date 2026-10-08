@@ -44,6 +44,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
@@ -752,12 +753,41 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.disaggregation_decode_extra_slots = (
             kvc.server_args.disaggregation_decode_extra_slots or 0
         )
+        self.hisparse_window_hash_layout = None
         if kvc.server_args.enable_hisparse and not kvc.is_draft_worker:
-            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+            from sglang.srt.mem_cache.hisparse_window_hash import (
+                HiSparseWindowHashLayout,
+            )
+            from sglang.srt.mem_cache.sparsity import (
+                parse_hisparse_config,
+                resolve_dspark_device_buffer_size,
+            )
 
-            self.c4_shrink_factor = parse_hisparse_config(
-                kvc.server_args
-            ).host_to_device_ratio
+            hisparse_cfg = parse_hisparse_config(kvc.server_args)
+            self.c4_shrink_factor = hisparse_cfg.host_to_device_ratio
+            verify_width = kvc.server_args.speculative_num_draft_tokens or 0
+            if (
+                verify_width > 0
+                and not is_hip()
+                and (
+                    kvc.spec_algorithm.is_dspark()
+                    or (
+                        kvc.spec_algorithm.is_eagle()
+                        and not kvc.spec_algorithm.is_frozen_kv_mtp()
+                    )
+                )
+            ):
+                top_k = getattr(cfg.hf_text_config, "index_topk", hisparse_cfg.top_k)
+                if kvc.spec_algorithm.is_dspark():
+                    hisparse_cfg = resolve_dspark_device_buffer_size(
+                        hisparse_cfg,
+                        raw_hisparse_config=kvc.server_args.hisparse_config,
+                        verify_width=verify_width,
+                        effective_top_k=top_k,
+                    )
+                self.hisparse_window_hash_layout = HiSparseWindowHashLayout(
+                    hisparse_cfg.device_buffer_size, verify_width, top_k
+                )
         else:
             self.c4_shrink_factor = 1
         assert self.c4_shrink_factor >= 1
@@ -931,6 +961,22 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         max_running_requests = min(estimated, token_capacity // 2)
         return self._get_c128_state_fixed_bytes(max_running_requests)
 
+    def _get_window_hash_fixed_bytes_for_token_capacity(
+        self, token_capacity: int
+    ) -> int:
+        layout = self.hisparse_window_hash_layout
+        if layout is None:
+            return 0
+        requested = self.requested_max_running_requests_per_worker
+        estimated = max(min(int(token_capacity / self.context_len * 512), 4096), 2048)
+        num_reqs = min(
+            estimated if requested is None else requested, token_capacity // 2
+        )
+        return layout.fixed_state_bytes(
+            num_layers=self.num_layers_ca4,
+            num_req_slots=self._get_num_req_slots(num_reqs),
+        )
+
     def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:
         full = sizes.full_max_total_num_tokens
         swa = sizes.swa_max_total_num_tokens
@@ -969,7 +1015,27 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             page_size % 128 == 0
         ), "page_size must be multiple of 128 for compressed attention"
 
-        if self.requested_max_running_requests_per_worker is not None:
+        if self.hisparse_window_hash_layout is not None:
+            # Hash workspace is request-indexed, and request count depends on
+            # token capacity. Solve both together before allocating the KV pools.
+            lo, hi = 0, int(available_bytes / self.bytes_per_full_token) // page_size
+            while lo < hi:
+                pages = (lo + hi + 1) // 2
+                tokens = pages * page_size
+                fixed = self._get_c128_state_fixed_bytes_for_token_capacity(tokens)
+                fixed += self._get_window_hash_fixed_bytes_for_token_capacity(tokens)
+                if tokens * self.bytes_per_full_token + fixed <= available_bytes:
+                    lo = pages
+                else:
+                    hi = pages - 1
+            full_token = lo * page_size
+            c128_state_fixed_bytes = (
+                self._get_c128_state_fixed_bytes_for_token_capacity(full_token)
+            )
+            window_hash_fixed_bytes = (
+                self._get_window_hash_fixed_bytes_for_token_capacity(full_token)
+            )
+        elif self.requested_max_running_requests_per_worker is not None:
             c128_state_fixed_bytes = self._get_c128_state_fixed_bytes(
                 self.requested_max_running_requests_per_worker
             )
@@ -979,8 +1045,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 self._get_c128_state_fixed_bytes_for_token_capacity(full_token)
             )
 
-        available_bytes_for_tokens = max(available_bytes - c128_state_fixed_bytes, 0)
-        full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
+        if self.hisparse_window_hash_layout is None:
+            window_hash_fixed_bytes = 0
+            available_bytes_for_tokens = max(
+                available_bytes - c128_state_fixed_bytes, 0
+            )
+            full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
 
         sizes = self._compute_dsv4_sizes(full_token, page_size)
         logger.info(
@@ -988,6 +1058,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "
+            f"window_hash_fixed={window_hash_fixed_bytes / (1 << 30):.2f} GB, "
             f"full_token={sizes.full_max_total_num_tokens}"
         )
         return self._to_config(sizes)

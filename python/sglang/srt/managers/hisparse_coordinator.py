@@ -12,6 +12,11 @@ from sglang.kernels.ops.kvcache.hisparse import (
     load_cache_to_device_buffer_mla,
     transfer_cache_dsv4_mla,
 )
+from sglang.kernels.ops.kvcache.hisparse_window_hash import (
+    allocate_window_hash_states,
+    initialize_window_hash_state,
+    plan_cache_window_hash_mla,
+)
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.hisparse_prefetcher import (
@@ -26,6 +31,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
 )
+from sglang.srt.mem_cache.hisparse_window_hash import HiSparseWindowHashLayout
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -432,9 +438,19 @@ class HiSparseCoordinator:
         self._spec_miss_src = None
         self._spec_miss_dst = None
         self._spec_miss_count = None
+        self._window_hash_states = None
         if self.is_dsv4_hisparse and is_speculative and speculative_verify_width > 0:
-            # One row per request holds the ordered union of all verify-step
-            # misses. Fixed addresses make plan+copy safe to capture and replay.
+            # Hash/CLOCK state and the unique miss union retain fixed addresses
+            # across graph replay. DSpark's writer scratch stays independent.
+            if not _is_hip:
+                self._window_hash_states = allocate_window_hash_states(
+                    HiSparseWindowHashLayout(
+                        self.device_buffer_size, speculative_verify_width, self.top_k
+                    ),
+                    num_layers=layer_num,
+                    num_req_slots=max_num_req_slots,
+                    device=device,
+                )
             max_verify_misses = speculative_verify_width * self.top_k
             self._spec_miss_src = torch.empty(
                 (max_num_req_slots, max_verify_misses),
@@ -821,6 +837,7 @@ class HiSparseCoordinator:
             self.req_device_buffer_tokens[
                 :, req.req_pool_idx, : self.device_buffer_size
             ] = -1
+            self._initialize_window_hash_request(req.req_pool_idx)
 
         req.hisparse_staging = False
         self._skip_first_backup[req.req_pool_idx] = True
@@ -892,6 +909,22 @@ class HiSparseCoordinator:
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
+
+        self._initialize_window_hash_request(req.req_pool_idx)
+
+    def _initialize_window_hash_request(self, req_pool_idx: int) -> None:
+        states = getattr(self, "_window_hash_states", None)
+        if states is None:
+            return
+        req_pool_indices = torch.tensor(
+            [req_pool_idx], dtype=torch.int64, device=self.device
+        )
+        for layer_id, state in enumerate(states):
+            initialize_window_hash_state(
+                device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+                req_pool_indices=req_pool_indices,
+                state=state,
+            )
 
     def _grow_device_buffers(
         self,
@@ -1189,9 +1222,9 @@ class HiSparseCoordinator:
         Returns:
             Device KV cache indices for the selected tokens.  Shape: (num_reqs, top_k)
         """
-        assert not self.is_dsv4_hisparse, (
-            "naive_load_topk is not implemented for dsv4 hisparse"
-        )
+        assert (
+            not self.is_dsv4_hisparse
+        ), "naive_load_topk is not implemented for dsv4 hisparse"
         num_reqs = req_pool_indices.size(0)
         top_k_indices = torch.full(
             (num_reqs, self.top_k), -1, dtype=torch.int32, device=self.device
@@ -1206,9 +1239,9 @@ class HiSparseCoordinator:
             req_idx = int(req_pool_indices[i].item())
             selected_tokens = top_k_tokens[i, :top_n].to(dtype=torch.int64)
 
-            assert torch.all(selected_tokens >= 0), (
-                f"Req {req_idx}: selected tokens contain negative positions"
-            )
+            assert torch.all(
+                selected_tokens >= 0
+            ), f"Req {req_idx}: selected tokens contain negative positions"
             assert torch.all(selected_tokens < seq_len), (
                 f"Req {req_idx}: selected tokens {selected_tokens.tolist()} "
                 f"out of range for seq_len={seq_len}"
@@ -1412,6 +1445,22 @@ class HiSparseCoordinator:
             self.top_k_device_locs_buffer if output_buffer is None else output_buffer
         )[:num_reqs]
 
+        if getattr(self, "_window_hash_states", None) is not None:
+            # A decode fallback must update the same persistent metadata as
+            # target verify, rather than leaving the hash stale after LRU I/O.
+            if record_plan or num_top_k != self.top_k:
+                raise ValueError(
+                    "Window hash speculative cache does not support prefetch plans."
+                )
+            return self._run_swap_in_verify_window(
+                req_pool_indices=req_pool_indices,
+                compressed_seq_lens=compressed_seq_lens,
+                top_k_result=top_k_result,
+                layer_id=layer_id,
+                verify_width=1,
+                output_buffer=top_k_indices,
+            )
+
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla
             if self.is_dsv4_hisparse
@@ -1466,6 +1515,12 @@ class HiSparseCoordinator:
         # logical hot-buffer slot to its allocated physical device location.
         # Clearing it would make the swap-in kernel copy to device location -1.
         self.lru_slots[layer_id, req_pool_indices] = self._lru_init
+        if getattr(self, "_window_hash_states", None) is not None:
+            initialize_window_hash_state(
+                device_buffer_tokens=tokens,
+                req_pool_indices=req_pool_indices,
+                state=self._window_hash_states[layer_id],
+            )
 
     def _consume_previous_prefetch(
         self,
@@ -1921,9 +1976,11 @@ class HiSparseCoordinator:
                 self._submit_previous_prefetch(
                     req_pool_indices,
                     compressed_seq_lens,
-                    top_k_result
-                    if prefetch_candidates is None
-                    else prefetch_candidates,
+                    (
+                        top_k_result
+                        if prefetch_candidates is None
+                        else prefetch_candidates
+                    ),
                     layer_id,
                 )
             elif self.prefetcher_name == "ema" and prefetch_candidates is not None:
@@ -1979,7 +2036,7 @@ class HiSparseCoordinator:
         verify_width: int,
         output_buffer: torch.Tensor,
     ) -> torch.Tensor:
-        """Resolve one verify window, then copy its ordered miss union once."""
+        """Hash all verify positions together, then copy unique misses once."""
         self._invalidate_hot_buffer_residency(req_pool_indices, layer_id)
         if not self.is_dsv4_hisparse:
             raise RuntimeError("one-shot verify swap-in requires DeepSeek-V4 C4")
@@ -1993,29 +2050,49 @@ class HiSparseCoordinator:
         miss_src = self._spec_miss_src[:num_reqs, :plan_width]
         miss_dst = self._spec_miss_dst[:num_reqs, :plan_width]
         miss_count = self._spec_miss_count[:num_reqs]
-        load_cache_to_device_buffer_dsv4_mla(
-            top_k_tokens=top_k_result,
-            device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+        common = dict(
             host_cache_locs=self.req_to_host_pool,
-            device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
             host_cache=self.mem_pool_host.kv_buffer[layer_id],
             device_buffer=self.mem_pool_device.kv_buffer[layer_id],
-            top_k_device_locs=output_buffer,
             req_pool_indices=req_pool_indices,
             seq_lens=compressed_seq_lens,
-            lru_slots=self.lru_slots[layer_id],
-            item_size_bytes=self.item_size_bytes,
-            num_top_k=self.top_k,
-            hot_buffer_size=self.device_buffer_size,
-            page_size=1,
-            block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
             miss_src=miss_src,
             miss_dst=miss_dst,
             miss_count=miss_count,
-            skip_io=True,
-            verify_width=verify_width,
         )
+        if self._window_hash_states is None:
+            # Retain main's ROCm planner. PR #40670's hash path targets CUDA.
+            load_cache_to_device_buffer_dsv4_mla(
+                **common,
+                top_k_tokens=top_k_result,
+                device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+                device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
+                top_k_device_locs=output_buffer,
+                lru_slots=self.lru_slots[layer_id],
+                item_size_bytes=self.item_size_bytes,
+                num_top_k=self.top_k,
+                hot_buffer_size=self.device_buffer_size,
+                page_size=1,
+                block_size=self.swap_in_block_size,
+                skip_io=True,
+                verify_width=verify_width,
+            )
+        else:
+            plan_cache_window_hash_mla(
+                **common,
+                top_k_tokens=top_k_result.reshape(num_reqs, verify_width, self.top_k),
+                device_buffer_tokens=self.req_device_buffer_tokens[
+                    layer_id, :, : self.device_buffer_size + 1
+                ],
+                device_buffer_locs=self.req_device_buffer_token_locs[
+                    layer_id, :, : self.device_buffer_size + 1
+                ],
+                top_k_device_locs=output_buffer.view(
+                    num_reqs, verify_width, self.top_k
+                ),
+                state=self._window_hash_states[layer_id],
+            )
         copy_cache_planned_mla(
             miss_src=miss_src,
             miss_dst=miss_dst,
@@ -2040,13 +2117,13 @@ class HiSparseCoordinator:
         verify_lens_cpu: Optional[List[int]] = None,
         output_buffer: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Plan and copy a complete DSPARK verify window in two launches.
+        """Plan and copy a complete DSPARK verify window with parallel hash.
 
         ``top_k_result`` is the *real* Indexer output, with either static
-        ``[B * W, K]`` rows or compact ``[sum(verify_lens), K]`` rows. LRU and
-        resident-slot tables are per request, so one planner block owns a request
-        and resolves all of its steps serially. The resulting ordered miss union
-        is copied with one copy-only launch.
+        ``[B * W, K]`` rows or compact ``[sum(verify_lens), K]`` rows. All positions
+        query persistent per-request hashes in parallel. A commit kernel protects
+        union hits and admits deduplicated misses with CLOCK; main's copy kernel
+        then transfers that unique miss union.
         Padding rows beyond ``sum(verify_lens)`` remain invalid and never update
         resident state.
 

@@ -11,6 +11,9 @@ from sglang.srt.managers.hisparse_coordinator import (
     dspark_fixed_buffer_commit_indices,
 )
 from sglang.srt.mem_cache.allocation import alloc_paged_token_slots_extend
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def test_dspark_spec_reservation_allocates_logical_kv_only(monkeypatch):
@@ -337,12 +340,12 @@ def test_dspark_swap_in_ignores_graph_padding_rows():
     torch.testing.assert_close(actual[4:], torch.full((2, 2), -1, dtype=torch.int32))
 
 
-def test_dspark_verify_window_plans_and_copies_once(monkeypatch):
-    """The complete verify window produces one ordered plan and one copy."""
+def test_dspark_verify_window_hashes_and_copies_once(monkeypatch):
+    """The whole verify window uses one hash planner and main's copy kernel."""
     planner = MagicMock()
     copier = MagicMock()
     monkeypatch.setattr(
-        "sglang.srt.managers.hisparse_coordinator.load_cache_to_device_buffer_dsv4_mla",
+        "sglang.srt.managers.hisparse_coordinator.plan_cache_window_hash_mla",
         planner,
     )
     monkeypatch.setattr(
@@ -352,6 +355,8 @@ def test_dspark_verify_window_plans_and_copies_once(monkeypatch):
     coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
     coordinator.is_dsv4_hisparse = True
     coordinator._speculative_verify_width = 3
+    coordinator._window_hash_states = [object()]
+    coordinator.force_h2d_each_step = False
     coordinator.top_k = 2
     coordinator.device_buffer_size = 6
     coordinator.swap_in_block_size = 256
@@ -386,13 +391,57 @@ def test_dspark_verify_window_plans_and_copies_once(monkeypatch):
     assert actual.data_ptr() == output.data_ptr()
     planner.assert_called_once()
     copier.assert_called_once()
-    assert planner.call_args.kwargs["verify_width"] == 3
-    assert planner.call_args.kwargs["skip_io"]
+    assert planner.call_args.kwargs["top_k_tokens"].shape == (2, 3, 2)
+    assert planner.call_args.kwargs["state"] is coordinator._window_hash_states[0]
+    assert planner.call_args.kwargs["top_k_device_locs"].data_ptr() == output.data_ptr()
     assert planner.call_args.kwargs["miss_src"].shape == (2, 6)
     assert copier.call_args.kwargs["num_blocks"] == 4
     assert copier.call_args.kwargs["miss_src"].data_ptr() == (
         planner.call_args.kwargs["miss_src"].data_ptr()
     )
+
+
+def test_force_h2d_reinitializes_hash_without_changing_physical_slots(monkeypatch):
+    initialize = MagicMock()
+    monkeypatch.setattr(
+        "sglang.srt.managers.hisparse_coordinator.initialize_window_hash_state",
+        initialize,
+    )
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator.force_h2d_each_step = True
+    coordinator._window_hash_states = [object()]
+    coordinator._lru_init = torch.arange(8, dtype=torch.int16)
+    coordinator.lru_slots = coordinator._lru_init.repeat(1, 4, 1)
+    coordinator.req_device_buffer_tokens = torch.arange(36, dtype=torch.int32).view(
+        1, 4, 9
+    )
+    coordinator.req_device_buffer_token_locs = (
+        torch.arange(36, dtype=torch.int32).view(1, 4, 9) + 100
+    )
+    physical = coordinator.req_device_buffer_token_locs.clone()
+    coordinator._invalidate_hot_buffer_residency(torch.tensor([3, 1]), 0)
+    assert (coordinator.req_device_buffer_tokens[0, [3, 1]] == -1).all()
+    torch.testing.assert_close(coordinator.req_device_buffer_token_locs, physical)
+    initialize.assert_called_once()
+    assert initialize.call_args.kwargs["state"] is coordinator._window_hash_states[0]
+
+
+def test_decode_fallback_uses_same_window_hash_state():
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator._window_hash_states = [object()]
+    coordinator.top_k = 2
+    coordinator.top_k_device_locs_buffer = torch.full((4, 2), -1, dtype=torch.int32)
+    coordinator._run_swap_in_verify_window = MagicMock(
+        return_value=coordinator.top_k_device_locs_buffer[:2]
+    )
+    result = coordinator._run_swap_in_kernel(
+        torch.tensor([3, 1]),
+        torch.tensor([12, 15]),
+        torch.zeros((2, 2), dtype=torch.int32),
+        0,
+    )
+    assert result.data_ptr() == coordinator.top_k_device_locs_buffer.data_ptr()
+    assert coordinator._run_swap_in_verify_window.call_args.kwargs["verify_width"] == 1
 
 
 def test_dspark_swap_in_rejects_inconsistent_ragged_geometry():
