@@ -186,6 +186,29 @@ def test_graph_replay_force_reset_and_request_slot_reuse():
         assert args["top_k_device_locs"].data_ptr() == output_ptr
 
 
+def test_force_h2d_inside_graph_reloads_old_hits_and_deduplicates_window():
+    args = _inputs(6, 3, 2)
+    args["top_k_tokens"][:2] = torch.tensor([[1, 2], [2, 7], [7, 8]], device="cuda")
+    physical = args["device_buffer_locs"].clone()
+
+    def run():
+        args["device_buffer_tokens"].index_fill_(0, args["req_pool_indices"][:2], -1)
+        _initialize(args)
+        plan_cache_window_hash_mla(**args)
+        _copy(args)
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(3):
+        graph.replay()
+        _check_contents(args)
+        assert args["miss_count"].tolist() == [4, 4, 0]
+        torch.testing.assert_close(args["device_buffer_locs"], physical)
+
+
 def test_clock_epoch_wrap_does_not_protect_ancient_references():
     args = _inputs(8, 2, 2)
     state = args["state"]

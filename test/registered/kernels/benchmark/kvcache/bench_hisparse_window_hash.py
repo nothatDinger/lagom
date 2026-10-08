@@ -1,13 +1,18 @@
 """Compare main's positional LRU with PR #40670's whole-window hash planner.
 
 Example: python bench_hisparse_window_hash.py --batch-size 4 --verify-width 6
-Use --metadata-only to time planning. Resets occur before the timed CUDA events;
-both planners see the same resident snapshot, Top-K, and DSv4 copy kernel.
+Default: plan+IO. --mode all also measures planning and copy-only replay.
+Snapshot resets occur before CUDA events. With --force-h2d-each-step, residency
+invalidation occurs inside the timed plan, as in the runtime. --timing eager
+uses direct launches like main's bench_hisparse.py instead of CUDA graphs.
 """
 
 import argparse
 import json
+import math
+import os
 import statistics
+from pathlib import Path
 
 import torch
 
@@ -38,15 +43,44 @@ def main():
     parser.add_argument("--overlap", type=float, default=0.75)
     parser.add_argument("--rounds", type=int, default=50)
     parser.add_argument("--metadata-only", action="store_true")
+    parser.add_argument(
+        "--mode",
+        choices=("plan-io", "metadata-only", "copy-only", "all"),
+        default="plan-io",
+    )
+    parser.add_argument(
+        "--timing", choices=("cuda-graph", "eager"), default="cuda-graph"
+    )
+    parser.add_argument("--force-h2d-each-step", action="store_true")
+    parser.add_argument(
+        "--skip-io",
+        action="store_true",
+        default=os.environ.get("SGLANG_DEBUG_HISPARSE_SKIP_IO", "0") == "1",
+        help="Keep planning and copy dispatch but skip KV bytes, like the server probe.",
+    )
+    parser.add_argument("--num-copy-blocks", type=int, default=4)
+    parser.add_argument("--output-file", type=Path)
     opts = parser.parse_args()
+    if opts.metadata_only:
+        if opts.mode != "plan-io":
+            parser.error("--metadata-only cannot be combined with --mode")
+        opts.mode = "metadata-only"
+    if opts.mode in ("metadata-only", "all") and opts.skip_io:
+        parser.error("--skip-io requires --mode plan-io or copy-only")
     if not torch.cuda.is_available() or torch.version.hip is not None:
         parser.error("NVIDIA CUDA is required")
     if not (0 <= opts.miss_rate <= 1 and 0 <= opts.overlap <= 1):
         parser.error("miss-rate and overlap must be between 0 and 1")
-    if opts.batch_size <= 0 or opts.rounds <= 0:
-        parser.error("batch-size and rounds must be positive")
+    if opts.batch_size <= 0 or opts.rounds <= 0 or opts.num_copy_blocks <= 0:
+        parser.error("batch-size, rounds, and num-copy-blocks must be positive")
     b, w, k = opts.batch_size, opts.verify_width, opts.top_k
-    h = opts.hot_slots or w * k
+    # Match resolve_dspark_device_buffer_size: force-H2D still needs room for
+    # every distinct token in this live verify window.
+    h = (
+        w * k
+        if opts.force_h2d_each_step
+        else (opts.hot_slots if opts.hot_slots is not None else w * k)
+    )
     layout = HiSparseWindowHashLayout(h, w, k)
     host_len = h + w * k + 1
     page_bytes = ((64 * 584 + 575) // 576) * 576
@@ -115,7 +149,16 @@ def main():
         else:
             lru.copy_(lru_initial)
 
-    def run(planner):
+    def plan(planner):
+        if opts.force_h2d_each_step:
+            # Forget the previous step once, preserving all physical slot IDs.
+            # The planner still deduplicates repeated tokens within this window.
+            tokens.index_fill_(0, reqs, -1)
+            lru[reqs] = lru_initial
+            if planner == "window_hash":
+                initialize_window_hash_state(
+                    device_buffer_tokens=tokens, req_pool_indices=reqs, state=state
+                )
         if planner == "window_hash":
             plan_cache_window_hash_mla(**args, state=state)
         else:
@@ -133,73 +176,122 @@ def main():
                 skip_io=True,
                 verify_width=w,
             )
-        if not opts.metadata_only:
-            copy_cache_planned_mla(
-                **{
-                    key: args[key]
-                    for key in (
-                        "miss_src",
-                        "miss_dst",
-                        "miss_count",
-                        "num_real_reqs",
-                        "host_cache",
-                        "device_buffer",
-                    )
-                },
-                item_size_bytes=584,
-                is_dsv4_layout=True,
-                num_blocks=b,
-            )
+
+    def copy():
+        copy_cache_planned_mla(
+            **{
+                key: args[key]
+                for key in (
+                    "miss_src",
+                    "miss_dst",
+                    "miss_count",
+                    "num_real_reqs",
+                    "host_cache",
+                    "device_buffer",
+                )
+            },
+            item_size_bytes=584,
+            is_dsv4_layout=True,
+            num_blocks=opts.num_copy_blocks,
+            skip_io=opts.skip_io,
+        )
 
     results = []
     for planner in ("lru", "window_hash"):
-        for _ in range(5):
-            reset(planner)
-            run(planner)
-        torch.cuda.synchronize()
-        reset(planner)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            run(planner)
-        timings = []
-        for _ in range(opts.rounds):
-            reset(planner)
-            start, end = (
-                torch.cuda.Event(enable_timing=True),
-                torch.cuda.Event(enable_timing=True),
+        modes = (
+            ("plan-io", "metadata-only", "copy-only")
+            if opts.mode == "all"
+            else (opts.mode,)
+        )
+        for mode in modes:
+
+            def run():
+                if mode != "copy-only":
+                    plan(planner)
+                if mode != "metadata-only":
+                    copy()
+
+            def prepare():
+                reset(planner)
+                if mode == "copy-only":
+                    plan(planner)
+
+            for _ in range(5):
+                prepare()
+                run()
+            torch.cuda.synchronize()
+            prepare()
+            graph = None
+            if opts.timing == "cuda-graph":
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    run()
+            timings = []
+            for _ in range(opts.rounds):
+                prepare()
+                start, end = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                start.record()
+                if graph is None:
+                    run()
+                else:
+                    graph.replay()
+                end.record()
+                end.synchronize()
+                timings.append(start.elapsed_time(end) * 1000)
+            misses = args["miss_count"].tolist()
+            expected_misses = (
+                torch.unique(topk[0]).numel()
+                if opts.force_h2d_each_step
+                else torch.unique(topk[0][topk[0] >= h]).numel()
             )
-            start.record()
-            graph.replay()
-            end.record()
-            end.synchronize()
-            timings.append(start.elapsed_time(end) * 1000)
-        results.append(
-            {
-                "planner": planner,
-                "median_us": statistics.median(timings),
-                "min_us": min(timings),
-                "unique_misses_per_request": args["miss_count"].tolist(),
-                "persistent_metadata_bytes": (
-                    layout.fixed_state_bytes(num_layers=1, num_req_slots=b)
-                    if planner == "window_hash"
-                    else lru.numel() * lru.element_size()
-                ),
-            }
-        )
-    print(
-        json.dumps(
-            {
-                "config": vars(opts),
-                "gpu": torch.cuda.get_device_name(),
-                "torch": torch.__version__,
-                "cuda": torch.version.cuda,
-                "reset_in_timing": False,
-                "cuda_graph_timing": True,
-                "results": results,
-            },
-            indent=2,
-        )
+            if misses != [expected_misses] * b:
+                raise RuntimeError(
+                    f"{planner} miss counts {misses} != expected {expected_misses}"
+                )
+            results.append(
+                {
+                    "planner": planner,
+                    "mode": mode,
+                    "mean_us": statistics.fmean(timings),
+                    "median_us": statistics.median(timings),
+                    "p95_us": sorted(timings)[math.ceil(0.95 * len(timings)) - 1],
+                    "min_us": min(timings),
+                    "unique_misses_per_request": misses,
+                    "h2d_bytes_per_window": (
+                        sum(misses) * 584
+                        if mode != "metadata-only" and not opts.skip_io
+                        else 0
+                    ),
+                    "force_invalidation_in_timing": opts.force_h2d_each_step
+                    and mode != "copy-only",
+                    "persistent_metadata_bytes": (
+                        layout.fixed_state_bytes(num_layers=1, num_req_slots=b)
+                        if planner == "window_hash"
+                        else lru.numel() * lru.element_size()
+                    ),
+                }
+            )
+    config = vars(opts).copy()
+    config["output_file"] = str(opts.output_file) if opts.output_file else None
+    report = json.dumps(
+        {
+            "config": config,
+            "effective_hot_slots": h,
+            "gpu": torch.cuda.get_device_name(),
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "reset_in_timing": False,
+            "cuda_graph_timing": opts.timing == "cuda-graph",
+            "results": results,
+        },
+        indent=2,
     )
+    print(report)
+    if opts.output_file:
+        opts.output_file.write_text(report + "\n")
 
 
 if __name__ == "__main__":

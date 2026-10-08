@@ -340,10 +340,21 @@ def test_dspark_swap_in_ignores_graph_padding_rows():
     torch.testing.assert_close(actual[4:], torch.full((2, 2), -1, dtype=torch.int32))
 
 
-def test_dspark_verify_window_hashes_and_copies_once(monkeypatch):
+@pytest.mark.parametrize("force_h2d", [False, True])
+@pytest.mark.parametrize(
+    "skip_io, override", [(False, None), (True, None), (True, False), (False, True)]
+)
+def test_dspark_verify_window_hashes_and_copies_once(
+    monkeypatch, force_h2d, skip_io, override
+):
     """The whole verify window uses one hash planner and main's copy kernel."""
     planner = MagicMock()
     copier = MagicMock()
+    initialize = MagicMock()
+    monkeypatch.setattr(
+        "sglang.srt.managers.hisparse_coordinator.initialize_window_hash_state",
+        initialize,
+    )
     monkeypatch.setattr(
         "sglang.srt.managers.hisparse_coordinator.plan_cache_window_hash_mla",
         planner,
@@ -356,12 +367,12 @@ def test_dspark_verify_window_hashes_and_copies_once(monkeypatch):
     coordinator.is_dsv4_hisparse = True
     coordinator._speculative_verify_width = 3
     coordinator._window_hash_states = [object()]
-    coordinator.force_h2d_each_step = False
+    coordinator.force_h2d_each_step = force_h2d
     coordinator.top_k = 2
     coordinator.device_buffer_size = 6
     coordinator.swap_in_block_size = 256
     coordinator.item_size_bytes = 16
-    coordinator.skip_io = False
+    coordinator.skip_io = skip_io
     coordinator._init_shared_index_prefetch(
         shared_index_layers=None, layer_num=1, max_num_req_slots=4
     )
@@ -374,10 +385,13 @@ def test_dspark_verify_window_hashes_and_copies_once(monkeypatch):
     coordinator.req_to_host_pool = torch.empty((4, 16), dtype=torch.int64)
     coordinator.req_device_buffer_token_locs = torch.empty((1, 4, 7), dtype=torch.int32)
     coordinator.lru_slots = torch.empty((1, 4, 6), dtype=torch.int16)
+    coordinator._lru_init = torch.arange(6, dtype=torch.int16)
     coordinator.mem_pool_host = SimpleNamespace(kv_buffer=[torch.empty(1)])
     coordinator.mem_pool_device = SimpleNamespace(kv_buffer=[torch.empty(1)])
     top_k = torch.arange(12, dtype=torch.int32).view(6, 2)
     output = torch.full_like(top_k, -1)
+    physical = coordinator.req_device_buffer_token_locs.clone()
+    real_reqs = torch.tensor([1], dtype=torch.int32)
 
     actual = coordinator._run_swap_in_verify_window(
         req_pool_indices=torch.tensor([1, 3]),
@@ -386,6 +400,8 @@ def test_dspark_verify_window_hashes_and_copies_once(monkeypatch):
         layer_id=0,
         verify_width=3,
         output_buffer=output,
+        skip_io=override,
+        num_real_reqs=real_reqs,
     )
 
     assert actual.data_ptr() == output.data_ptr()
@@ -396,6 +412,15 @@ def test_dspark_verify_window_hashes_and_copies_once(monkeypatch):
     assert planner.call_args.kwargs["top_k_device_locs"].data_ptr() == output.data_ptr()
     assert planner.call_args.kwargs["miss_src"].shape == (2, 6)
     assert copier.call_args.kwargs["num_blocks"] == 4
+    assert copier.call_args.kwargs["skip_io"] == (
+        skip_io if override is None else override
+    )
+    assert copier.call_args.kwargs["num_real_reqs"] is real_reqs
+    assert planner.call_args.kwargs["num_real_reqs"] is real_reqs
+    assert initialize.call_count == int(force_h2d)
+    torch.testing.assert_close(coordinator.req_device_buffer_token_locs, physical)
+    if force_h2d:
+        assert (coordinator.req_device_buffer_tokens[0, [1, 3]] == -1).all()
     assert copier.call_args.kwargs["miss_src"].data_ptr() == (
         planner.call_args.kwargs["miss_src"].data_ptr()
     )
@@ -442,6 +467,38 @@ def test_decode_fallback_uses_same_window_hash_state():
     )
     assert result.data_ptr() == coordinator.top_k_device_locs_buffer.data_ptr()
     assert coordinator._run_swap_in_verify_window.call_args.kwargs["verify_width"] == 1
+
+
+def test_decode_hash_invalidates_once_and_forwards_probe_options():
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator._window_hash_states = [object()]
+    coordinator.top_k = 2
+    coordinator.top_k_device_locs_buffer = torch.zeros((2, 2), dtype=torch.int32)
+    coordinator.enable_prefetch = False
+    coordinator.prefetcher_name = None
+    coordinator._consume_previous_prefetch = MagicMock()
+    coordinator._invalidate_hot_buffer_residency = MagicMock()
+
+    def run_window(**kwargs):
+        coordinator._invalidate_hot_buffer_residency(
+            kwargs["req_pool_indices"], kwargs["layer_id"]
+        )
+        return kwargs["output_buffer"]
+
+    coordinator._run_swap_in_verify_window = MagicMock(side_effect=run_window)
+    reqs = torch.tensor([0, 1])
+    lengths = torch.tensor([10, 20])
+    topk = torch.zeros((2, 2), dtype=torch.int32)
+    coordinator.swap_in_selected_pages(reqs, lengths, topk, 0)
+    coordinator._invalidate_hot_buffer_residency.assert_called_once()
+
+    real_reqs = torch.tensor([1], dtype=torch.int32)
+    coordinator._run_swap_in_kernel(
+        reqs, lengths, topk, 0, skip_io=True, num_real_reqs=real_reqs
+    )
+    kwargs = coordinator._run_swap_in_verify_window.call_args.kwargs
+    assert kwargs["skip_io"] is True
+    assert kwargs["num_real_reqs"] is real_reqs
 
 
 def test_dspark_swap_in_rejects_inconsistent_ragged_geometry():

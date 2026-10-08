@@ -1459,6 +1459,8 @@ class HiSparseCoordinator:
                 layer_id=layer_id,
                 verify_width=1,
                 output_buffer=top_k_indices,
+                skip_io=skip_io,
+                num_real_reqs=num_real_reqs,
             )
 
         swap_in_fn = (
@@ -1964,7 +1966,9 @@ class HiSparseCoordinator:
             req_pool_indices_cpu,
             committed_lens_cpu,
         )
-        self._invalidate_hot_buffer_residency(req_pool_indices, layer_id)
+        # The hash fallback invalidates inside _run_swap_in_verify_window.
+        if getattr(self, "_window_hash_states", None) is None:
+            self._invalidate_hot_buffer_residency(req_pool_indices, layer_id)
         if not self.enable_prefetch:
             result = self._run_swap_in_kernel(
                 req_pool_indices,
@@ -2035,6 +2039,8 @@ class HiSparseCoordinator:
         layer_id: int,
         verify_width: int,
         output_buffer: torch.Tensor,
+        skip_io: Optional[bool] = None,
+        num_real_reqs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Hash all verify positions together, then copy unique misses once."""
         self._invalidate_hot_buffer_residency(req_pool_indices, layer_id)
@@ -2056,7 +2062,9 @@ class HiSparseCoordinator:
             device_buffer=self.mem_pool_device.kv_buffer[layer_id],
             req_pool_indices=req_pool_indices,
             seq_lens=compressed_seq_lens,
-            num_real_reqs=self.num_real_reqs,
+            num_real_reqs=(
+                self.num_real_reqs if num_real_reqs is None else num_real_reqs
+            ),
             miss_src=miss_src,
             miss_dst=miss_dst,
             miss_count=miss_count,
@@ -2097,13 +2105,13 @@ class HiSparseCoordinator:
             miss_src=miss_src,
             miss_dst=miss_dst,
             miss_count=miss_count,
-            num_real_reqs=self.num_real_reqs,
+            num_real_reqs=common["num_real_reqs"],
             host_cache=self.mem_pool_host.kv_buffer[layer_id],
             device_buffer=self.mem_pool_device.kv_buffer[layer_id],
             item_size_bytes=self.item_size_bytes,
             num_blocks=self._prefetch_copy_blocks,
             is_dsv4_layout=True,
-            skip_io=self.skip_io,
+            skip_io=self.skip_io if skip_io is None else skip_io,
         )
         return output_buffer
 
