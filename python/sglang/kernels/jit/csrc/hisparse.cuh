@@ -332,6 +332,7 @@ template <
     bool IsDsv4Layout,
     bool RecordMissPlan,
     bool SkipIO,
+    int VERIFY_WIDTH,
     typename SeqLensT,
     typename ReqPoolIndicesT>
 __global__ void load_cache_to_device_buffer_kernel(
@@ -358,7 +359,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t* __restrict__ miss_src_out,
     int32_t* __restrict__ miss_dst_out,
     int32_t* __restrict__ miss_count_out,
-    int64_t plan_stride) {
+    int64_t plan_stride,
+    int64_t seq_lens_request_stride) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
@@ -367,13 +369,15 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   const int bid = blockIdx.x;
   const int tid = threadIdx.x;
-  int32_t* req_top_k_device_locs = top_k_device_locs + bid * top_k_device_locs_stride;
 
   // CUDA graph pads the batch to a captured size. Keep padded output rows
   // invalid without a separate fill kernel.
   if (bid >= num_real_reqs[0]) {
-    for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
-      req_top_k_device_locs[i] = -1;
+    for (int step = 0; step < VERIFY_WIDTH; ++step) {
+      int32_t* row_locs = top_k_device_locs + (bid * VERIFY_WIDTH + step) * top_k_device_locs_stride;
+      for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+        row_locs[i] = -1;
+      }
     }
     return;
   }
@@ -383,288 +387,314 @@ __global__ void load_cache_to_device_buffer_kernel(
   const BallotMask lanes_before = (BallotMask(1) << lane_id) - BallotMask(1);
 
   const int64_t rid = req_pool_indices[bid];
-  const int64_t seq_len = seq_lens[bid];
+  int plan_offset = 0;
+  if constexpr (RecordMissPlan) {
+    if (tid == 0) miss_count_out[bid] = 0;
+  }
 
-  // Calculate offsets for this request
-  const int32_t* req_top_k_tokens = top_k_tokens + bid * top_k_tokens_stride;
+  // A speculative verify instantiation assigns one block to one request and
+  // resolves that request's rows in order.  This preserves the per-request LRU
+  // dependency while producing one deduplicated miss plan for the whole window.
+  for (int verify_step = 0; verify_step < VERIFY_WIDTH; ++verify_step) {
+    const int row = bid * VERIFY_WIDTH + verify_step;
+    int32_t* req_top_k_device_locs = top_k_device_locs + row * top_k_device_locs_stride;
+    const int64_t seq_len =
+        seq_lens_request_stride == 0 ? seq_lens[bid] : seq_lens[bid * seq_lens_request_stride + verify_step];
 
-  const int64_t buffer_offset = rid * buffer_stride_0;
-  int32_t* req_device_buffer_tokens = device_buffer_tokens + buffer_offset;
-  const int32_t* req_device_buffer_locs = device_buffer_locs + buffer_offset;
-  const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
-  int16_t* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
+    // Calculate offsets for this request
+    const int32_t* req_top_k_tokens = top_k_tokens + row * top_k_tokens_stride;
 
-  // Fast path: short sequences have all tokens in the device buffer in order.
-  if (seq_len <= HOT_BUFFER_SIZE) {
-    const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
-    for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
-      int32_t device_loc = -1;
-      if (i < count) {
-        int32_t token_pos = req_top_k_tokens[i];
-        if (token_pos >= 0) {
-          device_loc = req_device_buffer_locs[token_pos];
+    const int64_t buffer_offset = rid * buffer_stride_0;
+    int32_t* req_device_buffer_tokens = device_buffer_tokens + buffer_offset;
+    const int32_t* req_device_buffer_locs = device_buffer_locs + buffer_offset;
+    const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
+    int16_t* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
+
+    // Fast path: short sequences have all tokens in the device buffer in order.
+    if (seq_len <= HOT_BUFFER_SIZE) {
+      const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
+      for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+        int32_t device_loc = -1;
+        if (i < count) {
+          int32_t token_pos = req_top_k_tokens[i];
+          if (token_pos >= 0) {
+            device_loc = req_device_buffer_locs[token_pos];
+          }
+        }
+        req_top_k_device_locs[i] = device_loc;
+      }
+      // Short sequences load nothing from host: an empty miss plan for this request.
+      if constexpr (RecordMissPlan) {
+        if (tid == 0) {
+          miss_count_out[bid] = plan_offset;
         }
       }
-      req_top_k_device_locs[i] = device_loc;
+      continue;
     }
-    // Short sequences load nothing from host: an empty miss plan for this request.
+
+    // Dynamic shared memory layout: int32_t arrays first, then int16_t arrays.
+    extern __shared__ char smem_raw[];
+    using Layout = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>;
+    constexpr int HASH_SIZE = Layout::HASH_SIZE;
+
+    int32_t* smem_i32 = reinterpret_cast<int32_t*>(smem_raw);
+    // Top-k token positions; reused as miss-token scratch in the copy phase
+    int32_t* s_top_k_tokens = smem_i32;
+    // Prefix-sum offsets for hit counting and miss counting
+    int32_t* s_chunk_offset = s_top_k_tokens + NUM_TOP_K;
+    // Prefix-sum offsets for evictable counting
+    int32_t* s_evict_chunk_offset = s_chunk_offset + (NUM_BUFFER_CHUNKS + 1);
+    // Open-addressing hash table: top-k token_id -> top-k index (keys)
+    int32_t* s_hash_keys = s_evict_chunk_offset + (NUM_BUFFER_CHUNKS + 1);
+    // Scalar counters
+    int32_t& s_total_hits = s_hash_keys[HASH_SIZE];
+    int32_t& s_newest_hit = s_hash_keys[HASH_SIZE + 1];
+    int32_t& s_invalid_count = s_hash_keys[HASH_SIZE + 2];
+
+    int16_t* smem_i16 = reinterpret_cast<int16_t*>(smem_i32 + Layout::TOTAL_INT32);
+    // Compacted slot ordering: [hits fwd->  ...  <-evictables bwd]
+    int16_t* s_lru_slots_out = smem_i16;
+    // Open-addressing hash table: top-k token_id -> top-k index (values)
+    int16_t* s_hash_vals = s_lru_slots_out + HOT_BUFFER_SIZE;
+
+    // Initialize shared memory: counters, hash table, prefix-sum offsets.
+    if (tid == 0) {
+      s_total_hits = 0;
+      s_newest_hit = 0;
+      s_invalid_count = 0;
+    }
+    for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
+      s_hash_keys[i] = HASH_EMPTY;
+    }
+    for (int i = tid; i < NUM_BUFFER_CHUNKS + 1; i += BLOCK_SIZE) {
+      s_chunk_offset[i] = 0;
+      s_evict_chunk_offset[i] = 0;
+    }
+    __syncthreads();
+
+    const int newest_slot = HOT_BUFFER_SIZE;
+    const int32_t newest_token = seq_len - 1;
+
+    // Insert top-k tokens into shared-memory hash table.
+    for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+      int32_t token_idx = req_top_k_tokens[i];
+      // TARGET_VERIFY contains graph-padding rows and can also expose C4
+      // positions which have not become authoritative host KV yet.  Never put a
+      // negative/out-of-sequence sentinel into the hash table: HASH_EMPTY is -1,
+      // and treating it as a miss eventually indexes host_cache_locs[-1].
+      if (token_idx < 0 || token_idx >= seq_len) {
+        s_top_k_tokens[i] = TOKEN_HIT;
+        req_top_k_device_locs[i] = -1;
+        atomicAdd(&s_invalid_count, 1);
+      } else if (token_idx == newest_token) {
+        // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
+        // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
+        s_top_k_tokens[i] = TOKEN_HIT;
+        req_top_k_device_locs[i] = req_device_buffer_locs[newest_slot];
+        s_newest_hit = 1;
+      } else {
+        int slot = hash_slot(token_idx, HASH_SIZE);
+        while (true) {
+          int32_t old = atomicCAS(&s_hash_keys[slot], HASH_EMPTY, token_idx);
+          if (old == HASH_EMPTY || old == token_idx) {
+            s_hash_vals[slot] = static_cast<int16_t>(i);
+            break;
+          }
+          slot = (slot + 1) % HASH_SIZE;
+        }
+        s_top_k_tokens[i] = token_idx;
+      }
+    }
+    __syncthreads();
+
+    constexpr int ITERATIONS_PER_WARP_BUFFER = (NUM_BUFFER_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
+    int total_hit_count = 0;
+    int total_evict_count = 0;
+    for (int iter = 0; iter < ITERATIONS_PER_WARP_BUFFER; iter++) {
+      int chunk_idx = warp_id + iter * NUM_WARPS;
+      bool has_valid_chunk = chunk_idx < NUM_BUFFER_CHUNKS;
+
+      const int slot_idx = chunk_idx * WARP_SIZE + lane_id;
+      const bool has_valid_slot = has_valid_chunk && (slot_idx < HOT_BUFFER_SIZE);
+      const int16_t buf_slot = has_valid_slot ? req_lru_slots[slot_idx] : -1;
+      int32_t my_buffer_token = (buf_slot >= 0) ? req_device_buffer_tokens[buf_slot] : -1;
+      int my_found_top_k_idx = -1;
+      if (my_buffer_token >= 0) {
+        int h = hash_slot(my_buffer_token, HASH_SIZE);
+        while (true) {
+          int32_t k = s_hash_keys[h];
+          if (k == my_buffer_token) {
+            my_found_top_k_idx = static_cast<int32_t>(s_hash_vals[h]);
+            break;
+          }
+          if (k == HASH_EMPTY) break;
+          h = (h + 1) % HASH_SIZE;
+        }
+      }
+      bool is_hit = my_found_top_k_idx >= 0;
+      bool is_evictable = has_valid_slot && !is_hit;
+
+      // Record hits
+      if (is_hit) {
+        s_top_k_tokens[my_found_top_k_idx] = TOKEN_HIT;
+        req_top_k_device_locs[my_found_top_k_idx] = req_device_buffer_locs[buf_slot];
+      }
+
+      int local_hit_offset = 0;
+      int local_evict_offset = 0;
+      if (has_valid_chunk) {
+        const BallotMask hit_mask = __ballot_sync(FULL_WARP_MASK, is_hit);
+        const BallotMask evict_mask = __ballot_sync(FULL_WARP_MASK, is_evictable);
+        local_hit_offset = popc_mask(hit_mask & lanes_before);
+        local_evict_offset = popc_mask(evict_mask & lanes_before);
+        if (lane_id == 0) {
+          s_chunk_offset[chunk_idx + 1] = popc_mask(hit_mask);
+          s_evict_chunk_offset[chunk_idx + 1] = popc_mask(evict_mask);
+        }
+      }
+      __syncthreads();
+
+      if (warp_id == 0) {
+#ifdef USE_ROCM
+        // ROCm wavefront64: WARP_SIZE (64) > NUM_WARPS (16 at block_size=1024),
+        // so the wide-count form below would let lanes beyond this iteration's
+        // NUM_WARPS-wide window write the accumulator into s_chunk_offset
+        // positions belonging to future iterations, corrupting their reads.
+        // Bound the scan window to NUM_WARPS lanes.
+        const int scan_offset = iter * NUM_WARPS + 1;
+        const int scan_count = min(scan_offset + NUM_WARPS, NUM_BUFFER_CHUNKS + 1);
+        total_hit_count = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_hit_count);
+        total_evict_count =
+            warp_inclusive_scan(s_evict_chunk_offset, lane_id, scan_offset, scan_count, total_evict_count);
+#else
+        total_hit_count =
+            warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_hit_count);
+        total_evict_count =
+            warp_inclusive_scan(s_evict_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_evict_count);
+#endif
+        if (tid == 0) {
+          s_total_hits = total_hit_count;
+        }
+      }
+      __syncthreads();
+
+      // Hits grow forward from index 0
+      if (is_hit) {
+        int hit_offset = s_chunk_offset[chunk_idx] + local_hit_offset;
+        s_lru_slots_out[hit_offset] = buf_slot;
+      }
+      // Evictables grow backward from HOT_BUFFER_SIZE - 1
+      if (is_evictable) {
+        int evict_offset = s_evict_chunk_offset[chunk_idx] + local_evict_offset;
+        s_lru_slots_out[HOT_BUFFER_SIZE - 1 - evict_offset] = buf_slot;
+      }
+    }
+    __syncthreads();
+
+    // Reset offsets for the miss counting phase (only NUM_TOKEN_CHUNKS + 1 entries needed).
+    for (int i = tid; i < NUM_TOKEN_CHUNKS + 1; i += BLOCK_SIZE) {
+      s_chunk_offset[i] = 0;
+    }
+    __syncthreads();
+
+    // Third pass to identify misses and their evictable slots
+    int total_misses = 0;
+    constexpr int ITERATIONS_PER_WARP_TOKEN = (NUM_TOKEN_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
+    for (int iter = 0; iter < ITERATIONS_PER_WARP_TOKEN; iter++) {
+      int chunk_idx = warp_id + iter * NUM_WARPS;
+      bool has_valid_chunk = chunk_idx < NUM_TOKEN_CHUNKS;
+
+      const int chunk_token_start = chunk_idx * WARP_SIZE;
+      const int my_token_idx = chunk_token_start + lane_id;
+      const bool has_valid_token = has_valid_chunk && (my_token_idx < NUM_TOP_K);
+
+      int32_t my_token = 0;
+      bool is_miss = false;
+      int local_miss_offset = 0;
+
+      if (has_valid_token) {
+        is_miss = s_top_k_tokens[my_token_idx] != TOKEN_HIT;
+        if (is_miss) {
+          my_token = s_top_k_tokens[my_token_idx];
+          // Host pool contains committed, authoritative KV only.  A speculative
+          // C4 entry with no host location must not be copied from address -1.
+          // Leave its attention location invalid until the speculative scratch
+          // entry is committed/bound by the coordinator.
+          if (req_host_cache_locs[my_token] < 0) {
+            is_miss = false;
+            req_top_k_device_locs[my_token_idx] = -1;
+            atomicAdd(&s_invalid_count, 1);
+          }
+        }
+      }
+
+      if (has_valid_chunk) {
+        const BallotMask miss_mask = __ballot_sync(FULL_WARP_MASK, is_miss);
+        local_miss_offset = popc_mask(miss_mask & lanes_before);
+        const int warp_miss_count = popc_mask(miss_mask);
+        if (lane_id == 0) {
+          s_chunk_offset[chunk_idx + 1] = warp_miss_count;
+        }
+      }
+      __syncthreads();
+
+      if (warp_id == 0) {
+#ifdef USE_ROCM
+        const int scan_offset = iter * NUM_WARPS + 1;
+        const int scan_count = min(scan_offset + NUM_WARPS, NUM_TOKEN_CHUNKS + 1);
+        total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_misses);
+#else
+        total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, total_misses);
+#endif
+      }
+      __syncthreads();
+
+      if (is_miss) {
+        int miss_offset = s_chunk_offset[chunk_idx] + local_miss_offset;
+        int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_offset];
+        // Reuse s_top_k_tokens as miss scratch: miss_offset < my_token_idx always
+        // holds (hits are skipped), so compacted writes never overrun pending reads.
+        s_top_k_tokens[miss_offset] = my_token;
+        req_top_k_device_locs[my_token_idx] = req_device_buffer_locs[evict_slot];
+        req_device_buffer_tokens[evict_slot] = my_token;
+        // Record the plan where the eviction is decided so it cannot disagree
+        // with the copy phase; locs are layer-independent (lockstep buffers).
+        if constexpr (RecordMissPlan) {
+          miss_src_out[bid * plan_stride + plan_offset + miss_offset] = req_host_cache_locs[my_token];
+          miss_dst_out[bid * plan_stride + plan_offset + miss_offset] = req_device_buffer_locs[evict_slot];
+        }
+      }
+    }
+    __syncthreads();
+
+    total_misses = NUM_TOP_K - s_total_hits - s_newest_hit - s_invalid_count;
     if constexpr (RecordMissPlan) {
       if (tid == 0) {
-        miss_count_out[bid] = 0;
+        miss_count_out[bid] = plan_offset + total_misses;
       }
     }
-    return;
-  }
-
-  // Dynamic shared memory layout: int32_t arrays first, then int16_t arrays.
-  extern __shared__ char smem_raw[];
-  using Layout = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>;
-  constexpr int HASH_SIZE = Layout::HASH_SIZE;
-
-  int32_t* smem_i32 = reinterpret_cast<int32_t*>(smem_raw);
-  // Top-k token positions; reused as miss-token scratch in the copy phase
-  int32_t* s_top_k_tokens = smem_i32;
-  // Prefix-sum offsets for hit counting and miss counting
-  int32_t* s_chunk_offset = s_top_k_tokens + NUM_TOP_K;
-  // Prefix-sum offsets for evictable counting
-  int32_t* s_evict_chunk_offset = s_chunk_offset + (NUM_BUFFER_CHUNKS + 1);
-  // Open-addressing hash table: top-k token_id -> top-k index (keys)
-  int32_t* s_hash_keys = s_evict_chunk_offset + (NUM_BUFFER_CHUNKS + 1);
-  // Scalar counters
-  int32_t& s_total_hits = s_hash_keys[HASH_SIZE];
-  int32_t& s_newest_hit = s_hash_keys[HASH_SIZE + 1];
-  int32_t& s_invalid_count = s_hash_keys[HASH_SIZE + 2];
-
-  int16_t* smem_i16 = reinterpret_cast<int16_t*>(smem_i32 + Layout::TOTAL_INT32);
-  // Compacted slot ordering: [hits fwd->  ...  <-evictables bwd]
-  int16_t* s_lru_slots_out = smem_i16;
-  // Open-addressing hash table: top-k token_id -> top-k index (values)
-  int16_t* s_hash_vals = s_lru_slots_out + HOT_BUFFER_SIZE;
-
-  // Initialize shared memory: counters, hash table, prefix-sum offsets.
-  if (tid == 0) {
-    s_total_hits = 0;
-    s_newest_hit = 0;
-    s_invalid_count = 0;
-  }
-  for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
-    s_hash_keys[i] = HASH_EMPTY;
-  }
-  for (int i = tid; i < NUM_BUFFER_CHUNKS + 1; i += BLOCK_SIZE) {
-    s_chunk_offset[i] = 0;
-    s_evict_chunk_offset[i] = 0;
-  }
-  __syncthreads();
-
-  const int newest_slot = HOT_BUFFER_SIZE;
-  const int32_t newest_token = seq_len - 1;
-
-  // Insert top-k tokens into shared-memory hash table.
-  for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
-    int32_t token_idx = req_top_k_tokens[i];
-    // TARGET_VERIFY contains graph-padding rows and can also expose C4
-    // positions which have not become authoritative host KV yet.  Never put a
-    // negative/out-of-sequence sentinel into the hash table: HASH_EMPTY is -1,
-    // and treating it as a miss eventually indexes host_cache_locs[-1].
-    if (token_idx < 0 || token_idx >= seq_len) {
-      s_top_k_tokens[i] = TOKEN_HIT;
-      req_top_k_device_locs[i] = -1;
-      atomicAdd(&s_invalid_count, 1);
-    } else if (token_idx == newest_token) {
-      // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
-      // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
-      s_top_k_tokens[i] = TOKEN_HIT;
-      req_top_k_device_locs[i] = req_device_buffer_locs[newest_slot];
-      s_newest_hit = 1;
-    } else {
-      int slot = hash_slot(token_idx, HASH_SIZE);
-      while (true) {
-        int32_t old = atomicCAS(&s_hash_keys[slot], HASH_EMPTY, token_idx);
-        if (old == HASH_EMPTY || old == token_idx) {
-          s_hash_vals[slot] = static_cast<int16_t>(i);
-          break;
-        }
-        slot = (slot + 1) % HASH_SIZE;
-      }
-      s_top_k_tokens[i] = token_idx;
-    }
-  }
-  __syncthreads();
-
-  constexpr int ITERATIONS_PER_WARP_BUFFER = (NUM_BUFFER_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
-  int total_hit_count = 0;
-  int total_evict_count = 0;
-  for (int iter = 0; iter < ITERATIONS_PER_WARP_BUFFER; iter++) {
-    int chunk_idx = warp_id + iter * NUM_WARPS;
-    bool has_valid_chunk = chunk_idx < NUM_BUFFER_CHUNKS;
-
-    const int slot_idx = chunk_idx * WARP_SIZE + lane_id;
-    const bool has_valid_slot = has_valid_chunk && (slot_idx < HOT_BUFFER_SIZE);
-    const int16_t buf_slot = has_valid_slot ? req_lru_slots[slot_idx] : -1;
-    int32_t my_buffer_token = (buf_slot >= 0) ? req_device_buffer_tokens[buf_slot] : -1;
-    int my_found_top_k_idx = -1;
-    if (my_buffer_token >= 0) {
-      int h = hash_slot(my_buffer_token, HASH_SIZE);
-      while (true) {
-        int32_t k = s_hash_keys[h];
-        if (k == my_buffer_token) {
-          my_found_top_k_idx = static_cast<int32_t>(s_hash_vals[h]);
-          break;
-        }
-        if (k == HASH_EMPTY) break;
-        h = (h + 1) % HASH_SIZE;
-      }
-    }
-    bool is_hit = my_found_top_k_idx >= 0;
-    bool is_evictable = has_valid_slot && !is_hit;
-
-    // Record hits
-    if (is_hit) {
-      s_top_k_tokens[my_found_top_k_idx] = TOKEN_HIT;
-      req_top_k_device_locs[my_found_top_k_idx] = req_device_buffer_locs[buf_slot];
-    }
-
-    int local_hit_offset = 0;
-    int local_evict_offset = 0;
-    if (has_valid_chunk) {
-      const BallotMask hit_mask = __ballot_sync(FULL_WARP_MASK, is_hit);
-      const BallotMask evict_mask = __ballot_sync(FULL_WARP_MASK, is_evictable);
-      local_hit_offset = popc_mask(hit_mask & lanes_before);
-      local_evict_offset = popc_mask(evict_mask & lanes_before);
-      if (lane_id == 0) {
-        s_chunk_offset[chunk_idx + 1] = popc_mask(hit_mask);
-        s_evict_chunk_offset[chunk_idx + 1] = popc_mask(evict_mask);
-      }
-    }
-    __syncthreads();
-
-    if (warp_id == 0) {
+    // Write back LRU order: evictables at front (LRU), hits at back (MRU).
+    {
+      const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
 #ifdef USE_ROCM
-      // ROCm wavefront64: WARP_SIZE (64) > NUM_WARPS (16 at block_size=1024),
-      // so the wide-count form below would let lanes beyond this iteration's
-      // NUM_WARPS-wide window write the accumulator into s_chunk_offset
-      // positions belonging to future iterations, corrupting their reads.
-      // Bound the scan window to NUM_WARPS lanes.
-      const int scan_offset = iter * NUM_WARPS + 1;
-      const int scan_count = min(scan_offset + NUM_WARPS, NUM_BUFFER_CHUNKS + 1);
-      total_hit_count = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_hit_count);
-      total_evict_count =
-          warp_inclusive_scan(s_evict_chunk_offset, lane_id, scan_offset, scan_count, total_evict_count);
+      // ROCm: cap writeback threads at 512 for large kernels.
+      constexpr int LRU_WRITEBACK_THREADS = (BLOCK_SIZE > 512) ? 512 : BLOCK_SIZE;
+      if (tid < LRU_WRITEBACK_THREADS) {
+        for (int i = tid; i < HOT_BUFFER_SIZE; i += LRU_WRITEBACK_THREADS) {
+          if (i < total_misses) {
+            // Misses: just loaded from host, place right before hits
+            req_lru_slots[total_evictable - total_misses + i] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+          } else if (i < total_evictable) {
+            // Remaining evictables: truly stale, dest at LRU front
+            req_lru_slots[i - total_misses] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+          } else {
+            // Hits: source at forward end, dest at MRU back
+            req_lru_slots[i] = s_lru_slots_out[i - total_evictable];
+          }
+        }
+      }
 #else
-      total_hit_count =
-          warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_hit_count);
-      total_evict_count =
-          warp_inclusive_scan(s_evict_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_evict_count);
-#endif
-      if (tid == 0) {
-        s_total_hits = total_hit_count;
-      }
-    }
-    __syncthreads();
-
-    // Hits grow forward from index 0
-    if (is_hit) {
-      int hit_offset = s_chunk_offset[chunk_idx] + local_hit_offset;
-      s_lru_slots_out[hit_offset] = buf_slot;
-    }
-    // Evictables grow backward from HOT_BUFFER_SIZE - 1
-    if (is_evictable) {
-      int evict_offset = s_evict_chunk_offset[chunk_idx] + local_evict_offset;
-      s_lru_slots_out[HOT_BUFFER_SIZE - 1 - evict_offset] = buf_slot;
-    }
-  }
-  __syncthreads();
-
-  // Reset offsets for the miss counting phase (only NUM_TOKEN_CHUNKS + 1 entries needed).
-  for (int i = tid; i < NUM_TOKEN_CHUNKS + 1; i += BLOCK_SIZE) {
-    s_chunk_offset[i] = 0;
-  }
-  __syncthreads();
-
-  // Third pass to identify misses and their evictable slots
-  int total_misses = 0;
-  constexpr int ITERATIONS_PER_WARP_TOKEN = (NUM_TOKEN_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
-  for (int iter = 0; iter < ITERATIONS_PER_WARP_TOKEN; iter++) {
-    int chunk_idx = warp_id + iter * NUM_WARPS;
-    bool has_valid_chunk = chunk_idx < NUM_TOKEN_CHUNKS;
-
-    const int chunk_token_start = chunk_idx * WARP_SIZE;
-    const int my_token_idx = chunk_token_start + lane_id;
-    const bool has_valid_token = has_valid_chunk && (my_token_idx < NUM_TOP_K);
-
-    int32_t my_token = 0;
-    bool is_miss = false;
-    int local_miss_offset = 0;
-
-    if (has_valid_token) {
-      is_miss = s_top_k_tokens[my_token_idx] != TOKEN_HIT;
-      if (is_miss) {
-        my_token = s_top_k_tokens[my_token_idx];
-        // Host pool contains committed, authoritative KV only.  A speculative
-        // C4 entry with no host location must not be copied from address -1.
-        // Leave its attention location invalid until the speculative scratch
-        // entry is committed/bound by the coordinator.
-        if (req_host_cache_locs[my_token] < 0) {
-          is_miss = false;
-          req_top_k_device_locs[my_token_idx] = -1;
-          atomicAdd(&s_invalid_count, 1);
-        }
-      }
-    }
-
-    if (has_valid_chunk) {
-      const BallotMask miss_mask = __ballot_sync(FULL_WARP_MASK, is_miss);
-      local_miss_offset = popc_mask(miss_mask & lanes_before);
-      const int warp_miss_count = popc_mask(miss_mask);
-      if (lane_id == 0) {
-        s_chunk_offset[chunk_idx + 1] = warp_miss_count;
-      }
-    }
-    __syncthreads();
-
-    if (warp_id == 0) {
-#ifdef USE_ROCM
-      const int scan_offset = iter * NUM_WARPS + 1;
-      const int scan_count = min(scan_offset + NUM_WARPS, NUM_TOKEN_CHUNKS + 1);
-      total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_misses);
-#else
-      total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, total_misses);
-#endif
-    }
-    __syncthreads();
-
-    if (is_miss) {
-      int miss_offset = s_chunk_offset[chunk_idx] + local_miss_offset;
-      int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_offset];
-      // Reuse s_top_k_tokens as miss scratch: miss_offset < my_token_idx always
-      // holds (hits are skipped), so compacted writes never overrun pending reads.
-      s_top_k_tokens[miss_offset] = my_token;
-      req_top_k_device_locs[my_token_idx] = req_device_buffer_locs[evict_slot];
-      req_device_buffer_tokens[evict_slot] = my_token;
-      // Record the plan where the eviction is decided so it cannot disagree
-      // with the copy phase; locs are layer-independent (lockstep buffers).
-      if constexpr (RecordMissPlan) {
-        miss_src_out[bid * plan_stride + miss_offset] = req_host_cache_locs[my_token];
-        miss_dst_out[bid * plan_stride + miss_offset] = req_device_buffer_locs[evict_slot];
-      }
-    }
-  }
-  __syncthreads();
-
-  total_misses = NUM_TOP_K - s_total_hits - s_newest_hit - s_invalid_count;
-  if constexpr (RecordMissPlan) {
-    if (tid == 0) {
-      miss_count_out[bid] = total_misses;
-    }
-  }
-  // Write back LRU order: evictables at front (LRU), hits at back (MRU).
-  {
-    const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
-#ifdef USE_ROCM
-    // ROCm: cap writeback threads at 512 for large kernels.
-    constexpr int LRU_WRITEBACK_THREADS = (BLOCK_SIZE > 512) ? 512 : BLOCK_SIZE;
-    if (tid < LRU_WRITEBACK_THREADS) {
-      for (int i = tid; i < HOT_BUFFER_SIZE; i += LRU_WRITEBACK_THREADS) {
+      for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
         if (i < total_misses) {
           // Misses: just loaded from host, place right before hits
           req_lru_slots[total_evictable - total_misses + i] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
@@ -676,35 +706,24 @@ __global__ void load_cache_to_device_buffer_kernel(
           req_lru_slots[i] = s_lru_slots_out[i - total_evictable];
         }
       }
+#endif
     }
-#else
-    for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
-      if (i < total_misses) {
-        // Misses: just loaded from host, place right before hits
-        req_lru_slots[total_evictable - total_misses + i] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
-      } else if (i < total_evictable) {
-        // Remaining evictables: truly stale, dest at LRU front
-        req_lru_slots[i - total_misses] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
-      } else {
-        // Hits: source at forward end, dest at MRU back
-        req_lru_slots[i] = s_lru_slots_out[i - total_evictable];
+
+    // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
+    if constexpr (!SkipIO) {
+      for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
+        const int32_t miss_token = s_top_k_tokens[miss_idx];
+        const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
+
+        const int64_t src_loc = req_host_cache_locs[miss_token];
+        const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
+
+        copy_miss_item<IsMLA, IsDsv4Layout>(
+            lane_id, host_cache_k, host_cache_v, device_buffer_k, device_buffer_v, src_loc, dst_loc, item_size_bytes);
       }
     }
-#endif
-  }
-
-  // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
-  if constexpr (!SkipIO) {
-    for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
-      const int32_t miss_token = s_top_k_tokens[miss_idx];
-      const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
-
-      const int64_t src_loc = req_host_cache_locs[miss_token];
-      const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
-
-      copy_miss_item<IsMLA, IsDsv4Layout>(
-          lane_id, host_cache_k, host_cache_v, device_buffer_k, device_buffer_v, src_loc, dst_loc, item_size_bytes);
-    }
+    plan_offset += total_misses;
+    __syncthreads();
   }
 }
 
@@ -715,7 +734,8 @@ template <
     bool IsMLA,
     bool IsDsv4Layout,
     bool RecordMissPlan,
-    bool SkipIO>
+    bool SkipIO,
+    int VERIFY_WIDTH>
 void load_cache_to_device_buffer(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -737,7 +757,14 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView miss_count_out) {
   using namespace host;
 
-  const int64_t bs = top_k_tokens.shape()[0];
+  if (top_k_tokens.shape()[0] % VERIFY_WIDTH != 0) {
+    throw std::runtime_error("load_cache_to_device_buffer: rows must be divisible by verify width");
+  }
+  const int64_t bs = top_k_tokens.shape()[0] / VERIFY_WIDTH;
+  if (seq_lens.shape()[0] != bs && seq_lens.shape()[0] != top_k_tokens.shape()[0]) {
+    throw std::runtime_error("load_cache_to_device_buffer: sequence lengths must be per request or per input row");
+  }
+  const int64_t seq_lens_request_stride = seq_lens.shape()[0] == bs ? 0 : VERIFY_WIDTH;
   const int64_t host_stride = host_cache_locs.shape()[1];
   // Miss-plan side outputs; 0-dim sentinels when RecordMissPlan is false.
   int64_t* const miss_src_ptr = RecordMissPlan ? static_cast<int64_t*>(miss_src_out.data_ptr()) : nullptr;
@@ -787,7 +814,8 @@ void load_cache_to_device_buffer(
         miss_src_ptr,
         miss_dst_ptr,
         miss_count_ptr,
-        plan_stride);
+        plan_stride,
+        seq_lens_request_stride);
   };
 
   const auto seq_dtype = seq_lens.dtype();
@@ -805,6 +833,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            VERIFY_WIDTH,
             int64_t,
             int64_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()),
@@ -819,6 +848,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            VERIFY_WIDTH,
             int64_t,
             int32_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()),
@@ -833,6 +863,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            VERIFY_WIDTH,
             int32_t,
             int64_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),
@@ -847,6 +878,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            VERIFY_WIDTH,
             int32_t,
             int32_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),

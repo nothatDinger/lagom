@@ -65,6 +65,7 @@ class SparseConfig:
     min_sparse_prompt_len: Optional[int] = None
     prefetcher: Optional[str] = None
     prefetcher_config: dict = field(default_factory=dict)
+    force_h2d_each_step: bool = False
     sparse_extra_config: dict = field(
         default_factory=dict
     )  # Algorithm-specific config, parsed by each algorithm
