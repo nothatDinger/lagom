@@ -7,6 +7,23 @@ import urllib.request
 from pathlib import Path
 
 
+def decode_profile_response(status, content_type, body):
+    text = body.decode("utf-8", errors="replace")
+    result = dict(
+        status=status, content_type=content_type, body=text, bytes_received=len(body)
+    )
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    result["json"] = parsed
+    result["accepted"] = 200 <= status < 300 and (
+        (isinstance(parsed, dict) and parsed.get("success") is True)
+        or text.strip() == "Start profiling."
+    )
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--decode-url", default="http://127.0.0.1:30000")
@@ -34,12 +51,17 @@ def main():
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(request, timeout=180) as response:
-        result = json.load(response)
+        result = decode_profile_response(
+            response.status, response.headers.get("Content-Type", ""), response.read()
+        )
     (opts.output_dir / "capture-request.json").write_text(
         json.dumps(dict(request=body, response=result), indent=2) + "\n"
     )
-    if result.get("success") is False:
-        raise SystemExit(f"Profile rejected: {result}")
+    if not result["accepted"]:
+        raise SystemExit(
+            f"Profile response was not recognized as success: {result}. "
+            "Check server logs and existing capture files before triggering again."
+        )
     print(json.dumps(result, indent=2))
     print(
         "Profile stops automatically after the requested scheduler steps. "

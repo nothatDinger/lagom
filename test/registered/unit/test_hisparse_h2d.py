@@ -1,10 +1,13 @@
 import copy
 import json
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
-from sglang.benchmark.hisparse_h2d import read_events, summarize
+from sglang.benchmark.hisparse_h2d import read_events, summarize, summarize_payload
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -159,3 +162,101 @@ def test_trace_identity_rejects_another_capture_or_rank(tmp_path):
         read_events(path, capture_id="run-b", pid=123)
     with pytest.raises(ValueError, match="identities"):
         read_events(path, capture_id="run-a", pid=124)
+
+
+def test_serialized_recorders_on_different_streams_are_paired():
+    probe, events = fixtures()
+    events[2]["args"]["stream"] = 312
+    events[3]["args"]["stream"] = 312
+    result = summarize(probe, events)
+    assert result["pairing"]["mode"] == "serialized_recorders"
+    assert result["pairing"]["recorder_streams"] == [312, 7]
+    assert result["samples"][1]["copy_stream"] == 312
+    assert result["layers"]["1"]["copy_gpu_us"] == 10
+    assert result["summary"]["copy_gpu_overlap_us"] == 0
+
+
+def test_pairing_follows_recorder_order_rather_than_copy_start_order():
+    probe, events = fixtures()
+    events[2].update(ts=-5, dur=30)
+    events[3].update(ts=25, dur=2)
+    events[2]["args"]["stream"] = 312
+    events[3]["args"]["stream"] = 312
+    result = summarize(probe, events)
+    assert result["samples"][0]["copy_us"] == 20
+    assert result["samples"][1]["copy_us"] == 30
+    assert result["summary"]["copy_gpu_us"] == 50
+    assert result["summary"]["copy_gpu_union_us"] == 30
+    assert result["summary"]["copy_gpu_overlap_us"] == 20
+
+
+def overlapping_fixtures():
+    probe, events = fixtures()
+    events[1]["dur"] = 10
+    events[2].update(ts=5, dur=20)
+    events[3].update(ts=25, dur=10)
+    events[2]["args"]["stream"] = 312
+    events[3]["args"]["stream"] = 312
+    # Counter increments can precede a stamp on another concurrently executing
+    # recorder; no relation between row index and kernel start is assumed.
+    probe["samples"][1]["gpu_stamp_ns"] = 500
+    return probe, events
+
+
+def test_overlapping_recorders_report_totals_without_layer_timing():
+    probe, events = overlapping_fixtures()
+    result = summarize(probe, events)
+    assert result["pairing"]["mode"] == "capture_totals_only"
+    assert result["summary"]["h2d_bytes"] == 58400
+    assert result["summary"]["copy_gpu_us"] == 40
+    assert result["summary"]["copy_gpu_union_us"] == 25
+    assert result["summary"]["copy_GBps"] == pytest.approx(58400 / 40 / 1000)
+    assert result["summary"]["copy_active_wall_GBps"] == pytest.approx(
+        58400 / 25 / 1000
+    )
+    assert "copy_gpu_us" not in result["layers"]["0"]
+    assert "copy_us" not in result["samples"][0]
+
+
+def test_overlapping_recorders_do_not_assign_filtered_bytes_to_times():
+    probe, events = overlapping_fixtures()
+    with pytest.raises(ValueError, match="whole-capture"):
+        summarize(probe, events, start_us=1)
+    probe["samples"][1]["real_batch"] = 3
+    probe["samples"][1]["misses_per_request"] = [10, 15, 15]
+    with pytest.raises(ValueError, match="whole-capture"):
+        summarize(probe, events, batch_size=2)
+
+
+def test_probe_only_retains_payload_without_inventing_timing():
+    probe, _ = fixtures()
+    result = summarize_payload(probe)
+    assert result["summary"]["h2d_bytes"] == 58400
+    assert result["captured_geometry"][0]["captured_batch"] == 4
+    assert "copy_GBps" not in result["summary"]
+
+
+@pytest.mark.parametrize("probe_only", [False, True])
+def test_offline_cli_analyzes_existing_multistream_files(tmp_path, probe_only):
+    probe, events = overlapping_fixtures()
+    probe_path, trace_path = tmp_path / "probe.json", tmp_path / "trace.json"
+    output = tmp_path / "report.json"
+    probe_path.write_text(json.dumps(probe))
+    trace_path.write_text(json.dumps(dict(traceEvents=events)))
+    script = (
+        Path(__file__).resolve().parents[3] / "python/sglang/benchmark/hisparse_h2d.py"
+    )
+    args = [
+        sys.executable,
+        str(script),
+        "--probe",
+        str(probe_path),
+        "--output-file",
+        str(output),
+    ]
+    args += ["--probe-only"] if probe_only else ["--trace", str(trace_path)]
+    run = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    assert run.returncode == 0, run.stderr
+    result = json.loads(output.read_text())
+    assert result["summary"]["h2d_bytes"] == 58400
+    assert ("copy_GBps" in result["summary"]) is (not probe_only)

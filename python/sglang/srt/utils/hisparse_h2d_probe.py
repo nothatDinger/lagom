@@ -104,22 +104,40 @@ class HiSparseH2DProbe:
             torch=torch.__version__,
             cuda=torch.version.cuda,
             capacity=self.capacity,
+            max_batch=self.max_batch,
             total_records=total,
             overflow=total > self.capacity,
             samples=samples,
         )
 
 
-def create_h2d_probe(device):
+def resolve_probe_max_batch(required, configured=None):
+    required = int(required)
+    reserve = int(configured) if configured is not None else required
+    if required <= 0 or reserve <= 0:
+        raise ValueError("H2D probe request-slot count and reserve must be positive")
+    return max(required, reserve)
+
+
+def create_h2d_probe(device, *, max_batch):
     capacity = int(os.environ.get("SGLANG_HISPARSE_H2D_PROBE_CAPACITY", "0"))
     if capacity == 0:
         return None
+    max_batch = resolve_probe_max_batch(
+        max_batch, os.environ.get("SGLANG_HISPARSE_H2D_PROBE_MAX_BATCH")
+    )
     key = str(torch.device(device))
     if key not in _probes:
         _probes[key] = HiSparseH2DProbe(
             device,
             capacity,
-            int(os.environ.get("SGLANG_HISPARSE_H2D_PROBE_MAX_BATCH", "64")),
+            max_batch,
+        )
+    elif _probes[key].max_batch < max_batch:
+        raise ValueError(
+            f"Shared H2D probe was reserved for {_probes[key].max_batch} requests; "
+            f"this coordinator needs {max_batch}. Set the reserve for the largest "
+            "coordinator before startup; captured probe buffers cannot be resized."
         )
     return _probes[key]
 

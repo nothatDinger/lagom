@@ -272,7 +272,6 @@ class HiSparseCoordinator:
         # Timing probe: skip the host->device KV bytes to measure the "IO is
         # free" floor. Produces garbage output; benchmarking only.
         self.skip_io = envs.SGLANG_DEBUG_HISPARSE_SKIP_IO.get()
-        self._h2d_probe = create_h2d_probe(device)
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
         self.is_dsv4_hisparse = isinstance(
@@ -317,6 +316,9 @@ class HiSparseCoordinator:
         self.page_size = self.mem_pool_device.page_size
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
+        # Startup/warmup can exercise all request slots, independently of the
+        # maximum decode CUDA-graph batch. Reserve before any graph capture.
+        self._h2d_probe = create_h2d_probe(device, max_batch=max_num_req_slots)
         max_context_len = req_to_token_pool.max_context_len
         max_compressed_context_len = (
             max_context_len + self.compress_ratio - 1

@@ -5,6 +5,11 @@
 本轮建立测量事实，暂不改生产 copy 并行度、缓存算法或调度。
 历史 23/55 GB/s 不作为定量依据。
 
+首轮实机修复：probe 现在按 request pool 的完整 slot 数预分配，覆盖启动/warmup 的 batch=256，
+不再按 `cuda-graph-max-bs-decode=64` 推断上限。`PROBE_MAX_BATCH` 是额外预留的下限，较小的旧值会自动提升。
+collector 兼容 `/start_profile` 的纯文本 `Start profiling.`，并保存 HTTP 响应。
+多 stream 的旧 trace 现在可以离线分析，不因 stream ID 数量直接拒绝；已有 C/D 文件无需重新采集。
+
 ## 1. 本轮回答的问题
 
 1. 真正的每层、每个 verify window、每 rank H2D 有多少有效字节？
@@ -26,6 +31,8 @@ DSv4 C4 的有效载荷是 **576 value + 8 scale = 584 bytes/entry**，不含 pa
 - 实际字节：只读 `num_real_reqs` 范围内的真实 `miss_count`，每次 copy 的 `bytes=sum(misses)*584`。
 - copy 带宽：`sum(bytes)/sum(copy_gpu_us)/1000`，单位十进制 GB/s；不会平均逐次 GB/s。
 - copy 时间：从每个真实 GPU copy kernel 的 trace 时长得到，不包含 planner、主机提交间隙或 recorder。
+- 多 stream 时另报 `copy_gpu_union_us` 和 `copy_active_wall_GBps`：重叠 copy 的时间区间取并集。
+  `copy_GBps` 仍使用 kernel 时长之和，两个口径不能混用；出现多个 stream ID 本身并不证明发生并发。
 - 整个 decode 窗口的有效带宽：只有选定**完整稳态 decode 迭代边界**后才用相同窗口的 bytes/wall time 算。
 - TP rank 分别报告。总线物理流量、CE 带宽、有效 KV 载荷带宽分别解释。
   KV 载荷计数不能替代 PCIe wire counter，也不能排除 GPU cache 的影响。
@@ -34,8 +41,10 @@ DSv4 C4 的有效载荷是 **576 value + 8 scale = 584 bytes/entry**，不含 pa
   只在 profile 开始/结束同步并导出；这些边界不用于性能基准。
 - recorder 是额外 kernel，可能改变时间线。报告单独给出其耗时，并要求下面的无 profile A/B 对照。
   profiler 对主机提交的影响也必须考虑，不能把 profile run 的 TPOT 当作性能结果。
-- 严格配对对应 rank 的 recorder 与紧邻它的 copy 节点。溢出、缺少 graph-node 时间、顺序错误、
-  多 recorder stream、skip-IO 或字节不一致均拒绝输出 GB/s，保留原始数据继续检查。
+- 严格按 stream 配对 recorder 与紧邻它的 copy 节点。recorder 区间不重叠时，其执行顺序保证全局计数顺序，
+  可得到逐次和逐层时间；区间重叠时只给整段载荷/时间总量，不猜测每条记录与哪次 copy 对应。
+  后者不支持切割时间窗口或只选部分 B/W 的带宽，也不输出逐层时间。
+  溢出、缺少 graph-node 时间、配对错误、skip-IO 或字节不一致仍拒绝输出 GB/s。
 
 当前覆盖 **DSv4 speculative 同步 verify** 路径，包括静态 graph 和 ragged eager window。
 其他模型/普通 decode 不自动套用此测量。
@@ -107,9 +116,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 SGLANG_HISPARSE_H2D_PROBE_CAPACITY=0 \
     --disaggregation-ib-device '{"0":"mlx5_0","1":"mlx5_3","2":"mlx5_4","3":"mlx5_5"}' \
     >"$H2D_OUT/prefill.log" 2>"$H2D_OUT/prefill.err" &
 
-# A: capacity=0. B/C: restart decode with capacity=8192. Keep everything else identical.
+# A: capacity=0. B/C: restart decode with capacity=16384. Keep everything else identical.
 CUDA_VISIBLE_DEVICES=4,5,6,7 SGLANG_HISPARSE_H2D_PROBE_CAPACITY=0 \
-  SGLANG_HISPARSE_H2D_PROBE_MAX_BATCH=64 \
+  SGLANG_HISPARSE_H2D_PROBE_MAX_BATCH=1024 \
   "$LAGOM_PY" -m sglang.launch_server "${COMMON[@]}" \
     --mem-fraction-static 0.85 --enable-hisparse --disable-radix-cache \
     --port 30000 --disaggregation-mode decode \
@@ -125,6 +134,8 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 SGLANG_HISPARSE_H2D_PROBE_CAPACITY=0 \
 
 等三个 `/health` 都正常。保存完整实际启动命令；如果安装的 router 参数名不同，使用你原来已经跑通的 router 命令。
 不要把旧日志覆盖掉：每次重启使用不同结果目录。
+新版也可 unset `SGLANG_HISPARSE_H2D_PROBE_MAX_BATCH`，自动使用实际 request pool slot 数。
+已有实验使用 1024/16384 的环境设置可以保留，避免改变观察者开销对照。
 
 负载使用附件同样的 ShareGPT 派生 random 数据、seed=0、64 请求、并发上限 32。
 脚本增加 `--tokenize-prompt`，直接传 input_ids，避免文本 decode/encode 改变 16384-token 输入长度；
@@ -142,7 +153,7 @@ bash scripts/pd_test/bench_h2d_round1.sh "$H2D_OUT" normal-A2
 bash scripts/pd_test/bench_h2d_round1.sh "$H2D_OUT" normal-A3
 ```
 
-**B：重启 decode，改为 probe=8192，其余相同，无 profile。** 同样重复三次，用 `normal-B1/B2/B3` 标签。
+**B：重启 decode，改为 probe=16384，其余相同，无 profile。** 同样重复三次，用 `normal-B1/B2/B3` 标签。
 不开 profile 时 recorder 仍是一个空 kernel，因此 B 衡量增加 graph 节点的成本；
 采集激活后的计数写入成本由 C 的 recorder 时长补充评估。
 若 A/B 的 TPOT 差异明显超过重复运行波动，先分析观察者开销，不据此宣称根因或收益。
@@ -166,7 +177,7 @@ bash scripts/pd_test/bench_h2d_round1.sh "$H2D_OUT" normal-profile
 若没有稳定 B=32，原样返回日志和实际 B 分布，不按客户端 max-concurrency 假定 GPU batch。
 等四个 decode TP rank 都显示 `Profiling done`。每 rank 会有 `.trace.json.gz` 和 `.h2d.json`。
 
-**D：强制 H2D 对照。** 单独结果目录；重启相关服务，将 COMMON 的 force 改为 `true`、decode probe=8192。
+**D：强制 H2D 对照。** 单独结果目录；重启相关服务，将 COMMON 的 force 改为 `true`、decode probe=16384。
 重复 C，使用 `forced-profile` 标签和 `forced-trace` 目录。保留其 benchmark JSONL 和日志，但不拿该 profile run 作吞吐基准。
 这组用于区分小负载启动成本与持续传输成本；以后有需要再做其完整无 profile 吞吐基准。
 
@@ -182,13 +193,23 @@ bash scripts/pd_test/bench_h2d_round1.sh "$H2D_OUT" normal-profile
 ```
 
 先不加 B/W 过滤，保留实际分布。需要时可加 `--batch-size 32 --verify-width 6`。
+多 stream 会在 `pairing` 中列出实际 stream ID 和 recorder 是否重叠；若重叠，
+`mode=capture_totals_only` 下仍可看整段带宽，但 layer/geometry 只有载荷统计。
+只看 probe 的载荷分布，不计算 GB/s：
+
+```bash
+"$LAGOM_PY" python/sglang/benchmark/hisparse_h2d.py \
+  --probe /path/to/D-TP0.h2d.json --probe-only \
+  --output-file "$H2D_OUT/D-TP0-payload.json"
+```
+
 不要把四个 rank 的时长累加计算单卡 GB/s。
 `--window-start-us/--window-end-us` 只接受自行确认的完整稳态迭代边界；无需第一轮手工选择，返回原始 trace 后再一起核对。
 torch trace 和 probe 内还带同一 capture ID/PID，解析器检查两者匹配，避免不同轮次恰好节点数相同被混用。
 解析器严格拒绝只有 `cudaGraphLaunch` 而没有内部 kernel 的 trace。
 
 如果 torch trace 缺少 graph nodes，保留错误信息，采用 Nsight 重采，不切换 eager 冒充同一个结果。
-用原 decode 命令前加（probe 仍为 8192）：
+用原 decode 命令前加（probe 仍为 16384）：
 
 ```bash
 nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
