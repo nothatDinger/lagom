@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import get_device_module, is_hip
+from sglang.srt.utils.hisparse_h2d_probe import create_h2d_probe
 
 device_module = get_device_module()
 
@@ -271,6 +272,7 @@ class HiSparseCoordinator:
         # Timing probe: skip the host->device KV bytes to measure the "IO is
         # free" floor. Produces garbage output; benchmarking only.
         self.skip_io = envs.SGLANG_DEBUG_HISPARSE_SKIP_IO.get()
+        self._h2d_probe = create_h2d_probe(device)
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
         self.is_dsv4_hisparse = isinstance(
@@ -435,6 +437,14 @@ class HiSparseCoordinator:
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
         self._speculative_verify_width = speculative_verify_width
+        if self._h2d_probe is not None and (
+            not self.is_dsv4_hisparse
+            or speculative_verify_width <= 0
+            or self.item_size_bytes != 584
+        ):
+            raise ValueError(
+                "H2D probe currently requires speculative DSv4 C4 (584 bytes per entry)"
+            )
         self._spec_miss_src = None
         self._spec_miss_dst = None
         self._spec_miss_count = None
@@ -2113,6 +2123,16 @@ class HiSparseCoordinator:
             is_dsv4_layout=True,
             skip_io=self.skip_io if skip_io is None else skip_io,
         )
+        if getattr(self, "_h2d_probe", None) is not None:
+            self._h2d_probe.record(
+                miss_count,
+                common["num_real_reqs"],
+                layer=layer_id,
+                width=verify_width,
+                item_bytes=self.item_size_bytes,
+                copy_blocks=self._prefetch_copy_blocks,
+                skip_io=self.skip_io if skip_io is None else skip_io,
+            )
         return output_buffer
 
     def swap_in_selected_pages_spec(

@@ -15,6 +15,12 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.hisparse_h2d_probe import (
+    annotate_h2d_trace,
+    export_h2d_probes,
+    start_h2d_probes,
+    stop_h2d_probes,
+)
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 _is_npu = is_npu()
@@ -134,6 +140,7 @@ class ProfileManager:
         raise NotImplementedError("manually stop is only supported yet")
 
     def _do_start(self, stage: Optional[str] = None):
+        start_h2d_probes()
         logger.info(
             f"Profiling starts{f' for {stage}' if stage else ''}. "
             f"Traces will be saved to: {self.profiler_kwargs['output_dir']} "
@@ -152,7 +159,14 @@ class ProfileManager:
 
     def _do_stop(self):
         logger.info("Stop profiling...")
+        h2d_reports = stop_h2d_probes()
         self.profiler.stop()
+        export_h2d_probes(
+            h2d_reports,
+            self.profiler_kwargs["output_dir"],
+            f"hisparse-{self.profiler_kwargs['profile_id']}-TP-{self.ps.tp_rank}-PID-{os.getpid()}",
+            capture_id=self.profiler_kwargs["profile_id"],
+        )
         logger.info(
             f"Profiling done. Traces are saved to: {self.profiler_kwargs['output_dir']}"
         )
@@ -336,6 +350,7 @@ class _ProfilerTorch(_ProfilerConcreteBase):
             ),
         )
         self.torch_profiler.start()
+        annotate_h2d_trace(self.torch_profiler, self.profile_id)
 
     def stop(self):
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)

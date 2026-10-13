@@ -22,6 +22,12 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import is_mps, is_npu
+from sglang.srt.utils.hisparse_h2d_probe import (
+    annotate_h2d_trace,
+    export_h2d_probes,
+    start_h2d_probes,
+    stop_h2d_probes,
+)
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.srt.utils.profile_utils import ProfileManager
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
@@ -159,6 +165,7 @@ class SchedulerProfilerManager:
         if envs.SGLANG_PROFILE_V2.get():
             return self._profile_manager.manual_start()
 
+        start_h2d_probes()
         stage_str = f" for {stage.name}" if stage else ""
         logger.info(
             f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir} (with profile id: {self.profile_id})",
@@ -248,7 +255,9 @@ class SchedulerProfilerManager:
                 self.torch_profiler.start()
             except RuntimeError as e:
                 self.torch_profiler = None
+                stop_h2d_probes()
                 return ProfileReqOutput(success=False, message=str(e))
+            annotate_h2d_trace(self.torch_profiler, self.profile_id)
             self.profile_in_progress = True
 
         if "MEM" in activities:
@@ -309,6 +318,7 @@ class SchedulerProfilerManager:
             )
 
         self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
+        h2d_reports = stop_h2d_probes()
 
         if self.profile_prefix:
             stage_prefix = self.profile_prefix + "-"
@@ -373,6 +383,12 @@ class SchedulerProfilerManager:
                 torch.cuda.cudart().cudaProfilerStop()
 
         merge_message = self._merge_profile_traces()
+        export_h2d_probes(
+            h2d_reports,
+            self.torch_profiler_output_dir,
+            f"{stage_prefix}{self.profile_id}-TP-{self.ps.tp_rank}-PID-{os.getpid()}{stage_suffix}",
+            capture_id=self.profile_id,
+        )
 
         logger.info(
             "Profiling done. Traces are saved to: %s%s",
