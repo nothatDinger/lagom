@@ -5,7 +5,7 @@
 
 ## 1. 首轮已经支持的判断
 
-以下数值来自用户 2026-10-13 上传的报告；尚未拿到原始 trace/probe/JSONL，属于汇总核对。
+以下数值来自用户 2026-10-13 的报告。后续用本机分析器校验和紧凑摘要反馈，原始文件保留在实机，无需上传。
 
 | 模式 | TP0 有效载荷 GB/s | TP1–3 有效载荷 GB/s | 四 rank 每卡累计载荷 |
 |---|---:|---:|---:|
@@ -36,8 +36,15 @@
   `python/sglang/srt/utils/numa_utils.py` 的自动 NUMA 配置可以从硬绑定退回 preferred、CPU-only 或跳过。
   GPU 的 NUMA 归属、允许使用的内存节点，都不能替代实际 host 页归属。
 
-原始文件还需要核对 layer/verify 边界、rank 身份和 acceptance。
+layer/verify 边界、rank 身份和 acceptance 在本机核对并回传关键特征。
 W=6 是候选验证宽度，不等于每次实际提交 6 个 token。不能用 copy 时间直接预测 TPOT 的优化比例。
+
+已确认每 rank 是 21 层 × 64 次迭代。C 的平均每次 verify 的 copy 时长之和为 TP0 1.285 ms、
+TP1–3 1.721–1.727 ms；D 为 14.368 ms 和 20.397–20.458 ms。这些是 per-rank kernel 时长之和，
+不包含其他计算，不代表整个 decode 墙钟时间，不累加 TP rank。
+已确认 device 0–3 是逻辑编号，实际 decode GPU 仍为物理 4–7，NUMA1。
+TP0 layer 17 的 6.2 MB @ 7.7 GB/s 对应累计约 0.805 ms，仅占该 rank 总 copy 时间约 1%；
+这是按四舍五入报告计算的近似值。低带宽层是否值得优化，需要一起看时间占比。
 
 ## 2. 先保存现有进程的 NUMA 证据
 
@@ -84,7 +91,7 @@ CUDA_VISIBLE_DEVICES=4 "$LAGOM_PY" scripts/pd_test/bench_h2d_copy.py \
 ```
 
 必须退出成功，`smoke/rank0.json` 中 `success=true`，全部 correctness 通过、copy 时长为正。
-smoke 的工作集很小，其带宽不用于性能判断。失败时先返回日志与部分 JSON，不继续矩阵。
+smoke 的工作集很小，其带宽不用于性能判断。失败时先反馈报错末尾约 30 行及 JSON 的 `success`/`error`，不继续矩阵。
 CPU 开发环境已验证解析、几何计数和独立 CPU 字节校验；GPU event/capture 仍需这个实机检查。
 
 确认 `numactl --hardware` 的 node 1 对应 decode GPU；本机报告为 node 1。使用**硬内存绑定**，
@@ -149,11 +156,40 @@ barrier 本身不保证跨 GPU 同时开始，不能凭 rank 数量虚构精确�
 
 ## 5. 请返回的数据
 
-先返回 `live-numa.json`，以及首轮 `analysis-C/`、`analysis-D/`、六个 A/B JSONL、
-environment JSON、对应 decode 日志的 `accept len`/`avg_spec_accept_length` 数据。
-分析 JSON 保留 sample/interval 明细；另保留原始 `.h2d.json` + `.trace.json.gz`，可打包上传以便核查配对与时间线。
-仅有汇总 Markdown 不能完成原始数据审计。
+**只需短报告。** 所有 JSON、trace、日志留在实机；使用新的标准库脚本提取特征，无需上传完整文件。
+不用重新采集 C/D。先提取 C 的主耗时层和载荷分桶：
 
-独立实验返回整个 `work/h2d-round2/`：smoke/单卡/四卡的 rank JSON 与日志。
-JSON 已包含逐次 GPU copy 时间、每波区间、NUMA 分配证据、配置和 GPU 身份。
-正常服务的新 C 采集、远端对照和生产 CTA 修改都由这些结果决定，本轮先不要求重跑整套 ShareGPT。
+```bash
+python3 scripts/pd_test/summarize_h2d_report.py \
+  --analysis-dir work/h2d-round1/analysis-C \
+  --output-file work/h2d-round2/compact-C.txt
+```
+
+输入必须是原分析器 `--output-file` 保存的完整分析 JSON，包含 `samples`，不能用其 stdout 的缩减 JSON。
+脚本核对计数、有效字节和 GPU 时长之和；只有连续且重复的完整层序列才计算每 cycle 的 copy 成本。
+默认最多列 8 个层：主耗时层以及小载荷层。需要某个层的细节时再定向提取，或用 `--max-layers 21` 列全。
+层表的 `time%` 是该 rank 总 copy 时间占比；分桶包括零字节 kernel，避免忽略固定成本。
+跨 rank 的 `normalized_us/byte` 只比较相同 B/captured/W 分布、平均载荷相差不超过 5% 的层，
+仍是分组描述，不假设不同 rank 的第 n 条记录必然对应同一次迭代。
+
+可按需要追加 `--analysis-dir work/h2d-round1/analysis-D`。D 的全 rank 总量已反馈，暂时只需额外提供
+B/captured/W 几何分布和各组 GB/s，完整层表可以留在实机。
+给同一个命令追加 `--decode-log /实际路径/normal-decode.log`，脚本只输出最后 5 条 B=32 日志里的
+时间、`accept len`、`accept rate` 和 cap/block 特征，不复制其他日志文本。
+这些行用于粗略判断提交 token 数；如果不在 C 的采集时段，不能宣称是同窗精确的 decode 占比。
+
+NUMA 取证与独立实验完成后，生成另一份紧凑报告：
+
+```bash
+python3 scripts/pd_test/summarize_h2d_report.py \
+  --numa-file work/h2d-round2/live-numa.json \
+  --copy-dir work/h2d-round2 \
+  --output-file work/h2d-round2/compact-round2.txt
+```
+
+`--numa-file`、`--copy-dir` 都可单独使用，尚未完成的项先省略。
+独立实验只输出 GPU 身份、配置、CTA/CE 带宽和 host buffer 对应 VMA 的 node page counts；
+correctness 或 timing 检查失败会明确报错，`success=false` 不生成带宽。
+VMA 的 True/False 表示 buffer 是否覆盖整段映射，False 时不能将整段统计归给该 buffer。
+若需要某次 wave 的并发细节，我会再给定向提取方式。
+正常服务的新 C 采集、远端对照和生产 CTA 修改由这些结果决定，先不要求重跑整套 ShareGPT。
