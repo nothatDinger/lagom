@@ -5,6 +5,9 @@
 本轮建立测量事实，暂不改生产 copy 并行度、缓存算法或调度。
 历史 23/55 GB/s 不作为定量依据。
 
+完成首轮后，参见 [第二轮说明](README_h2d_round2.md)：核查实际 host 页位置，
+用生产 copy kernel 区分 CTA 并行度、单卡/四卡共享资源，并测连续 H2D 对照。
+
 首轮实机修复：probe 现在按 request pool 的完整 slot 数预分配，覆盖启动/warmup 的 batch=256，
 不再按 `cuda-graph-max-bs-decode=64` 推断上限。`PROBE_MAX_BATCH` 是额外预留的下限，较小的旧值会自动提升。
 collector 兼容 `/start_profile` 的纯文本 `Start profiling.`，并保存 HTTP 响应。

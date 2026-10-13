@@ -25,10 +25,20 @@ class HiSparseH2DProbe:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.capacity = capacity
         self.max_batch = max_batch
+        self.host_buffers = {}
         self.control = torch.zeros(2, dtype=torch.int64, device=self.device)
         self.records = torch.empty(
             (capacity, 10 + max_batch), dtype=torch.int64, device=self.device
         )
+
+    def register_host_buffers(self, named_buffers):
+        # CPU metadata only, once at coordinator creation; no reads of KV data.
+        for name, buffer in named_buffers:
+            self.host_buffers[buffer.data_ptr()] = dict(
+                name=name,
+                address=buffer.data_ptr(),
+                nbytes=buffer.numel() * buffer.element_size(),
+            )
 
     def record(
         self, counts, num_real_reqs, *, layer, width, item_bytes, copy_blocks, skip_io
@@ -69,6 +79,8 @@ class HiSparseH2DProbe:
         torch.cuda.current_stream(self.device).synchronize()
 
     def stop(self):
+        from sglang.benchmark.hisparse_h2d_diagnostics import process_snapshot
+
         torch.cuda.synchronize(self.device)
         self.control[0].zero_()
         torch.cuda.current_stream(self.device).synchronize()
@@ -101,6 +113,15 @@ class HiSparseH2DProbe:
             pid=os.getpid(),
             device=self.device.index,
             gpu=torch.cuda.get_device_name(self.device),
+            gpu_uuid=str(
+                getattr(
+                    torch.cuda.get_device_properties(self.device), "uuid", "unavailable"
+                )
+            ),
+            cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
+            host_numa_snapshot=process_snapshot(
+                buffers=list(self.host_buffers.values())
+            ),
             torch=torch.__version__,
             cuda=torch.version.cuda,
             capacity=self.capacity,

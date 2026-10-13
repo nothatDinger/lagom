@@ -447,6 +447,13 @@ class HiSparseCoordinator:
             raise ValueError(
                 "H2D probe currently requires speculative DSv4 C4 (584 bytes per entry)"
             )
+        if self._h2d_probe is not None:
+            self._h2d_probe.register_host_buffers(
+                [
+                    (f"dsv4_c4_layer_{i}", buffer)
+                    for i, buffer in enumerate(self.mem_pool_host.kv_buffer)
+                ]
+            )
         self._spec_miss_src = None
         self._spec_miss_dst = None
         self._spec_miss_count = None
