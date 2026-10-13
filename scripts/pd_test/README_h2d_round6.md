@@ -49,8 +49,22 @@ paired 基准显式指定每种策略，忽略该生产环境变量，以免误�
 
 ## 3. 先过新 CUDA 代码的正确性检查
 
-当前开发环境没有 GPU/nvcc，31 项 CPU 测试已通过，3 项 CUDA 测试跳过；
-没有声称完成实机编译或正确性验证。本项使用一张空闲的物理 GPU4，不启动模型。
+实机首次执行在三种策略的 eager 校验上均失败，已定位为新增测试的布局错误：
+测试把每页字节数写成 `38016`，生产 `kvcacheio.cuh` 实际是
+`ceil(64 * 584 / 576) * 576 = 37440`（36864 value + 512 scale + 64 padding）。
+kernel 按 37440 步进，测试分配和 oracle 按 38016 步进，第 p 页基址相差 `p * 576`。
+`divmod(destination, 64)` 是正确的；这次失败不能作为第 65 个 miss 或 plan stride-96 有 bug 的证据。
+测试输出的 tensor 行是缓存页，不是 request 行，跨页源和目的地址都受错误页宽影响。
+
+CPU 按 kernel 的平坦地址公式模拟旧 fixture，复现第 1 行前三字节
+`actual=[251,35,250]`、`expected=[181,223,108]`；改正页宽后完整字节一致。
+修复复用了 paired 基准已有的正确布局常量，保留所有原始覆盖；没有修改生产 kernel/策略。
+此前 paired/solo 基准和首轮 probe 的布局计算均正确，不需要因此重跑旧轮次。
+
+当前开发环境没有 GPU/nvcc；本次相关测试为 **36 passed / 3 skipped**，
+3 项跳过均为 CUDA 用例，修正后的 CUDA 执行仍需实机验证。
+新增 CPU 回归直接构造同一测试 fixture：核对平坦物理地址与按页 oracle，
+覆盖有效/空/padded request，并要求旧错误布局被拒绝。本项使用一张空闲的物理 GPU4，不启动模型。
 Python 静态检查通过；全仓 CI 登记检查仍报 7 个既有文件缺少登记，已核实这些文件
 与修改前 HEAD 完全相同，本次新增/修改测试的登记均已单独验证。
 
@@ -68,13 +82,16 @@ mkdir -p "$H2D_R6"
 CUDA_VISIBLE_DEVICES=4 numactl --cpunodebind=1 --membind=1 \
   "$LAGOM_PY" -m pytest -q \
   test/registered/kernels/ops/kvcache/test_hisparse_copy_load_policy.py \
-  >"$H2D_R6/correctness.txt" 2>&1
-cat "$H2D_R6/correctness.txt"
+  >"$H2D_R6/correctness-v2.txt" 2>&1
+cat "$H2D_R6/correctness-v2.txt"
 ```
 
 必须 **3 passed**，跳过不算通过。验证所有 value/scale 字节、未写区域及 page padding，
 包含跨 page、非连续 plan 行、空 miss、padded request，以及 graph replay 之间改变 host 数据和计数。
-若编译或断言失败，在此停下，反馈错误的最后约 30 行；无需继续性能实验。
+若断言失败，新增 `Copy mismatch ...` 行会给出策略、eager/graph 阶段、counts、真实请求数、
+页宽、plan stride、每 tensor 行错误字节数，以及前 8 个错误字节的实际/预期值。
+反馈这一行即可；若编译或其他异常则给末尾约 30 行。在此停下，不继续性能实验。
+无需清理 JIT 缓存；通过后直接继续 §4，不另跑前几轮对照。
 
 ## 4. 两次正式对照：先正序，再反序
 
@@ -179,6 +196,6 @@ bash scripts/pd_test/bench_h2d_round1.sh "$H2D_R6/service" "$RUN_BLOCK-3"
 ## 6. 本次只需反馈
 
 先完成 §3–4 即可；§5 已列出后续验收方法，不需要为此等待 8 卡资源再反馈。
-只给 `correctness.txt` 的结果和两份 `policy-*/pair-compact.txt`，不上传 trace/大日志。
+只给 `correctness-v2.txt` 的结果和两份 `policy-*/pair-compact.txt`，不上传 trace/大日志。
 若只能文字，给两次的 correctness/coverage，以及两档 payload、两张卡各自
 `legacy/ca/cg` 的无 profile event 均值、profile activity 均值和 CE 是否稳定。
