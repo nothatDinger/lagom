@@ -72,7 +72,7 @@ def validate_sm(torch, host, device, source, destination=None):
             raise RuntimeError(f"DSv4 scale mismatch at chunk {begin}")
 
 
-def capture_wave(torch, functions):
+def capture_wave(torch, functions, *, stream=None):
     # Default (external=False) event handling is only a graph dependency.
     # external=True emits real event-record nodes, allowing elapsed_time().
     events = [
@@ -83,7 +83,7 @@ def capture_wave(torch, functions):
         for _ in functions
     ]
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, stream=stream):
         for fn, (start, end) in zip(functions, events):
             start.record()
             fn()

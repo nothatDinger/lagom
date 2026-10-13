@@ -3,6 +3,10 @@
 分支仍是 `perf/hisparse-h2d-diagnosis`，以 `hash_verify@0fef460d` 为基础。
 原有工作区和生产 copy 参数保持原样。本轮使用原生 Python/venv，不需要 Docker。
 
+第二轮单卡反馈后，下一步参见 [第三轮对照](README_h2d_round3.md)：
+同一 pinned host 分配、双卡顺序 ABBA、NVML 状态和 event/activity 计时校验。
+已有 solo 结果无需重跑；当前服务已经退出时，live NUMA 留待下一次服务存活再取证。
+
 ## 1. 首轮已经支持的判断
 
 以下数值来自用户 2026-10-13 的报告。后续用本机分析器校验和紧凑摘要反馈，原始文件保留在实机，无需上传。
