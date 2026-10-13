@@ -141,35 +141,68 @@ class CopyCase:
         args,
         plan=None,
         misses=None,
+        device_source=None,
+        shared_sm=None,
     ):
         self.device, self.label, self.method = device, label, method
         self.nbytes, self.banks = nbytes, banks
         self.host = host
+        self.source_kind = "device" if method == "sm_hbm" else "host"
         self.functions = []
         with torch.cuda.device(device):
-            if method == "sm":
+            if method in ("sm", "sm_hbm"):
                 from sglang.kernels.ops.kvcache.hisparse import copy_cache_planned_mla
 
-                src = plan["src"].to(device="cuda")
-                kwargs = dict(
-                    miss_dst=plan["dst"].to(device="cuda"),
-                    miss_count=torch.full(
-                        (args.batch,), misses, dtype=torch.int32, device="cuda"
-                    ),
-                    num_real_reqs=torch.tensor(
-                        [args.batch], dtype=torch.int32, device="cuda"
-                    ),
-                    host_cache=host,
-                    device_buffer=torch.zeros(
-                        (plan["destination_pages"], PAGE_BYTES),
-                        dtype=torch.uint8,
-                        device="cuda",
-                    ),
-                    item_size_bytes=ITEM_BYTES,
-                    num_blocks=4,
-                    block_size=1024,
-                    is_dsv4_layout=True,
+                source = host
+                if method == "sm_hbm":
+                    if (
+                        device_source is None
+                        or device_source.device != torch.device("cuda", device)
+                        or device_source.shape != host.shape
+                        or device_source.dtype != host.dtype
+                        or not device_source.is_contiguous()
+                    ):
+                        raise ValueError(
+                            "SM-HBM requires an equal-shaped source on the measured GPU"
+                        )
+                    source = device_source
+                self.source = (
+                    source  # Keep the source alive through every graph replay.
                 )
+                if method == "sm_hbm":
+                    if shared_sm is None or (
+                        shared_sm.device,
+                        shared_sm.label,
+                        shared_sm.banks,
+                        shared_sm.nbytes,
+                    ) != (device, label, banks, nbytes):
+                        raise ValueError("SM-HBM requires the matching host-SM case")
+                    # Reuse exact GPU plan, counts and destination allocations.
+                    # Only the source argument differs; graphs run sequentially.
+                    src = shared_sm.plan_src
+                    kwargs = dict(shared_sm.sm_kwargs, host_cache=source)
+                else:
+                    src = plan["src"].to(device="cuda")
+                    kwargs = dict(
+                        miss_dst=plan["dst"].to(device="cuda"),
+                        miss_count=torch.full(
+                            (args.batch,), misses, dtype=torch.int32, device="cuda"
+                        ),
+                        num_real_reqs=torch.tensor(
+                            [args.batch], dtype=torch.int32, device="cuda"
+                        ),
+                        host_cache=source,
+                        device_buffer=torch.zeros(
+                            (plan["destination_pages"], PAGE_BYTES),
+                            dtype=torch.uint8,
+                            device="cuda",
+                        ),
+                        item_size_bytes=ITEM_BYTES,
+                        num_blocks=4,
+                        block_size=1024,
+                        is_dsv4_layout=True,
+                    )
+                self.plan_src, self.sm_kwargs = src, kwargs
                 output = kwargs["device_buffer"]
                 self.functions = [
                     lambda bank=bank: copy_cache_planned_mla(
@@ -187,7 +220,7 @@ class CopyCase:
                         plan["dst"][:, :misses],
                     )
 
-            else:
+            elif method == "ce":
                 output = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
                 inputs = [
                     host.view(-1).narrow(0, bank * nbytes, nbytes)
@@ -201,6 +234,9 @@ class CopyCase:
                 def validate(bank):
                     if not torch.equal(output.cpu(), inputs[bank]):
                         raise RuntimeError("CE copy correctness failed")
+
+            else:
+                raise ValueError(f"Unknown copy method: {method}")
 
             self.verified_banks = sorted({0, banks - 1})
             for bank in self.verified_banks:
@@ -239,6 +275,8 @@ class CopyCase:
         return dict(
             case=self.label,
             method=self.method,
+            source_kind=self.source_kind,
+            h2d_bytes_per_copy=0 if self.source_kind == "device" else self.nbytes,
             device=self.device,
             phase=phase,
             trial=trial,
@@ -311,6 +349,11 @@ def main():
         "--phases", nargs="+", choices=["copy", "compute"], default=["copy", "compute"]
     )
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--device-source-control",
+        action="store_true",
+        help="Also run the same SM kernel from local GPU memory; its payload rate is NOT H2D bandwidth",
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     if args.register_device not in args.devices:
@@ -397,11 +440,24 @@ def main():
             ]
         )
         report["hugepage_setting"] = os.environ.get("SGLANG_HUGEPAGE_SIZE", "")
+        device_sources = {}
+        if args.device_source_control:
+            # One identical full source per GPU, shared across miss shapes.
+            # Setup H2D copies and synchronization are outside every timed wave.
+            for device in args.devices:
+                with torch.cuda.device(device):
+                    device_sources[device] = host.to(device="cuda")
+                    torch.cuda.synchronize()
+            report["device_sources"] = [
+                dict(device=device, address=source.data_ptr(), nbytes=source.numel())
+                for device, source in device_sources.items()
+            ]
+        methods = ("sm", "sm_hbm", "ce") if args.device_source_control else ("sm", "ce")
         cases = {}
         for case_index, (misses, geometry) in enumerate(zip(args.misses, geometries)):
             plan = make_plan(torch, args, geometry, case_index, misses)
             label = f"B{args.batch}-miss{misses}"
-            for method in ("sm", "ce"):
+            for method in methods:
                 cases[(label, method)] = {
                     device: CopyCase(
                         torch,
@@ -414,6 +470,8 @@ def main():
                         args,
                         plan,
                         misses,
+                        device_sources.get(device),
+                        cases.get((label, "sm"), {}).get(device),
                     )
                     for device in args.devices
                 }
@@ -431,6 +489,7 @@ def main():
                         case=label,
                         method=method,
                         device=device,
+                        source_kind=case.source_kind,
                         verified_banks=case.verified_banks,
                         all_payload_bytes_checked=True,
                         graph_replay_checked=case.graph_verified,

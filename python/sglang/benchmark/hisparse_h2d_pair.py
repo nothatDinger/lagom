@@ -97,19 +97,21 @@ def activity_check(events, wave):
         and e["ts"] >= lo
         and e["ts"] + e.get("dur", 0) <= hi
     ]
-    if wave["method"] == "sm":
+    if wave["method"] in ("sm", "sm_hbm"):
         copies = [
             e
             for e in candidates
             if "kernel" in e.get("cat", "").lower()
             and "copy_cache_planned_kernel" in e["name"]
         ]
-    else:
+    elif wave["method"] == "ce":
         copies = [
             e
             for e in candidates
             if "gpu_memcpy" in e.get("cat", "").lower() and "htod" in e["name"].lower()
         ]
+    else:
+        return invalid(f'Unknown copy method: {wave["method"]}')
     if len(copies) != wave["banks"]:
         return invalid(
             f'Expected {wave["banks"]} copy nodes, found {len(copies)}',
@@ -167,10 +169,15 @@ def activity_check(events, wave):
 def expected_case_keys(report):
     """The acquisition captures each device/case/method exactly once."""
     config = report["config"]
+    methods = (
+        ("sm", "sm_hbm", "ce")
+        if config.get("device_source_control", False)
+        else ("sm", "ce")
+    )
     cases = {
         (f'B{config["batch"]}-miss{misses}', method, device)
         for misses in config["misses"]
-        for method in ("sm", "ce")
+        for method in methods
         for device in config["devices"]
     }
     cases.update(
@@ -285,6 +292,12 @@ def compact_report(report):
     lines.append(
         "Rates use total payload / total time, decimal GB/s. SM uses CTA4/1024 threads."
     )
+    if report["config"].get("device_source_control", False):
+        lines.append(
+            "sm_hbm: SAME kernel from local GPU memory; reported GB/s is logical payload throughput, NOT H2D. "
+            "Its timed copies have h2d_bytes_per_copy=0; setup copies are outside timing."
+        )
+        lines.append(f'DEVICE_SOURCES {report.get("device_sources", [])}')
     groups = defaultdict(lambda: defaultdict(list))
     for wave in report.get("waves", []):
         groups[(wave["phase"], wave["case"], wave["method"])][wave["device"]].append(
@@ -328,6 +341,8 @@ def compact_report(report):
             lines.append(
                 f'PROFILE {wave["case"]} {wave["method"]} d{wave["device"]} n={check["activities"]} '
                 f'phase={wave.get("phase", "unknown")} '
+                f'source={"device" if wave["method"] == "sm_hbm" else "host"} '
+                f'h2d_bytes_per_copy={0 if wave["method"] == "sm_hbm" else wave["payload_bytes"]} '
                 f'event/activity_GBps={check["event_GBps"]:.2f}/{check["activity_GBps"]:.2f} '
                 f'event_time/activity_time={check["event_over_activity"]:.3f} '
                 f"mean_event/activity_us={event_mean:.2f}/{activity_mean:.2f} "

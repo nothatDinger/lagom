@@ -255,12 +255,18 @@ def test_nvml_matches_uuid_rather_than_assuming_cuda_is_physical_index(
     assert not sample["errors"]
 
 
-def captured_pair_fixture():
+def captured_pair_fixture(device_source_control=False):
     report = dict(
         success=True,
         profile_success=False,
         host_register_flags=1,
-        config=dict(batch=2, misses=[2, 70], devices=[0, 1], bulk_ce_mib=1),
+        config=dict(
+            batch=2,
+            misses=[2, 70],
+            devices=[0, 1],
+            bulk_ce_mib=1,
+            device_source_control=device_source_control,
+        ),
         devices={},
         waves=[],
         profile_waves=[],
@@ -311,6 +317,24 @@ def captured_pair_fixture():
     return report, trace
 
 
+def test_local_gpu_source_keeps_sm_activity_and_is_not_reported_as_h2d():
+    report, events = captured_pair_fixture(device_source_control=True)
+    assert len(expected_case_keys(report)) == 14
+    assert validate_profile(report, events)
+    assert correctness_summary(report)["complete"]
+    hbm = [w for w in report["profile_waves"] if w["method"] == "sm_hbm"]
+    assert len(hbm) == 4
+    assert all(w["activity_check"]["activities"] == 2 for w in hbm)
+    text = compact_report(report)
+    assert "NOT H2D" in text
+    assert "CORRECTNESS records=14/14" in text
+    assert text.count("source=device h2d_bytes_per_copy=0") == 4
+    report["profile_waves"] = [
+        w for w in report["profile_waves"] if w["method"] != "sm_hbm"
+    ]
+    assert not validate_profile(report, events)
+
+
 def test_correctness_and_profile_coverage_are_independent():
     report, events = captured_pair_fixture()
     assert correctness_summary(report)["complete"]
@@ -326,15 +350,31 @@ def test_correctness_and_profile_coverage_are_independent():
     assert not correctness_summary(report)["complete"]
 
 
-@pytest.mark.parametrize("failure", [None, "cpu_duplicate", "graph_check", "capture"])
-def test_offline_cli_needs_no_site_packages_and_preserves_originals(tmp_path, failure):
-    report, events = captured_pair_fixture()
+@pytest.mark.parametrize(
+    "failure,device_source_control",
+    [
+        (None, False),
+        ("cpu_duplicate", False),
+        ("graph_check", False),
+        ("capture", False),
+        (None, True),
+        ("missing_hbm", True),
+    ],
+)
+def test_offline_cli_needs_no_site_packages_and_preserves_originals(
+    tmp_path, failure, device_source_control
+):
+    report, events = captured_pair_fixture(device_source_control)
     if failure == "cpu_duplicate":
         events.append(copy.deepcopy(events[0]))
     elif failure == "graph_check":
         report["correctness"][0]["graph_replay_checked"] = False
     elif failure == "capture":
         report["success"] = False
+    elif failure == "missing_hbm":
+        report["profile_waves"] = [
+            w for w in report["profile_waves"] if w["method"] != "sm_hbm"
+        ]
     source = tmp_path / "pair.json"
     trace = tmp_path / "pair.trace.json"
     source.write_text(json.dumps(report))
@@ -362,7 +402,8 @@ def test_offline_cli_needs_no_site_packages_and_preserves_originals(tmp_path, fa
     updated = json.loads((output / "pair-reanalyzed.json").read_text())
     assert updated["success"] == report["success"]
     assert updated["reanalysis"]["ready_for_main"] == (failure is None)
-    assert "CORRECTNESS records=10/10" in run.stdout
+    expected = 14 if device_source_control else 10
+    assert f"CORRECTNESS records={expected}/{expected}" in run.stdout
     assert "gpu_user_annotation" in run.stdout
     saved = (output / "pair-reanalyzed.json").read_bytes()
     rerun = subprocess.run(command, capture_output=True, text=True)

@@ -1,5 +1,7 @@
 # 第四轮：确认大载荷的时间差是否位于 copy kernel 内
 
+第四轮 activity 已确认主要差距位于 kernel 内；后续见 [第五轮：注册 context 与源存储对照](README_h2d_round5.md)。
+
 分支：`perf/hisparse-h2d-diagnosis`。本轮复用已有 GPU 采集代码，只补充紧凑报告中的时间分解和状态。
 不需要新 smoke，不修改生产 copy 参数。本轮只安排一次短 profile。
 
