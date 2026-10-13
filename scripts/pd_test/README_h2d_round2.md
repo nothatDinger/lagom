@@ -46,6 +46,21 @@ TP1–3 1.721–1.727 ms；D 为 14.368 ms 和 20.397–20.458 ms。这些是 pe
 TP0 layer 17 的 6.2 MB @ 7.7 GB/s 对应累计约 0.805 ms，仅占该 rank 总 copy 时间约 1%；
 这是按四舍五入报告计算的近似值。低带宽层是否值得优化，需要一起看时间占比。
 
+紧凑 C/D 反馈进一步收敛了现象：C 的主要 [1,4) MB copy 占 TP0 时间 89.2%、TP1–3 时间约 91%，
+大层的归一化成本差约 1.35–1.39；小层 2/17 却只有约 1.01/1.00，并非所有层都存在常数乘法 penalty。
+D 的大载荷则跨层约 1.42，在 B=30/31/32 三组也基本持平。
+`t_copy ≈ a + payload / B_effective` 是与这些现象相容的待验证模型；a 是 GPU copy 的固定成本，
+不是本计时口径之外的 CPU 提交间隙。还没有据此证明 NUMA、PCIe 或 CTA 是根因。
+下一步应使用固定内存位置和固定生产 copy 的 CTA/CE 对照，而非继续扩展同一 C/D 的统计摘要。
+
+5 条正常 B=32 acceptance 日志的均值 α=5.63。将慢 rank 的 1.727 ms/verify 摊到单请求 token 间隔，
+得到约 0.307 ms/token；按整个 batch 产出的 32×α tokens 摊销 GPU 工作，得到约 9.59 µs/输出 token/rank。
+21/α 是单请求的层数摊销，实际 batch copy-kernel 数/全局输出 token 为 21/(32×α)，两种口径须分开。
+以先前无 profile TPOT=7.514 ms 估算，copy 成本量级约 4.1%；这些数据来自不同时间窗，不能称为同窗实测占比。
+若其他时间不变且减少的 copy 时间全部位于关键路径，慢 rank 降到 TP0 的成本对应约 1.0% TPOT 改善，
+所有有效载荷达到 55 GB/s 对应约 2.4%，完全消除 copy 对应约 4.1%。
+这是条件情景，尚未重新校准 CE 上限，不能当作承诺、一般上界或已测得的吞吐收益。
+
 ## 2. 先保存现有进程的 NUMA 证据
 
 在现有实验 worktree 更新分支；先确认没有本地 tracked 修改，再执行 fast-forward：
@@ -60,13 +75,16 @@ export H2D_R2="$LAGOM_REPO/work/h2d-round2"
 mkdir -p "$H2D_R2"
 
 "$LAGOM_PY" scripts/pd_test/collect_h2d_numa.py \
-  --probe-dir work/h2d-round1/normal-trace \
+  --gpu-index 4 5 6 7 \
   --output-file "$H2D_R2/live-numa.json"
 ```
 
-这一步不会加载模型、搬运 KV 或重启服务。旧 probe 没有进程启动标识，PID 会标为未验证；
-用结果中的 `nvidia-smi --query-compute-apps` 确认是当前 decode worker。
-如果已重启，改用 `--pid PID0 PID1 PID2 PID3`，不要将旧 PID 的读数归给旧 trace。
+这一步不会加载模型、搬运 KV 或重启服务。`--gpu-index` 是物理 nvidia-smi 编号，
+按 GPU UUID 查询当前 compute PID，避免 C/D 服务重启后读旧 PID。
+它会收集这些 GPU 上的所有 compute 进程；如果还有其他程序，用输出 PID/UUID 确认当前 decode worker。
+当前 PID/物理 GPU 的查询关系不证明旧 trace 的进程身份，`probe_identity_status` 仍保留未验证标记。
+也可使用 `--pid PID0 PID1 PID2 PID3`；不要将旧 PID 的读数归给旧 trace。
+已有新版 probe 可额外提供 `--probe-dir` 来校验 start_ticks 和 KV 地址。
 若是别的 Unix 用户启动的服务，读取可能被拒绝；输出保留权限错误。只需让服务所属用户运行这个只读脚本。
 
 旧版本只支持进程整体 NUMA 分布，不能精确归因到 KV。
@@ -95,10 +113,10 @@ smoke 的工作集很小，其带宽不用于性能判断。失败时先反馈�
 CPU 开发环境已验证解析、几何计数和独立 CPU 字节校验；GPU event/capture 仍需这个实机检查。
 
 确认 `numactl --hardware` 的 node 1 对应 decode GPU；本机报告为 node 1。使用**硬内存绑定**，
-绑定失败则停止，不静默回退成另一种 NUMA 配置。以下四个单卡命令顺序执行：
+绑定失败则停止，不静默回退成另一种 NUMA 配置。先顺序测 GPU4（原 TP0）和 GPU5（原 TP1）：
 
 ```bash
-for gpu in 4 5 6 7; do
+for gpu in 4 5; do
   CUDA_VISIBLE_DEVICES="$gpu" numactl --cpunodebind=1 --membind=1 \
     "$LAGOM_PY" scripts/pd_test/bench_h2d_copy.py \
     --output-dir "$H2D_R2/solo-gpu${gpu}-node1" \
@@ -106,7 +124,9 @@ for gpu in 4 5 6 7; do
 done
 ```
 
-检查四个 JSON 全部成功，再做四卡并发：
+本轮先反馈只读 NUMA、smoke 以及这两个单卡 JSON 的紧凑摘要，暂不执行以下四卡命令。
+若单卡仍有分化，再核对物理卡/通路与 CTA 响应；若单卡接近，则追加 GPU6/7 和四卡并发以查共享资源。
+后续四卡命令保留如下：
 
 ```bash
 CUDA_VISIBLE_DEVICES=4,5,6,7 GLOO_SOCKET_IFNAME=lo \

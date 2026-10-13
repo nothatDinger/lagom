@@ -249,6 +249,10 @@ def numa_text(path):
         )
         if p["errors"]:
             lines.append("  first_error=" + str(p["errors"][0]))
+        if p.get("current_gpu_query_matches"):
+            lines.append(
+                "  current_GPU_PID_matches=" + str(p["current_gpu_query_matches"])
+            )
         kv_groups = defaultdict(list)
         for buffer in p.get("buffer_snapshot", {}).get("buffers", []):
             regions = [

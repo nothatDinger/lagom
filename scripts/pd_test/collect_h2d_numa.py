@@ -1,6 +1,8 @@
 """Read current GPU/process NUMA evidence, without loading a model or modifying it."""
 
 import argparse
+import csv
+import io
 import json
 from pathlib import Path
 
@@ -8,16 +10,71 @@ from collect_h2d_environment import command
 
 from sglang.benchmark.hisparse_h2d_diagnostics import process_snapshot
 
+GPU_QUERY = ["nvidia-smi", "--query-gpu=index,uuid,pci.bus_id,name", "--format=csv"]
+PROCESS_QUERY = [
+    "nvidia-smi",
+    "--query-compute-apps=pid,gpu_uuid,used_gpu_memory",
+    "--format=csv",
+]
+
+
+def select_gpu_processes(gpus, processes, indices):
+    def rows(result):
+        if result.get("returncode") != 0:
+            raise ValueError(
+                "GPU discovery failed: "
+                + str(result.get("stderr", result.get("error", "unknown error")))
+            )
+        return [
+            {k.strip(): (v or "").strip() for k, v in row.items()}
+            for row in csv.DictReader(io.StringIO(result["stdout"]))
+        ]
+
+    inventory = {row["uuid"]: int(row["index"]) for row in rows(gpus)}
+    missing = set(indices) - set(inventory.values())
+    if missing:
+        raise ValueError(f"Physical GPU indices not found: {sorted(missing)}")
+    selected = {uuid: index for uuid, index in inventory.items() if index in indices}
+    matches = {}
+    for row in rows(processes):
+        if row["gpu_uuid"] in selected:
+            pid = int(row["pid"])
+            matches.setdefault(pid, []).append(
+                dict(gpu_index=selected[row["gpu_uuid"]], gpu_uuid=row["gpu_uuid"])
+            )
+    if not matches:
+        raise ValueError(
+            "No active compute processes on selected physical GPUs; collect while decode is running"
+        )
+    return matches
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pid", nargs="+", type=int, default=[])
+    parser.add_argument(
+        "--gpu-index",
+        nargs="+",
+        type=int,
+        default=[],
+        help="Discover current compute PIDs on physical nvidia-smi GPU indices",
+    )
     parser.add_argument("--probe-dir", type=Path)
     parser.add_argument("--output-file", required=True, type=Path)
     opts = parser.parse_args()
     if opts.output_file.exists():
         parser.error("Refusing to replace an existing output file")
     buffers = {pid: [] for pid in opts.pid}
+    commands = []
+    current_matches = {}
+    if opts.gpu_index:
+        commands = [command(GPU_QUERY), command(PROCESS_QUERY)]
+        try:
+            current_matches = select_gpu_processes(*commands, opts.gpu_index)
+        except (ValueError, KeyError) as exc:
+            parser.error(str(exc))
+        for pid in current_matches:
+            buffers.setdefault(pid, [])
     identities = []
     if opts.probe_dir:
         for path in sorted(opts.probe_dir.rglob("*.h2d.json")):
@@ -39,11 +96,14 @@ def main():
                 )
             )
     if not buffers:
-        parser.error("Provide --pid or a --probe-dir containing .h2d.json files")
+        parser.error(
+            "Provide --gpu-index, --pid or a --probe-dir containing .h2d.json files"
+        )
     snapshots = []
     for pid in sorted(buffers):
         snapshot = process_snapshot(pid)
         historical = [i for i in identities if i["pid"] == pid]
+        snapshot["current_gpu_query_matches"] = current_matches.get(pid, [])
         snapshot["probe_identity_status"] = (
             "verified_start_ticks"
             if historical
@@ -70,19 +130,11 @@ def main():
         schema_version=1,
         probe_identities=identities,
         processes=snapshots,
-        commands=[
+        commands=commands
+        + [
             command(cmd)
-            for cmd in [
-                [
-                    "nvidia-smi",
-                    "--query-gpu=index,uuid,pci.bus_id,name",
-                    "--format=csv",
-                ],
-                [
-                    "nvidia-smi",
-                    "--query-compute-apps=pid,gpu_uuid,used_gpu_memory",
-                    "--format=csv",
-                ],
+            for cmd in ([] if commands else [GPU_QUERY, PROCESS_QUERY])
+            + [
                 ["nvidia-smi", "topo", "-m"],
                 ["numactl", "--hardware"],
             ]

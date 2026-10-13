@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,90 @@ from sglang.benchmark.hisparse_h2d_diagnostics import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+@pytest.fixture
+def numa_collector(monkeypatch):
+    path = Path(__file__).resolve().parents[3] / "scripts/pd_test/collect_h2d_numa.py"
+    monkeypatch.syspath_prepend(str(path.parent))
+    spec = importlib.util.spec_from_file_location("collect_h2d_numa", path)
+    collector = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(collector)
+    return collector
+
+
+def gpu_query_fixture():
+    return (
+        dict(
+            returncode=0, stdout="index, uuid\n0, GPU-zero\n4, GPU-four\n5, GPU-five\n"
+        ),
+        dict(
+            returncode=0,
+            stdout="pid, gpu_uuid\n100, GPU-four\n100, GPU-five\n200, GPU-zero\n300, GPU-five\n",
+        ),
+    )
+
+
+def test_current_gpu_discovery_uses_physical_indices_and_deduplicates_pids(
+    numa_collector,
+):
+    gpus, processes = gpu_query_fixture()
+    selected = numa_collector.select_gpu_processes(gpus, processes, [4, 5])
+    assert set(selected) == {100, 300}
+    assert [m["gpu_index"] for m in selected[100]] == [4, 5]
+    assert set(numa_collector.select_gpu_processes(gpus, processes, [4])) == {100}
+
+
+@pytest.mark.parametrize("failure", ["missing_gpu", "query_failed", "no_processes"])
+def test_gpu_discovery_does_not_fall_back_to_old_or_unrelated_pids(
+    numa_collector, failure
+):
+    gpus, processes = gpu_query_fixture()
+    indices = [4]
+    if failure == "missing_gpu":
+        indices = [6]
+    elif failure == "query_failed":
+        processes = dict(returncode=1, stderr="query failed")
+    else:
+        processes["stdout"] = "pid, gpu_uuid\n200, GPU-zero\n"
+    with pytest.raises(ValueError):
+        numa_collector.select_gpu_processes(gpus, processes, indices)
+
+
+def test_gpu_discovery_cli_snapshots_only_current_selected_compute_pids(
+    numa_collector, monkeypatch, tmp_path
+):
+    gpus, processes = gpu_query_fixture()
+
+    def command(argv):
+        result = (
+            gpus
+            if argv == numa_collector.GPU_QUERY
+            else (
+                processes
+                if argv == numa_collector.PROCESS_QUERY
+                else dict(returncode=0, stdout="")
+            )
+        )
+        return dict(result, argv=argv)
+
+    monkeypatch.setattr(numa_collector, "command", command)
+    monkeypatch.setattr(
+        numa_collector,
+        "process_snapshot",
+        lambda pid: dict(pid=pid, pid_stable_during_snapshot=True, start_ticks=999),
+    )
+    target = tmp_path / "numa.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["collector", "--gpu-index", "4", "5", "--output-file", str(target)],
+    )
+    numa_collector.main()
+    report = json.loads(target.read_text())
+    assert [p["pid"] for p in report["processes"]] == [100, 300]
+    assert report["processes"][0]["probe_identity_status"] == "unverified_or_stale"
+    assert report["processes"][0]["current_gpu_query_matches"][0]["gpu_index"] == 4
 
 
 def test_numa_counts_for_a_shared_vma_are_not_attributed_to_a_buffer():
