@@ -1,5 +1,8 @@
 # 第三轮：同一 host 分配、双卡交替、状态与计时校验
 
+已完成 pair-main（未开启 profile）后的下一步见 [第四轮：补齐实际活动时长](README_h2d_round4.md)。
+第三轮的 correctness 与无 profiler 性能结果有效，无需重新跑 smoke。
+
 分支仍为 `perf/hisparse-h2d-diagnosis`，生产 copy 参数不变，原生 venv 执行。
 GPU4/5 必须空闲；本轮不启动模型，不使用 GPU0–3，不改时钟、功耗上限或驱动设置。
 

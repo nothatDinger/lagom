@@ -223,7 +223,7 @@ def validate_profile(report, events):
 
 
 def clock_text(waves):
-    samples = [s for w in waves for s in (w["before"], w["after"])]
+    samples = [s for w in waves for s in (w.get("before", {}), w.get("after", {}))]
 
     def values(key):
         found = sorted({s[key] for s in samples if key in s})
@@ -322,10 +322,16 @@ def compact_report(report):
                 f'examples={evidence["examples"]}'
             )
         if check["valid"]:
+            count = check["activities"]
+            event_mean = check["event_gpu_us"] / count
+            activity_mean = check["activity_gpu_us"] / count
             lines.append(
                 f'PROFILE {wave["case"]} {wave["method"]} d{wave["device"]} n={check["activities"]} '
+                f'phase={wave.get("phase", "unknown")} '
                 f'event/activity_GBps={check["event_GBps"]:.2f}/{check["activity_GBps"]:.2f} '
-                f'event_time/activity_time={check["event_over_activity"]:.3f}'
+                f'event_time/activity_time={check["event_over_activity"]:.3f} '
+                f"mean_event/activity_us={event_mean:.2f}/{activity_mean:.2f} "
+                f"mean_gap_us={event_mean - activity_mean:.2f} " + clock_text([wave])
             )
         else:
             lines.append(f'PROFILE {wave["scope"]} UNASSIGNED {check}')
