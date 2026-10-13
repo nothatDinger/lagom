@@ -57,12 +57,16 @@ GPU4/5 必须空闲；本轮不启动模型，不使用 GPU0–3，不改时钟�
 无 profile 的结果用于性能比较。随后 `--profile` 单独测一次每个 graph，记录同一波的 event interval，
 并从 torch trace 的实际 GPU kernel/HtoD activity 提取 copy 时间。
 同步 CPU annotation 包围整波，严格要求 copy node 数与 banks 相同；CE 若提供 bytes 字段也会校验。
+scope 必须是唯一的 `cat=user_annotation`。Kineto 可能输出同名 `gpu_user_annotation`，
+它是 GPU 上的投影，不计作第二个 CPU scope，也不用它的时间范围替代 CPU 边界。
+若仍有两个 CPU annotation，解析继续失败并打印候选元数据，不能任选一个。
 缺节点、范围或 clock 数据自洽检查失败时，不输出猜测的 activity GB/s。
 profiler 运行用于验证计时口径，不能代替无 profiler 的性能基线。
 
 ## 3. 执行：一次新 smoke，一次正式对照
 
 在此前实验 worktree 中更新；确认没有本地 tracked 修改后 fast-forward：
+仅离线恢复旧 smoke 时，执行前两条 git 命令后直接进入“先离线恢复”，可跳过 venv/NVML 预检。
 
 ```bash
 git fetch origin perf/hisparse-h2d-diagnosis
@@ -78,6 +82,39 @@ mkdir -p "$H2D_R3"
 若最后一行提示缺少 pynvml，仅需为该 venv 安装 Python binding：
 `"$LAGOM_PY" -m pip install nvidia-ml-py`。不安装或修改 GPU driver。
 
+### 已有 smoke 因 `Expected one scope, found 2` 失败：先离线恢复
+
+旧解析器只按名称和 `ph=X` 匹配，没有限定 CPU annotation；同名 GPU 投影可能被误算。
+用户报告的重复事件类别尚需从 trace 确认，不能仅凭数量 2 推断成重复 replay 或两卡各发一次。
+
+更新分支后，在仓库根目录执行以下命令，只读已有两个文件；系统 Python 即可，
+不导入 torch，不创建 CUDA context，不需要空闲 GPU，也无需重新跑 smoke：
+
+```bash
+python3 scripts/pd_test/reanalyze_h2d_pair.py \
+  --report work/h2d-round3/pair-smoke/pair.json \
+  --trace work/h2d-round3/pair-smoke/pair.trace.json \
+  --output-dir work/h2d-round3/pair-smoke-reanalyzed
+```
+
+输出到新目录，保留原文件；再次解析应使用另一个新目录。
+`pair-compact.txt` 现在直接包含独立的 correctness 汇总、10 个 profile scope 的覆盖校验、
+以及每个同名事件的 `cat/pid/tid/ts/dur` 等少量字段。
+若类别为一个 `user_annotation` 加一个 `gpu_user_annotation`，就确认了此次误判来源。
+离线输出 `pair-reanalyzed.json` 还记录原始输入 SHA256 和旧 profile 状态，便于复核。
+
+必须退出 0、`ready_for_main=True`、`profile_success=True`，
+且 `CORRECTNESS ... graph_replay_checked=10/10 complete=True`、profile coverage 为 10/10，
+才能直接进入下面的正式对照，无需再跑 smoke。
+否则只反馈新目录的 `pair-compact.txt`；如果未生成该文件，反馈错误末尾约 30 行。
+
+`graph_replay_checked` 是 capture 后清零、replay、逐字节验证的结果，独立于 profiler 解析。
+`profile_success=False` 不意味着 graph 正确性失败；旧摘要没有打印该字段，新摘要会直接展示。
+当前 profile 固定为 5 个 case/method × 2 张卡 = 10 个 scope，仅测 `profile_compute`；
+`copy/compute` 两阶段属于此前无 profiler 的对照，并不是这 10 个 scope 的另一倍数。
+
+### 首次运行才需要 smoke
+
 先 smoke：
 
 ```bash
@@ -91,12 +128,12 @@ CUDA_VISIBLE_DEVICES=4,5 numactl --cpunodebind=1 --membind=1 \
 
 必须退出成功，`pair-smoke/pair-compact.txt` 的 `success=True profile_success=True`。
 完整 `pair.json` 的 correctness 全通过，两卡分别识别为物理 4/5；profile 的 10 个 scope 均有有效 activity。
-所有 `graph_replay_checked` 也必须为 true。
+紧凑摘要也会显示 `CORRECTNESS ... graph_replay_checked=10/10 complete=True`。
 smoke 仅验证 Portable 共享、双卡 event/capture、NVML 映射和 profile 活动解析，带宽不用于性能判断。
 本开发环境无 GPU；这些新增 GPU 路径需要该实机检查。
 失败就反馈最后约 30 行错误和紧凑文件（若存在），不要继续。原始 trace 保留本机。
 
-正式对照：
+### 正式对照
 
 ```bash
 CUDA_VISIBLE_DEVICES=4,5 numactl --cpunodebind=1 --membind=1 \

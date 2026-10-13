@@ -1,5 +1,7 @@
 import copy
 import importlib.util
+import json
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +14,10 @@ from sglang.benchmark.hisparse_h2d_pair import (
     abba_order,
     activity_check,
     compact_report,
+    correctness_summary,
+    expected_case_keys,
     pci_path,
+    validate_profile,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -80,6 +85,46 @@ def test_activity_time_is_distinct_from_graph_event_interval():
     assert check["event_gpu_us"] == 13
     assert check["event_over_activity"] == pytest.approx(13 / 11)
     assert check["activity_GBps"] == pytest.approx(2000 / 11 / 1000)
+
+
+def test_gpu_projection_with_same_name_does_not_duplicate_the_cpu_scope():
+    events, wave = fixture()
+    # The GPU range may be shorter; it is not the synchronized CPU boundary.
+    events.insert(
+        0,
+        dict(
+            ph="X",
+            name=wave["scope"],
+            cat="gpu_user_annotation",
+            ts=112,
+            dur=20,
+            pid=0,
+            tid=7,
+            args=dict(device=0),
+        ),
+    )
+    check = activity_check(events, wave)
+    assert check["valid"] and check["activity_gpu_us"] == 11
+    assert check["scope_evidence"]["named_events"] == 2
+    assert check["scope_evidence"]["cpu_scopes"] == 1
+    assert check["scope_evidence"]["categories"] == {
+        "gpu_user_annotation": 1,
+        "user_annotation": 1,
+    }
+    # A real duplicate CPU annotation is still ambiguous, even if identical.
+    events.append(copy.deepcopy(events[1]))
+    check = activity_check(events, wave)
+    assert not check["valid"] and "activity_GBps" not in check
+    assert check["scope_evidence"]["cpu_scopes"] == 2
+
+
+@pytest.mark.parametrize("category", ["gpu_user_annotation", "cpu_op", "unknown", ""])
+def test_gpu_or_unknown_scope_cannot_replace_a_missing_cpu_annotation(category):
+    events, wave = fixture()
+    events[0]["cat"] = category
+    check = activity_check(events, wave)
+    assert not check["valid"] and "activity_GBps" not in check
+    assert check["scope_evidence"]["cpu_scopes"] == 0
 
 
 @pytest.mark.parametrize(
@@ -208,3 +253,118 @@ def test_nvml_matches_uuid_rather_than_assuming_cuda_is_physical_index(
     sample = observer.sample(1)
     assert sample["sm_MHz"] == 1800 and sample["power_W"] == 100
     assert not sample["errors"]
+
+
+def captured_pair_fixture():
+    report = dict(
+        success=True,
+        profile_success=False,
+        host_register_flags=1,
+        config=dict(batch=2, misses=[2, 70], devices=[0, 1], bulk_ce_mib=1),
+        devices={},
+        waves=[],
+        profile_waves=[],
+        correctness=[],
+    )
+    trace = []
+    for index, (case, method, device) in enumerate(sorted(expected_case_keys(report))):
+        events, wave = fixture()
+        wave.update(
+            case=case,
+            method=method,
+            device=device,
+            scope=f"h2d_pair:{case}:{method}:device{device}",
+        )
+        events = events[:3]  # CPU range and two actual copy nodes.
+        events[0].update(name=wave["scope"], pid=123, tid=456)
+        for event in events[1:]:
+            event["args"]["device"] = device
+            if method == "ce":
+                event.update(cat="gpu_memcpy", name="Memcpy HtoD (Pinned -> Device)")
+                event["args"]["bytes"] = wave["payload_bytes"]
+        events.append(
+            dict(
+                ph="X",
+                name=wave["scope"],
+                cat="gpu_user_annotation",
+                ts=110,
+                dur=26,
+                pid=device,
+                tid=7,
+                args=dict(device=device),
+            )
+        )
+        for event in events:
+            event["ts"] += index * 1000
+        trace.extend(events)
+        wave["activity_check"] = dict(valid=False, reason="Expected one scope, found 2")
+        report["profile_waves"].append(wave)
+        report["correctness"].append(
+            dict(
+                case=case,
+                method=method,
+                device=device,
+                all_payload_bytes_checked=True,
+                graph_replay_checked=True,
+            )
+        )
+    return report, trace
+
+
+def test_correctness_and_profile_coverage_are_independent():
+    report, events = captured_pair_fixture()
+    assert correctness_summary(report)["complete"]
+    assert report["profile_success"] is False
+    assert validate_profile(report, events)
+    assert report["profile_validation"]["validated"] == 10
+    report["profile_waves"].pop()
+    assert not validate_profile(report, events)
+    assert correctness_summary(report)["complete"]
+    report["profile_waves"] = []
+    assert not validate_profile(report, events)
+    report["correctness"].pop()
+    assert not correctness_summary(report)["complete"]
+
+
+@pytest.mark.parametrize("failure", [None, "cpu_duplicate", "graph_check", "capture"])
+def test_offline_cli_needs_no_site_packages_and_preserves_originals(tmp_path, failure):
+    report, events = captured_pair_fixture()
+    if failure == "cpu_duplicate":
+        events.append(copy.deepcopy(events[0]))
+    elif failure == "graph_check":
+        report["correctness"][0]["graph_replay_checked"] = False
+    elif failure == "capture":
+        report["success"] = False
+    source = tmp_path / "pair.json"
+    trace = tmp_path / "pair.trace.json"
+    source.write_text(json.dumps(report))
+    trace.write_text(json.dumps(dict(traceEvents=events)))
+    originals = source.read_bytes(), trace.read_bytes()
+    script = (
+        Path(__file__).resolve().parents[3] / "scripts/pd_test/reanalyze_h2d_pair.py"
+    )
+    output = tmp_path / "reanalyzed"
+    # -S excludes site-packages, including torch; this is strictly an offline parser.
+    command = [
+        sys.executable,
+        "-S",
+        str(script),
+        "--report",
+        str(source),
+        "--trace",
+        str(trace),
+        "--output-dir",
+        str(output),
+    ]
+    run = subprocess.run(command, capture_output=True, text=True)
+    assert (run.returncode == 0) == (failure is None), run.stderr
+    assert (source.read_bytes(), trace.read_bytes()) == originals
+    updated = json.loads((output / "pair-reanalyzed.json").read_text())
+    assert updated["success"] == report["success"]
+    assert updated["reanalysis"]["ready_for_main"] == (failure is None)
+    assert "CORRECTNESS records=10/10" in run.stdout
+    assert "gpu_user_annotation" in run.stdout
+    saved = (output / "pair-reanalyzed.json").read_bytes()
+    rerun = subprocess.run(command, capture_output=True, text=True)
+    assert rerun.returncode != 0
+    assert (output / "pair-reanalyzed.json").read_bytes() == saved

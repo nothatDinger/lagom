@@ -22,9 +22,9 @@ from sglang.benchmark.hisparse_h2d_diagnostics import (
 )
 from sglang.benchmark.hisparse_h2d_pair import (
     abba_order,
-    activity_check,
     compact_report,
     pci_path,
+    validate_profile,
 )
 
 
@@ -277,11 +277,7 @@ def run_profiles(torch, args, cases, warmers, observer, report):
                     report["profile_waves"].append(wave)
     profiler.export_chrome_trace(str(path))
     events = json.loads(path.read_text())["traceEvents"]
-    for wave in report["profile_waves"]:
-        wave["activity_check"] = activity_check(events, wave)
-    report["profile_success"] = all(
-        w["activity_check"]["valid"] for w in report["profile_waves"]
-    )
+    validate_profile(report, events)
 
 
 def main():

@@ -3,7 +3,7 @@
 import math
 import re
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 
@@ -50,12 +50,44 @@ def activity_check(events, wave):
     No per-node event matching is guessed: every node in a wave has the same
     payload, device and operation. A missing node invalidates the activity rate.
     """
-    scopes = [
-        e for e in events if e.get("ph") == "X" and e.get("name") == wave["scope"]
-    ]
+    named = [e for e in events if e.get("ph") == "X" and e.get("name") == wave["scope"]]
+    # Kineto may also project record_function onto a GPU stream under the
+    # same name, with cat=gpu_user_annotation. Only the CPU range brackets
+    # the entire synchronized measurement. Never select a range by duration
+    # or arbitrarily discard a second CPU annotation.
+    scopes = [e for e in named if e.get("cat") == "user_annotation"]
+    evidence = dict(
+        named_events=len(named),
+        cpu_scopes=len(scopes),
+        categories=dict(Counter(e.get("cat", "<missing>") for e in named)),
+        examples=[
+            {
+                **{k: e[k] for k in ("cat", "pid", "tid", "ts", "dur") if k in e},
+                **{
+                    k: e["args"][k]
+                    for k in ("device", "stream", "External id", "correlation")
+                    if k in e.get("args", {})
+                },
+            }
+            for e in named[:4]
+        ],
+    )
+
+    def invalid(reason, **details):
+        return dict(valid=False, reason=reason, scope_evidence=evidence, **details)
+
     if len(scopes) != 1:
-        return dict(valid=False, reason=f"Expected one scope, found {len(scopes)}")
+        return invalid(f"Expected one CPU user_annotation scope, found {len(scopes)}")
     scope = scopes[0]
+    if (
+        any(
+            not isinstance(scope.get(key), (int, float))
+            or not math.isfinite(scope[key])
+            for key in ("ts", "dur")
+        )
+        or scope["dur"] <= 0
+    ):
+        return invalid("Invalid CPU annotation timestamp or duration")
     lo, hi = scope["ts"] - 1, scope["ts"] + scope["dur"] + 1
     candidates = [
         e
@@ -79,9 +111,8 @@ def activity_check(events, wave):
             if "gpu_memcpy" in e.get("cat", "").lower() and "htod" in e["name"].lower()
         ]
     if len(copies) != wave["banks"]:
-        return dict(
-            valid=False,
-            reason=f'Expected {wave["banks"]} copy nodes, found {len(copies)}',
+        return invalid(
+            f'Expected {wave["banks"]} copy nodes, found {len(copies)}',
             activity_names=sorted(
                 {
                     e.get("name", "")
@@ -103,29 +134,27 @@ def activity_check(events, wave):
         )
     for copy in copies:
         if not math.isfinite(copy["dur"]) or copy["dur"] <= 0:
-            return dict(valid=False, reason="Invalid GPU activity duration")
+            return invalid("Invalid GPU activity duration")
         recorded_bytes = copy.get("args", {}).get("bytes")
         if (
             wave["method"] == "ce"
             and recorded_bytes is not None
             and int(recorded_bytes) != wave["payload_bytes"]
         ):
-            return dict(
-                valid=False, reason="CE activity byte count disagrees with payload"
-            )
+            return invalid("CE activity byte count disagrees with payload")
     active = sum(e["dur"] for e in copies)
     interval = sum(wave["copy_us"])
     if interval <= 0 or not math.isfinite(interval):
-        return dict(valid=False, reason="Invalid graph event interval")
+        return invalid("Invalid graph event interval")
     if active > interval + max(1, 0.5 * len(copies)):
-        return dict(
-            valid=False,
-            reason="Activity time exceeds bracketing event time beyond timer resolution",
+        return invalid(
+            "Activity time exceeds bracketing event time beyond timer resolution",
             activity_gpu_us=active,
             event_gpu_us=interval,
         )
     return dict(
         valid=True,
+        scope_evidence=evidence,
         activities=len(copies),
         activity_gpu_us=active,
         activity_GBps=wave["payload_bytes"] * len(copies) / active / 1000,
@@ -133,6 +162,64 @@ def activity_check(events, wave):
         event_gpu_us=interval,
         event_GBps=wave["payload_bytes"] * len(copies) / interval / 1000,
     )
+
+
+def expected_case_keys(report):
+    """The acquisition captures each device/case/method exactly once."""
+    config = report["config"]
+    cases = {
+        (f'B{config["batch"]}-miss{misses}', method, device)
+        for misses in config["misses"]
+        for method in ("sm", "ce")
+        for device in config["devices"]
+    }
+    cases.update(
+        (f'bulk-ce-{config["bulk_ce_mib"]}MiB', "ce", device)
+        for device in config["devices"]
+    )
+    return cases
+
+
+def correctness_summary(report):
+    """Read graph/copy assertions independently of profiler parsing status."""
+    rows = report.get("correctness", [])
+    keys = [(r["case"], r["method"], r["device"]) for r in rows]
+    expected = expected_case_keys(report)
+    payload = sum(r.get("all_payload_bytes_checked") is True for r in rows)
+    replay = sum(r.get("graph_replay_checked") is True for r in rows)
+    coverage = len(keys) == len(expected) and set(keys) == expected
+    return dict(
+        expected=len(expected),
+        records=len(rows),
+        payload_checked=payload,
+        graph_replay_checked=replay,
+        complete=bool(expected) and coverage and payload == replay == len(expected),
+    )
+
+
+def validate_profile(report, events):
+    """Refresh only analysis fields; retain acquisition status and raw timings."""
+    waves = report.get("profile_waves", [])
+    for wave in waves:
+        wave["activity_check"] = activity_check(events, wave)
+    expected = expected_case_keys(report)
+    keys = [(w["case"], w["method"], w["device"]) for w in waves]
+    errors = []
+    if not expected or len(keys) != len(expected) or set(keys) != expected:
+        errors.append(
+            "Profile waves do not cover each configured device/case/method exactly once"
+        )
+    if any(
+        w["scope"] != f'h2d_pair:{w["case"]}:{w["method"]}:device{w["device"]}'
+        for w in waves
+    ):
+        errors.append("Scope name disagrees with wave identity")
+    validated = sum(w["activity_check"]["valid"] for w in waves)
+    report["profile_success"] = not errors and validated == len(expected)
+    report["profile_validation"] = dict(
+        expected=len(expected), recorded=len(waves), validated=validated, errors=errors
+    )
+    return report["profile_success"]
 
 
 def clock_text(waves):
@@ -161,6 +248,18 @@ def compact_report(report):
     ]
     if report.get("error"):
         lines.append("ERROR " + report["error"])
+    if "correctness" in report:
+        check = correctness_summary(report)
+        lines.append(
+            f'CORRECTNESS records={check["records"]}/{check["expected"]} '
+            f'payload_checked={check["payload_checked"]}/{check["expected"]} '
+            f'graph_replay_checked={check["graph_replay_checked"]}/{check["expected"]} '
+            f'complete={check["complete"]} (independent of profile_success)'
+        )
+    if "profile_validation" in report:
+        lines.append(f'PROFILE_COVERAGE {report["profile_validation"]}')
+    if "reanalysis" in report:
+        lines.append(f'REANALYSIS {report["reanalysis"]}')
     for device, meta in sorted(report.get("devices", {}).items()):
         lines.append(
             f'logical={device} identity={ {k:v for k,v in meta.items() if k != "pci_path"} }'
@@ -215,6 +314,13 @@ def compact_report(report):
             "activity_check",
             dict(valid=False, reason="Profiling stopped before activity validation"),
         )
+        evidence = check.get("scope_evidence")
+        if evidence:
+            lines.append(
+                f'SCOPE {wave["scope"]} named={evidence["named_events"]} '
+                f'cpu={evidence["cpu_scopes"]} categories={evidence["categories"]} '
+                f'examples={evidence["examples"]}'
+            )
         if check["valid"]:
             lines.append(
                 f'PROFILE {wave["case"]} {wave["method"]} d{wave["device"]} n={check["activities"]} '
