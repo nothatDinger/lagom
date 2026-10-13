@@ -3,6 +3,8 @@
 分支仍是 `perf/hisparse-h2d-diagnosis`。只使用空闲的物理 GPU4/5、NUMA1，原生 venv 执行。
 生产 kernel 和服务参数不变。本轮至多两项：先 A；仅当 A 仍复现原差距时再 B。
 
+A/B 已完成后，参见 [第六轮：源读取策略候选与原始 decode 验收](README_h2d_round6.md)。
+
 ## 1. 第四轮确认了什么
 
 旧配置 register_device=0（物理 GPU4），共享 host、冻结 miss plan、flags=1。

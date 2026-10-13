@@ -6,6 +6,17 @@ import statistics
 from collections import Counter, defaultdict
 from pathlib import Path
 
+SM_LOAD_POLICIES = {"sm": "legacy", "sm_ca": "ca", "sm_cg": "cg", "sm_hbm": "legacy"}
+
+
+def copy_methods(config):
+    methods = ["sm"]
+    if config.get("copy_load_policy_control", False):
+        methods.extend(("sm_ca", "sm_cg"))
+    if config.get("device_source_control", False):
+        methods.append("sm_hbm")
+    return (*methods, "ce")
+
 
 def pci_path(bus, sys_root="/sys/bus/pci/devices"):
     """Read endpoint/ancestor topology and link attributes; never read/write config."""
@@ -97,7 +108,7 @@ def activity_check(events, wave):
         and e["ts"] >= lo
         and e["ts"] + e.get("dur", 0) <= hi
     ]
-    if wave["method"] in ("sm", "sm_hbm"):
+    if wave["method"] in SM_LOAD_POLICIES:
         copies = [
             e
             for e in candidates
@@ -169,11 +180,7 @@ def activity_check(events, wave):
 def expected_case_keys(report):
     """The acquisition captures each device/case/method exactly once."""
     config = report["config"]
-    methods = (
-        ("sm", "sm_hbm", "ce")
-        if config.get("device_source_control", False)
-        else ("sm", "ce")
-    )
+    methods = copy_methods(config)
     cases = {
         (f'B{config["batch"]}-miss{misses}', method, device)
         for misses in config["misses"]
@@ -292,6 +299,11 @@ def compact_report(report):
     lines.append(
         "Rates use total payload / total time, decimal GB/s. SM uses CTA4/1024 threads."
     )
+    if report["config"].get("copy_load_policy_control", False):
+        lines.append(
+            "LOAD_POLICIES sm=legacy C++; sm_ca=explicit PTX .ca; sm_cg=explicit PTX .cg. "
+            "Same GPU plans, counts, destination and launch shape; explicit benchmark policies ignore the service environment setting."
+        )
     if report["config"].get("device_source_control", False):
         lines.append(
             "sm_hbm: SAME kernel from local GPU memory; reported GB/s is logical payload throughput, NOT H2D. "
@@ -341,6 +353,7 @@ def compact_report(report):
             lines.append(
                 f'PROFILE {wave["case"]} {wave["method"]} d{wave["device"]} n={check["activities"]} '
                 f'phase={wave.get("phase", "unknown")} '
+                f'load_policy={SM_LOAD_POLICIES.get(wave["method"], "CE")} '
                 f'source={"device" if wave["method"] == "sm_hbm" else "host"} '
                 f'h2d_bytes_per_copy={0 if wave["method"] == "sm_hbm" else wave["payload_bytes"]} '
                 f'event/activity_GBps={check["event_GBps"]:.2f}/{check["activity_GBps"]:.2f} '

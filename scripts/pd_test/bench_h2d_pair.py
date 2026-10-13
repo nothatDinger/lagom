@@ -21,8 +21,10 @@ from sglang.benchmark.hisparse_h2d_diagnostics import (
     process_snapshot,
 )
 from sglang.benchmark.hisparse_h2d_pair import (
+    SM_LOAD_POLICIES,
     abba_order,
     compact_report,
+    copy_methods,
     pci_path,
     validate_profile,
 )
@@ -150,7 +152,7 @@ class CopyCase:
         self.source_kind = "device" if method == "sm_hbm" else "host"
         self.functions = []
         with torch.cuda.device(device):
-            if method in ("sm", "sm_hbm"):
+            if method in SM_LOAD_POLICIES:
                 from sglang.kernels.ops.kvcache.hisparse import copy_cache_planned_mla
 
                 source = host
@@ -169,16 +171,18 @@ class CopyCase:
                 self.source = (
                     source  # Keep the source alive through every graph replay.
                 )
-                if method == "sm_hbm":
+                if method != "sm":
                     if shared_sm is None or (
                         shared_sm.device,
                         shared_sm.label,
                         shared_sm.banks,
                         shared_sm.nbytes,
                     ) != (device, label, banks, nbytes):
-                        raise ValueError("SM-HBM requires the matching host-SM case")
+                        raise ValueError(
+                            "SM variant requires the matching host-SM case"
+                        )
                     # Reuse exact GPU plan, counts and destination allocations.
-                    # Only the source argument differs; graphs run sequentially.
+                    # Only source / source load policy differ; graphs run sequentially.
                     src = shared_sm.plan_src
                     kwargs = dict(shared_sm.sm_kwargs, host_cache=source)
                 else:
@@ -202,6 +206,7 @@ class CopyCase:
                         block_size=1024,
                         is_dsv4_layout=True,
                     )
+                kwargs["load_policy"] = SM_LOAD_POLICIES[method]
                 self.plan_src, self.sm_kwargs = src, kwargs
                 output = kwargs["device_buffer"]
                 self.functions = [
@@ -275,6 +280,7 @@ class CopyCase:
         return dict(
             case=self.label,
             method=self.method,
+            load_policy=SM_LOAD_POLICIES.get(self.method, "CE"),
             source_kind=self.source_kind,
             h2d_bytes_per_copy=0 if self.source_kind == "device" else self.nbytes,
             device=self.device,
@@ -346,9 +352,19 @@ def main():
     parser.add_argument("--warm-ms", type=float, default=250)
     parser.add_argument("--reverse-order", action="store_true")
     parser.add_argument(
+        "--reverse-method-order",
+        action="store_true",
+        help="Reverse measurement case/method order; allocation and GPU ABBA order stay unchanged",
+    )
+    parser.add_argument(
         "--phases", nargs="+", choices=["copy", "compute"], default=["copy", "compute"]
     )
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--copy-load-policy-control",
+        action="store_true",
+        help="Compare legacy, explicit .ca and .cg source loads with shared plans and destination",
+    )
     parser.add_argument(
         "--device-source-control",
         action="store_true",
@@ -452,7 +468,7 @@ def main():
                 dict(device=device, address=source.data_ptr(), nbytes=source.numel())
                 for device, source in device_sources.items()
             ]
-        methods = ("sm", "sm_hbm", "ce") if args.device_source_control else ("sm", "ce")
+        methods = copy_methods(vars(args))
         cases = {}
         for case_index, (misses, geometry) in enumerate(zip(args.misses, geometries)):
             plan = make_plan(torch, args, geometry, case_index, misses)
@@ -496,6 +512,8 @@ def main():
                     )
                 )
         warmers = {device: Warmer(torch, device) for device in args.devices}
+        if args.reverse_method_order:
+            cases = dict(reversed(list(cases.items())))
         for phase in args.phases:
             for (label, method), devices in cases.items():
                 for trial, device in enumerate(order):

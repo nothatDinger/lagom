@@ -53,6 +53,7 @@ def main():
                 "GLOO_SOCKET_IFNAME",
                 "SGLANG_HISPARSE_H2D_PROBE_CAPACITY",
                 "SGLANG_HISPARSE_H2D_PROBE_MAX_BATCH",
+                "SGLANG_HISPARSE_DSV4_COPY_LOAD_POLICY",
             ]
         },
     )

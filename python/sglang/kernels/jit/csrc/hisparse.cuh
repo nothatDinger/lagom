@@ -176,7 +176,7 @@ __device__ __forceinline__ int popc_mask(BallotMask mask) {
 
 // Copy one missed item host->device with one warp. Shared by the fused swap-in
 // kernel and copy_cache_planned_kernel so the layout dispatch cannot drift.
-template <bool IsMLA, bool IsDsv4Layout>
+template <bool IsMLA, bool IsDsv4Layout, int LoadPolicy = 0>
 __device__ __forceinline__ void copy_miss_item(
     int32_t lane_id,
     const void* __restrict__ host_cache_k,
@@ -203,7 +203,7 @@ __device__ __forceinline__ void copy_miss_item(
     // CUDA path: page-padded device layout + page-padded host layout, K-only.
     // The host cache is pinned DRAM but uses the same row layout as the GPU C4
     // cache, so use the page-padded address calculation for both ends.
-    device::hisparse::transfer_item(
+    device::hisparse::transfer_item<LoadPolicy>(
         /*dst_cache=*/device_buffer_k,
         /*src_cache=*/const_cast<void*>(host_cache_k),
         /*dst_index=*/static_cast<int32_t>(dst_loc),
@@ -890,7 +890,7 @@ void load_cache_to_device_buffer(
 // miss plan (no hit detection / LRU; the anchor's slot table stays valid). The
 // small fixed grid (num_blocks) keeps the SM footprint low while overlapping
 // compute on a side stream. SkipIO is the same probe as in the fused kernel.
-template <int BLOCK_SIZE, bool IsMLA, bool IsDsv4Layout, bool SkipIO>
+template <int BLOCK_SIZE, bool IsMLA, bool IsDsv4Layout, bool SkipIO, int LoadPolicy = 0>
 __global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_planned_kernel(
     const int64_t* __restrict__ miss_src_locs,
     const int32_t* __restrict__ miss_dst_locs,
@@ -928,7 +928,7 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_planned_kernel(
       for (int m = m0; m < cnt; m += total_warps) {
         // Timing probe: the plan is still walked; only the bytes stay put.
         if constexpr (SkipIO) continue;
-        copy_miss_item<IsMLA, IsDsv4Layout>(
+        copy_miss_item<IsMLA, IsDsv4Layout, LoadPolicy>(
             lane_id,
             host_cache_k,
             host_cache_v,
@@ -943,7 +943,7 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_planned_kernel(
   }
 }
 
-template <int BLOCK_SIZE, bool IsMLA, bool IsDsv4Layout, bool SkipIO>
+template <int BLOCK_SIZE, bool IsMLA, bool IsDsv4Layout, bool SkipIO, int LoadPolicy = 0>
 void copy_cache_planned(
     tvm::ffi::TensorView miss_src_locs,
     tvm::ffi::TensorView miss_dst_locs,
@@ -955,6 +955,7 @@ void copy_cache_planned(
     tvm::ffi::TensorView device_buffer_v,
     int64_t num_blocks,
     int64_t item_size_bytes) {
+  static_assert(LoadPolicy == 0 || (IsMLA && IsDsv4Layout), "Cache-policy controls require DSv4 MLA");
   using namespace host;
   const int64_t plan_stride = miss_src_locs.strides()[0];
   if (miss_dst_locs.strides()[0] != plan_stride) {
@@ -962,7 +963,7 @@ void copy_cache_planned(
   }
   const auto device = LaunchKernel::resolve_device(miss_src_locs.device());
   LaunchKernel(num_blocks, BLOCK_SIZE, device)(
-      copy_cache_planned_kernel<BLOCK_SIZE, IsMLA, IsDsv4Layout, SkipIO>,
+      copy_cache_planned_kernel<BLOCK_SIZE, IsMLA, IsDsv4Layout, SkipIO, LoadPolicy>,
       static_cast<const int64_t*>(miss_src_locs.data_ptr()),
       static_cast<const int32_t*>(miss_dst_locs.data_ptr()),
       static_cast<const int32_t*>(miss_counts.data_ptr()),

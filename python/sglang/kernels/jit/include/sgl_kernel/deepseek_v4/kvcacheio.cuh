@@ -39,6 +39,30 @@ SGL_DEVICE PointerInfo get_pointer_paged(void* cache, int32_t index) {
   return {static_cast<int64_t*>(value_ptr), static_cast<int64_t*>(scale_ptr)};
 }
 
+// 0: original C++ load; 1/2: identical PTX except for .ca/.cg cache policy.
+// Keep lane mapping, access widths, scale broadcast and stores unchanged.
+template <int LoadPolicy>
+SGL_DEVICE int64_t load_item_word(const int64_t* ptr) {
+  static_assert(LoadPolicy >= 0 && LoadPolicy <= 2);
+  if constexpr (LoadPolicy == 0) {
+    return *ptr;
+  } else {
+#ifdef USE_ROCM
+    static_assert(LoadPolicy == 0, "Explicit cache policies require NVIDIA CUDA");
+    return 0;
+#else
+    int64_t value;
+    if constexpr (LoadPolicy == 1) {
+      asm volatile("ld.global.ca.b64 %0, [%1];" : "=l"(value) : "l"(ptr) : "memory");
+    } else {
+      asm volatile("ld.global.cg.b64 %0, [%1];" : "=l"(value) : "l"(ptr) : "memory");
+    }
+    return value;
+#endif
+  }
+}
+
+template <int LoadPolicy = 0>
 SGL_DEVICE void transfer_item(void* dst_cache, void* src_cache, const int32_t dst_index, const int32_t src_index) {
   const auto [dst_value_ptr, dst_scale_ptr] = get_pointer_paged(dst_cache, dst_index);
   const auto [src_value_ptr, src_scale_ptr] = get_pointer_paged(src_cache, src_index);
@@ -51,7 +75,7 @@ SGL_DEVICE void transfer_item(void* dst_cache, void* src_cache, const int32_t ds
 
   for (int i = 0; i < 2; ++i) {
     const auto j = lane_id + i * 32;
-    local_items[i] = src_value_ptr[j];
+    local_items[i] = load_item_word<LoadPolicy>(src_value_ptr + j);
   }
 
   if (lane_id < 8) {  // handle the tail element safely
@@ -63,7 +87,7 @@ SGL_DEVICE void transfer_item(void* dst_cache, void* src_cache, const int32_t ds
     tail_dst_ptr = dst_scale_ptr;
   }
 
-  const auto tail_item = *tail_src_ptr;
+  const auto tail_item = load_item_word<LoadPolicy>(tail_src_ptr);
 
   // store first 512 bytes of value
   for (int i = 0; i < 2; ++i) {

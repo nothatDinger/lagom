@@ -255,7 +255,7 @@ def test_nvml_matches_uuid_rather_than_assuming_cuda_is_physical_index(
     assert not sample["errors"]
 
 
-def captured_pair_fixture(device_source_control=False):
+def captured_pair_fixture(device_source_control=False, copy_load_policy_control=False):
     report = dict(
         success=True,
         profile_success=False,
@@ -266,6 +266,7 @@ def captured_pair_fixture(device_source_control=False):
             devices=[0, 1],
             bulk_ce_mib=1,
             device_source_control=device_source_control,
+            copy_load_policy_control=copy_load_policy_control,
         ),
         devices={},
         waves=[],
@@ -331,6 +332,23 @@ def test_local_gpu_source_keeps_sm_activity_and_is_not_reported_as_h2d():
     assert text.count("source=device h2d_bytes_per_copy=0") == 4
     report["profile_waves"] = [
         w for w in report["profile_waves"] if w["method"] != "sm_hbm"
+    ]
+    assert not validate_profile(report, events)
+
+
+@pytest.mark.parametrize("with_hbm,expected", [(False, 18), (True, 22)])
+def test_cache_policy_variants_require_full_coverage_and_remain_host_copies(
+    with_hbm, expected
+):
+    report, events = captured_pair_fixture(with_hbm, True)
+    assert len(expected_case_keys(report)) == expected
+    assert validate_profile(report, events)
+    assert correctness_summary(report)["complete"]
+    text = compact_report(report)
+    assert "sm_ca=explicit PTX .ca" in text and "sm_cg=explicit PTX .cg" in text
+    assert text.count("load_policy=cg source=host h2d_bytes_per_copy=1000") == 4
+    report["profile_waves"] = [
+        w for w in report["profile_waves"] if w["method"] != "sm_cg"
     ]
     assert not validate_profile(report, events)
 

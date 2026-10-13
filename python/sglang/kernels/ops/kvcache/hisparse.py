@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import functools
+import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -9,6 +11,29 @@ from sglang.kernels.jit.utils import load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+
+@functools.cache
+def _dsv4_copy_load_policy_from_env() -> str:
+    policy = os.environ.get("SGLANG_HISPARSE_DSV4_COPY_LOAD_POLICY", "legacy")
+    if policy not in ("legacy", "ca", "cg"):
+        raise ValueError(f"Invalid SGLANG_HISPARSE_DSV4_COPY_LOAD_POLICY={policy!r}")
+    logging.getLogger(__name__).info(
+        "HiSparse DSv4 planned-copy load policy: %s", policy
+    )
+    return policy
+
+
+def _resolve_copy_load_policy(policy: str | None, is_dsv4_layout: bool) -> int:
+    if policy is None:
+        policy = _dsv4_copy_load_policy_from_env() if is_dsv4_layout else "legacy"
+    if policy not in ("legacy", "ca", "cg"):
+        raise ValueError(f"Invalid planned-copy load policy: {policy!r}")
+    if policy != "legacy" and (not is_dsv4_layout or torch.version.hip is not None):
+        raise ValueError(
+            "Explicit planned-copy cache policies require NVIDIA DSv4 layout"
+        )
+    return {"legacy": 0, "ca": 1, "cg": 2}[policy]
 
 
 @functools.cache
@@ -65,14 +90,18 @@ def _jit_copy_planned_module(
     is_mla: bool,
     is_dsv4_layout: bool,
     skip_io: bool,
+    load_policy: int = 0,
 ) -> Module:
-    template_args = make_cpp_args(block_size, is_mla, is_dsv4_layout, skip_io)
+    template_args = make_cpp_args(
+        block_size, is_mla, is_dsv4_layout, skip_io, load_policy
+    )
     return load_jit(
         "sparse_copy_planned",
         block_size,
         is_mla,
         is_dsv4_layout,
         skip_io,
+        load_policy,
         cuda_files=["hisparse.cuh"],
         cuda_wrappers=[
             (
@@ -327,15 +356,19 @@ def copy_cache_planned_mla(
     block_size: int = 1024,
     is_dsv4_layout: bool = False,
     skip_io: bool = False,
+    load_policy: str | None = None,
 ) -> None:
-    """Replay a recorded miss plan (host_cache -> device_buffer) for a skip layer.
+    """Replay a miss plan for a verify window or prefetched skip layer.
 
-    IO-only, no planning; the small fixed grid keeps the SM footprint low while
-    overlapped on a side stream. The anchor's slot table stays valid (lockstep).
+    IO-only, no planning; the caller chooses the stream and owns the slot table.
+    DSv4 ``load_policy=None`` uses SGLANG_HISPARSE_DSV4_COPY_LOAD_POLICY, resolved
+    once per process (default: legacy). Explicit legacy/ca/cg overrides that value.
+    Restart the process and recapture CUDA graphs when changing the environment.
     """
     assert miss_src.dtype == torch.int64 and miss_dst.dtype == torch.int32
     assert miss_count.dtype == torch.int32
-    module = _jit_copy_planned_module(block_size, True, is_dsv4_layout, skip_io)
+    policy = _resolve_copy_load_policy(load_policy, is_dsv4_layout)
+    module = _jit_copy_planned_module(block_size, True, is_dsv4_layout, skip_io, policy)
     empty = torch.empty(0)
     module.copy_cache_planned(
         miss_src,
