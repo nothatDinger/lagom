@@ -33,13 +33,40 @@ CANDIDATES = (
 
 
 def read_target(text):
-    header, rows = None, []
+    header, units, layout, rows = None, None, None, []
+    layouts = set()
     columns = {"ID", "Kernel Name", "Metric Name", "Metric Unit", "Metric Value"}
     for fields in csv.reader(io.StringIO(text)):
         if columns.issubset(fields):
-            header = fields
+            header, units, layout = fields, None, "long"
+        elif {"ID", "Kernel Name"}.issubset(fields) and any(
+            name in fields for name in REQUIRED
+        ):
+            # --page raw --csv may use one metric per column with a separate
+            # units row. Keep names/units; do not assume numeric column offsets.
+            header, units, layout = fields, None, "wide"
         elif header is not None and len(fields) == len(header):
-            rows.append(dict(zip(header, fields)))
+            row = dict(zip(header, fields))
+            layouts.add(layout)
+            if layout == "long":
+                rows.append(row)
+            elif not row["ID"] and not row["Kernel Name"] and units is None:
+                units = row
+            else:
+                if units is None:
+                    raise ValueError("NCU wide CSV has no units row")
+                for metric in REQUIRED:
+                    if metric in row:
+                        rows.append(
+                            dict(
+                                row,
+                                **{
+                                    "Metric Name": metric,
+                                    "Metric Unit": units[metric],
+                                    "Metric Value": row[metric],
+                                },
+                            )
+                        )
     if not rows:
         raise ValueError("No NCU raw metric rows with the required CSV columns")
     if any(not row["ID"] for row in rows):
@@ -78,7 +105,10 @@ def read_target(text):
     ):
         raise ValueError("Expected the unchanged CTA4/1024 gather launch")
     return dict(
-        identity=next(iter(identities)), kernel=next(iter(names)), metrics=metrics
+        identity=next(iter(identities)),
+        kernel=next(iter(names)),
+        metrics=metrics,
+        csv_layout=sorted(layouts),
     )
 
 
@@ -138,7 +168,10 @@ def main():
         )
         print("PAIR " + json.dumps(correct))
         print("DEVICES " + json.dumps(devices))
-        print("TARGET " + json.dumps({k: target[k] for k in ("identity", "kernel")}))
+        print(
+            "TARGET "
+            + json.dumps({k: target[k] for k in ("identity", "kernel", "csv_layout")})
+        )
         for name, value in target["metrics"].items():
             print(f"METRIC {name} {value['value']} {value['unit']}")
         for state, names in availability.items():

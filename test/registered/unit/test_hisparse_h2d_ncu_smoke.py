@@ -24,7 +24,9 @@ def cli():
     return module
 
 
-def raw_csv(cli, *, corrupt=None):
+def raw_csv(cli, *, corrupt=None, layout="long"):
+    if layout == "wide":
+        return wide_csv(cli, corrupt=corrupt)
     rows = [
         [
             "ID",
@@ -70,6 +72,41 @@ def raw_csv(cli, *, corrupt=None):
     return result.getvalue()
 
 
+def wide_csv(cli, *, corrupt=None):
+    rows = [
+        ["ID", "Process ID", "Kernel Name", "Device", *reversed(cli.REQUIRED)],
+        ["", "", "", "", "thread", "block", "cycle", "nsecond"],
+        [
+            "0",
+            "123",
+            "void sglang::copy_cache_planned_kernel<1024, true, true, false, 0>()",
+            "0",
+            "1024",
+            "4",
+            "1,500",
+            "10,000",
+        ],
+    ]
+    if corrupt == "missing":
+        rows = [row[:-1] for row in rows]
+    elif corrupt == "unavailable":
+        rows[2][-1] = "n/a"
+    elif corrupt == "nan":
+        rows[2][-1] = "nan"
+    elif corrupt == "second_launch":
+        rows.append(["1", *rows[2][1:]])
+    elif corrupt == "wrong_kernel":
+        rows[2][2] = "unrelated_kernel"
+    elif corrupt == "wrong_grid":
+        rows[2][5] = "8"
+    elif corrupt == "no_units":
+        rows.pop(1)
+    result = io.StringIO()
+    result.write("==PROF== Disconnected from process 123\n")
+    csv.writer(result).writerows(rows)
+    return result.getvalue()
+
+
 def pair_report():
     config = dict(
         batch=2,
@@ -104,8 +141,12 @@ def pair_report():
     )
 
 
-def test_ncu_csv_keeps_units_and_accepts_quoted_thousands_and_kernel_commas(cli):
-    target = cli.read_target(raw_csv(cli))
+@pytest.mark.parametrize("layout", ["long", "wide"])
+def test_ncu_csv_keeps_units_and_accepts_quoted_thousands_and_kernel_commas(
+    cli, layout
+):
+    target = cli.read_target(raw_csv(cli, layout=layout))
+    assert target["csv_layout"] == [layout]
     assert target["metrics"]["gpu__time_duration.sum"] == dict(
         value=10000, unit="nsecond"
     )
@@ -116,9 +157,15 @@ def test_ncu_csv_keeps_units_and_accepts_quoted_thousands_and_kernel_commas(cli)
     "corrupt",
     ["missing", "unavailable", "nan", "second_launch", "wrong_kernel", "wrong_grid"],
 )
-def test_incomplete_or_wrong_capture_cannot_pass(cli, corrupt):
+@pytest.mark.parametrize("layout", ["long", "wide"])
+def test_incomplete_or_wrong_capture_cannot_pass(cli, corrupt, layout):
     with pytest.raises(ValueError):
-        cli.read_target(raw_csv(cli, corrupt=corrupt))
+        cli.read_target(raw_csv(cli, corrupt=corrupt, layout=layout))
+
+
+def test_wide_csv_cannot_guess_missing_units(cli):
+    with pytest.raises(ValueError, match="no units row"):
+        cli.read_target(wide_csv(cli, corrupt="no_units"))
 
 
 def test_missing_copy_and_torch_profiler_fail_pair_gate(cli):
@@ -139,11 +186,12 @@ def test_metric_availability_does_not_infer_suffixes(cli):
     assert not cli.metric_availability(name.removesuffix(".sum"))["available"]
 
 
-def test_offline_cli_reports_compact_gate(tmp_path, monkeypatch, capsys, cli):
+@pytest.mark.parametrize("layout", ["long", "wide"])
+def test_offline_cli_reports_compact_gate(tmp_path, monkeypatch, capsys, cli, layout):
     pair = tmp_path / "pair.json"
     pair.write_text(json.dumps(pair_report()))
     raw = tmp_path / "raw.csv"
-    raw.write_text(raw_csv(cli))
+    raw.write_text(raw_csv(cli, layout=layout))
     monkeypatch.setattr(
         sys, "argv", ["summary", "--pair-json", str(pair), "--ncu-csv", str(raw)]
     )
@@ -156,7 +204,7 @@ def test_offline_cli_reports_compact_gate(tmp_path, monkeypatch, capsys, cli):
     )
     assert isolated.returncode == 0, isolated.stderr + isolated.stdout
     assert "compatibility_ok=True" in isolated.stdout
-    raw.write_text(raw_csv(cli, corrupt="unavailable"))
+    raw.write_text(raw_csv(cli, corrupt="unavailable", layout=layout))
     assert cli.main() == 1
     result = capsys.readouterr().out
     assert "compatibility_ok=False" in result and "compatibility_ok=True" not in result
