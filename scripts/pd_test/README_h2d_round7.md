@@ -6,7 +6,8 @@ NUMA1、原生 venv；生产默认仍为 legacy。先 smoke，再一个正式对
 **当前进度：smoke/main 全部门禁通过；§6 的大载荷原字段已核对，计时自洽，旧简表的
 event 列已更正。大载荷 host activity 降低 5.69% / 3.25%，卡间比值从 1.358 变为
 1.393；正常驻留小载荷此前报告改善不足 1%。本轮不推进排序进入生产。
-下一步执行 §7 的只读 PCIe 配置检查，不增加 GPU 重跑。**
+§7 的检查已完成：root 的 10BitTagReq 启用位存在差异，尚不能据此归因。
+下一步参见 [第八轮依赖读诊断](README_h2d_round8.md)。**
 
 ## 1. 本轮依据与问题
 
@@ -281,3 +282,8 @@ rg '^[0-9a-fA-F]{4}:|DevCap|DevCtl|MaxPayload|MaxReadReq|ExtTag|10BitTag|ATSCap|
 配置差异本身不是因果证明，MRRS/Tag 能力也不等于实际 SM 事务大小或实测在途深度。
 上游端口自己的 DevCtl 参数也不能直接当作 GPU endpoint 的生效请求参数。
 若可见配置一致，下一轮再隔离 host SM 读请求延迟和并行度；目前不增加 GPU 重跑。
+
+检查结果已收到：GPU4/GPU5 endpoint 与 switch 的上述字段相同；root 的能力位相同，
+但 `DevCtl2 10BitTagReq` 在 95:01.0 为 `+`，b5:01.0 为 `-`。
+因此不能总结成“所有静态配置相同”，也不能将 root 的 requester 启用位直接当成
+GPU 的读请求 Tag 数。字段解释、报告比值更正及下一轮实验见第八轮 README §1–2。
