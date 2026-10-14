@@ -12,7 +12,6 @@ import time
 from pathlib import Path
 
 from bench_h2d_copy import capture_wave, validate_sm
-
 from sglang.benchmark.hisparse_h2d_diagnostics import (
     ITEM_BYTES,
     PAGE_BYTES,
@@ -26,6 +25,7 @@ from sglang.benchmark.hisparse_h2d_pair import (
     compact_report,
     copy_methods,
     pci_path,
+    source_kind,
     validate_profile,
 )
 
@@ -130,6 +130,56 @@ def make_plan(torch, args, geometry, case_index, misses):
     )
 
 
+def bank_destination_plan(plan):
+    """Give both orders equally sized per-bank destination arrays."""
+    return dict(
+        plan,
+        dst=plan["dst"].unsqueeze(0).expand(plan["src"].shape[0], -1, -1).clone(),
+    )
+
+
+def order_source_plan(torch, plan, misses):
+    """Sort each bank globally, carrying absolute destinations with sources.
+
+    The kernel consumes absolute destination slots, not request-relative ones.
+    Sorting may move a pair to another request row but keeps miss counts fixed.
+    Check the complete source-to-destination mapping independently by destination.
+    """
+    active = plan["active_src"]
+    if active.ndim != 3 or active.shape[2] != misses or plan["dst"].ndim != 2:
+        raise ValueError("Source ordering requires the original uniform bank plan")
+    banks, batch, _ = active.shape
+    flat_src = active.reshape(banks, -1)
+    flat_dst = plan["dst"][:, :misses].reshape(1, -1).expand(banks, -1)
+    if flat_dst[0].unique().numel() != flat_dst.shape[1]:
+        raise ValueError("Source ordering requires unique destination slots")
+    sorted_src, order = flat_src.sort(dim=1)
+    sorted_dst = flat_dst.gather(1, order)
+    # Independent of the source-sort permutation: destinations identify pairs.
+    original_dst, original_order = flat_dst.sort(dim=1)
+    actual_dst, actual_order = sorted_dst.sort(dim=1)
+    if not torch.equal(original_dst, actual_dst) or not torch.equal(
+        flat_src.gather(1, original_order), sorted_src.gather(1, actual_order)
+    ):
+        raise ValueError("Source ordering changed the source/destination mapping")
+    src = plan["src"].clone()
+    src[:, :, :misses] = sorted_src.reshape(banks, batch, misses)
+    dst = plan["dst"].unsqueeze(0).expand(banks, -1, -1).clone()
+    dst[:, :, :misses] = sorted_dst.reshape(banks, batch, misses)
+    return dict(
+        src=src,
+        active_src=src[:, :, :misses],
+        dst=dst,
+        destination_pages=plan["destination_pages"],
+        ordering_check=dict(
+            all_banks_checked=True,
+            pairs_preserved=True,
+            entries_per_bank=flat_src.shape[1],
+            banks=banks,
+        ),
+    )
+
+
 class CopyCase:
     def __init__(
         self,
@@ -145,18 +195,19 @@ class CopyCase:
         misses=None,
         device_source=None,
         shared_sm=None,
+        oracle_plan=None,
     ):
         self.device, self.label, self.method = device, label, method
         self.nbytes, self.banks = nbytes, banks
         self.host = host
-        self.source_kind = "device" if method == "sm_hbm" else "host"
+        self.source_kind = source_kind(method)
         self.functions = []
         with torch.cuda.device(device):
             if method in SM_LOAD_POLICIES:
                 from sglang.kernels.ops.kvcache.hisparse import copy_cache_planned_mla
 
                 source = host
-                if method == "sm_hbm":
+                if self.source_kind == "device":
                     if (
                         device_source is None
                         or device_source.device != torch.device("cuda", device)
@@ -181,10 +232,15 @@ class CopyCase:
                         raise ValueError(
                             "SM variant requires the matching host-SM case"
                         )
-                    # Reuse exact GPU plan, counts and destination allocations.
-                    # Only source / source load policy differ; graphs run sequentially.
+                    # Share counts and destination allocation. HBM/cache variants
+                    # also share GPU plans; ordered SM replaces only paired plans.
                     src = shared_sm.plan_src
                     kwargs = dict(shared_sm.sm_kwargs, host_cache=source)
+                    if method == "sm_ordered":
+                        # Counts, source allocation and destination buffer stay
+                        # identical to random SM; only the paired plan order changes.
+                        src = plan["src"].to(device="cuda")
+                        kwargs["miss_dst"] = plan["dst"].to(device="cuda")
                 else:
                     src = plan["src"].to(device="cuda")
                     kwargs = dict(
@@ -209,20 +265,28 @@ class CopyCase:
                 kwargs["load_policy"] = SM_LOAD_POLICIES[method]
                 self.plan_src, self.sm_kwargs = src, kwargs
                 output = kwargs["device_buffer"]
+                dst = kwargs["miss_dst"]
+                copy_kwargs = {k: v for k, v in kwargs.items() if k != "miss_dst"}
                 self.functions = [
                     lambda bank=bank: copy_cache_planned_mla(
-                        miss_src=src[bank], **kwargs
+                        miss_src=src[bank],
+                        miss_dst=dst[bank] if dst.ndim == 3 else dst,
+                        **copy_kwargs,
                     )
                     for bank in range(banks)
                 ]
 
                 def validate(bank):
+                    # Ordered variants must produce the ORIGINAL mapping, not
+                    # an oracle derived from the possibly faulty ordered plan.
+                    reference = oracle_plan if oracle_plan is not None else plan
                     validate_sm(
                         torch,
                         host,
                         output,
-                        plan["active_src"][bank],
-                        plan["dst"][:, :misses],
+                        reference["active_src"][bank],
+                        reference["dst"][:, :misses],
+                        check_untouched=getattr(args, "source_order_control", False),
                     )
 
             elif method == "ce":
@@ -361,6 +425,11 @@ def main():
     )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument(
+        "--source-order-control",
+        action="store_true",
+        help="Sort the SAME source/destination pairs by source address outside timing",
+    )
+    parser.add_argument(
         "--copy-load-policy-control",
         action="store_true",
         help="Compare legacy, explicit .ca and .cg source loads with shared plans and destination",
@@ -400,7 +469,6 @@ def main():
         parser.error("Use a new output directory; existing results are not replaced")
 
     import torch
-
     from sglang.srt.mem_cache.pool_host.common import (
         HostTensorAllocator,
         _cuda_host_unregister,
@@ -473,7 +541,17 @@ def main():
         for case_index, (misses, geometry) in enumerate(zip(args.misses, geometries)):
             plan = make_plan(torch, args, geometry, case_index, misses)
             label = f"B{args.batch}-miss{misses}"
+            ordered_plan = None
+            base_plan = plan
+            if args.source_order_control:
+                ordered_plan = order_source_plan(torch, plan, misses)
+                base_plan = bank_destination_plan(plan)
+                report.setdefault("ordered_plans", []).append(
+                    dict(case=label, **ordered_plan["ordering_check"])
+                )
             for method in methods:
+                ordered = method in ("sm_ordered", "sm_hbm_ordered")
+                anchor = "sm_ordered" if method == "sm_hbm_ordered" else "sm"
                 cases[(label, method)] = {
                     device: CopyCase(
                         torch,
@@ -484,10 +562,11 @@ def main():
                         geometry["payload_bytes"],
                         geometry["banks"],
                         args,
-                        plan,
+                        ordered_plan if ordered else base_plan,
                         misses,
                         device_sources.get(device),
-                        cases.get((label, "sm"), {}).get(device),
+                        cases.get((label, anchor), {}).get(device),
+                        plan,
                     )
                     for device in args.devices
                 }
@@ -509,6 +588,9 @@ def main():
                         verified_banks=case.verified_banks,
                         all_payload_bytes_checked=True,
                         graph_replay_checked=case.graph_verified,
+                        untouched_bytes_checked=(
+                            args.source_order_control and method in SM_LOAD_POLICIES
+                        ),
                     )
                 )
         warmers = {device: Warmer(torch, device) for device in args.devices}

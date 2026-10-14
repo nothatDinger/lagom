@@ -6,15 +6,30 @@ import statistics
 from collections import Counter, defaultdict
 from pathlib import Path
 
-SM_LOAD_POLICIES = {"sm": "legacy", "sm_ca": "ca", "sm_cg": "cg", "sm_hbm": "legacy"}
+SM_LOAD_POLICIES = {
+    "sm": "legacy",
+    "sm_ca": "ca",
+    "sm_cg": "cg",
+    "sm_hbm": "legacy",
+    "sm_ordered": "legacy",
+    "sm_hbm_ordered": "legacy",
+}
+
+
+def source_kind(method):
+    return "device" if method in ("sm_hbm", "sm_hbm_ordered") else "host"
 
 
 def copy_methods(config):
     methods = ["sm"]
     if config.get("copy_load_policy_control", False):
         methods.extend(("sm_ca", "sm_cg"))
+    if config.get("source_order_control", False):
+        methods.append("sm_ordered")
     if config.get("device_source_control", False):
         methods.append("sm_hbm")
+        if config.get("source_order_control", False):
+            methods.append("sm_hbm_ordered")
     return (*methods, "ce")
 
 
@@ -201,13 +216,31 @@ def correctness_summary(report):
     expected = expected_case_keys(report)
     payload = sum(r.get("all_payload_bytes_checked") is True for r in rows)
     replay = sum(r.get("graph_replay_checked") is True for r in rows)
+    guarded = (
+        [r for r in rows if r["method"] in SM_LOAD_POLICIES]
+        if report["config"].get("source_order_control", False)
+        else []
+    )
+    guard_expected = (
+        sum(method in SM_LOAD_POLICIES for _, method, _ in expected)
+        if report["config"].get("source_order_control", False)
+        else 0
+    )
+    guard_checked = sum(r.get("untouched_bytes_checked") is True for r in guarded)
     coverage = len(keys) == len(expected) and set(keys) == expected
     return dict(
         expected=len(expected),
         records=len(rows),
         payload_checked=payload,
         graph_replay_checked=replay,
-        complete=bool(expected) and coverage and payload == replay == len(expected),
+        untouched_expected=guard_expected,
+        untouched_checked=guard_checked,
+        complete=(
+            bool(expected)
+            and coverage
+            and payload == replay == len(expected)
+            and guard_checked == guard_expected
+        ),
     )
 
 
@@ -270,6 +303,10 @@ def compact_report(report):
             f'graph_replay_checked={check["graph_replay_checked"]}/{check["expected"]} '
             f'complete={check["complete"]} (independent of profile_success)'
         )
+        if check["untouched_expected"]:
+            lines.append(
+                f'UNTOUCHED_SM checked={check["untouched_checked"]}/{check["untouched_expected"]}'
+            )
     if "profile_validation" in report:
         lines.append(f'PROFILE_COVERAGE {report["profile_validation"]}')
     if "reanalysis" in report:
@@ -306,10 +343,17 @@ def compact_report(report):
         )
     if report["config"].get("device_source_control", False):
         lines.append(
-            "sm_hbm: SAME kernel from local GPU memory; reported GB/s is logical payload throughput, NOT H2D. "
+            "sm_hbm / sm_hbm_ordered: SAME kernel from local GPU memory; reported GB/s is logical payload throughput, NOT H2D. "
             "Its timed copies have h2d_bytes_per_copy=0; setup copies are outside timing."
         )
         lines.append(f'DEVICE_SOURCES {report.get("device_sources", [])}')
+    if report["config"].get("source_order_control", False):
+        lines.append(
+            "SOURCE_ORDER sm/sm_hbm=random; sm_ordered/sm_hbm_ordered=ascending source indices per bank. "
+            "All source/destination pairs and counts are preserved; ordering also changes destination issue order. "
+            "Sorting is outside timing; this is a mechanism control, not a production speedup."
+        )
+        lines.append(f'ORDERED_PLANS {report.get("ordered_plans", [])}')
     groups = defaultdict(lambda: defaultdict(list))
     for wave in report.get("waves", []):
         groups[(wave["phase"], wave["case"], wave["method"])][wave["device"]].append(
@@ -354,8 +398,8 @@ def compact_report(report):
                 f'PROFILE {wave["case"]} {wave["method"]} d{wave["device"]} n={check["activities"]} '
                 f'phase={wave.get("phase", "unknown")} '
                 f'load_policy={SM_LOAD_POLICIES.get(wave["method"], "CE")} '
-                f'source={"device" if wave["method"] == "sm_hbm" else "host"} '
-                f'h2d_bytes_per_copy={0 if wave["method"] == "sm_hbm" else wave["payload_bytes"]} '
+                f'source={source_kind(wave["method"])} '
+                f'h2d_bytes_per_copy={0 if source_kind(wave["method"]) == "device" else wave["payload_bytes"]} '
                 f'event/activity_GBps={check["event_GBps"]:.2f}/{check["activity_GBps"]:.2f} '
                 f'event_time/activity_time={check["event_over_activity"]:.3f} '
                 f"mean_event/activity_us={event_mean:.2f}/{activity_mean:.2f} "

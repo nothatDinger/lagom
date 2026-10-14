@@ -38,9 +38,12 @@ def gpu_inventory():
         return dict(error=str(exc))
 
 
-def validate_sm(torch, host, device, source, destination=None):
+def validate_sm(
+    torch, host, device, source, destination=None, *, check_untouched=False
+):
     """Check every value and scale byte of a bank, using an independent CPU gather."""
     actual = device.cpu().view(-1)
+    expected_all = torch.zeros_like(actual) if check_untouched else None
     flat = host.view(-1)
     source = source.reshape(-1).cpu()
     destination = (
@@ -70,6 +73,11 @@ def validate_sm(torch, host, device, source, destination=None):
             raise RuntimeError(f"DSv4 value mismatch at chunk {begin}")
         if not torch.equal(actual[dsaddr + torch.arange(8)], expected_s):
             raise RuntimeError(f"DSv4 scale mismatch at chunk {begin}")
+        if expected_all is not None:
+            expected_all[dvaddr + torch.arange(VALUE_BYTES)] = expected_v
+            expected_all[dsaddr + torch.arange(8)] = expected_s
+    if expected_all is not None and not torch.equal(actual, expected_all):
+        raise RuntimeError("DSv4 copy modified untouched slots or page padding")
 
 
 def capture_wave(torch, functions, *, stream=None):
@@ -208,7 +216,6 @@ def main():
 
     import torch
     import torch.distributed as dist
-
     from sglang.kernels.ops.kvcache.hisparse import copy_cache_planned_mla
     from sglang.srt.mem_cache.pool_host.common import (
         HostTensorAllocator,

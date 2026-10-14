@@ -8,9 +8,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from sglang.benchmark.hisparse_h2d_diagnostics import copy_geometry
 from sglang.benchmark.hisparse_h2d_pair import (
+    SM_LOAD_POLICIES,
     abba_order,
     activity_check,
     compact_report,
@@ -216,6 +216,100 @@ def test_shared_plan_uses_one_frozen_source_and_valid_request_destinations(pair_
     assert plan["destination_pages"] == 6
 
 
+def test_source_order_preserves_all_pairs_banks_strides_and_input(pair_cli):
+    args = SimpleNamespace(seed=3, batch=2, plan_stride=96, buffer_slots=96)
+    geometry = copy_geometry(2, 65, 4 * 2**20, 4)
+    plan = pair_cli.make_plan(torch, args, geometry, 0, 65)
+    original = copy.deepcopy(plan)
+    ordered = pair_cli.order_source_plan(torch, plan, 65)
+    random_banked = pair_cli.bank_destination_plan(plan)
+    assert random_banked["src"].shape == ordered["src"].shape
+    assert random_banked["dst"].shape == ordered["dst"].shape
+    assert random_banked["dst"].stride() == ordered["dst"].stride()
+    assert torch.equal(random_banked["dst"], plan["dst"].unsqueeze(0).expand(4, -1, -1))
+    assert ordered["src"].stride(-2) == ordered["dst"].stride(-2) == 96
+    assert ordered["destination_pages"] == plan["destination_pages"]
+    assert ordered["ordering_check"]["all_banks_checked"]
+    for bank in range(4):
+        before = dict(
+            zip(
+                plan["dst"][:, :65].flatten().tolist(),
+                plan["active_src"][bank].flatten().tolist(),
+            )
+        )
+        after = dict(
+            zip(
+                ordered["dst"][bank, :, :65].flatten().tolist(),
+                ordered["active_src"][bank].flatten().tolist(),
+            )
+        )
+        assert len(before) == len(after) == 130
+        assert before == after
+        sources = ordered["active_src"][bank].flatten().tolist()
+        assert sources == sorted(sources)
+        assert torch.equal(ordered["src"][bank, :, 65:], plan["src"][bank, :, 65:])
+        assert torch.equal(ordered["dst"][bank, :, 65:], plan["dst"][:, 65:])
+    for key in ("src", "dst", "active_src"):
+        assert torch.equal(original[key], plan[key])
+
+
+def test_ordered_plan_matches_original_byte_oracle_and_rejects_padding(pair_cli):
+    # Exercise page boundaries and non-contiguous rows without CUDA. Build
+    # physical output independently with Python slices, not tensor gather.
+    args = SimpleNamespace(seed=0, batch=2, plan_stride=96, buffer_slots=96)
+    geometry = copy_geometry(2, 65, 2 * 2**20, 2)
+    plan = pair_cli.make_plan(torch, args, geometry, 0, 65)
+    ordered = pair_cli.order_source_plan(torch, plan, 65)
+    host = torch.randint(0, 256, (geometry["host_pages"], 37440), dtype=torch.uint8)
+    flat_host = host.flatten()
+
+    def physical_copy(sources, destinations):
+        output = torch.zeros((plan["destination_pages"], 37440), dtype=torch.uint8)
+        flat = output.flatten()
+        for source, dest in zip(
+            sources.flatten().tolist(), destinations.flatten().tolist()
+        ):
+            sp, so = divmod(source, 64)
+            dp, do = divmod(dest, 64)
+            for length, sa, da in [
+                (576, sp * 37440 + so * 576, dp * 37440 + do * 576),
+                (8, sp * 37440 + 36864 + so * 8, dp * 37440 + 36864 + do * 8),
+            ]:
+                flat[da : da + length] = flat_host[sa : sa + length]
+        return output
+
+    for bank in range(2):
+        expected = physical_copy(plan["active_src"][bank], plan["dst"][:, :65])
+        actual = physical_copy(
+            ordered["active_src"][bank], ordered["dst"][bank, :, :65]
+        )
+        assert torch.equal(actual, expected)
+        pair_cli.validate_sm(
+            torch,
+            host,
+            actual,
+            plan["active_src"][bank],
+            plan["dst"][:, :65],
+            check_untouched=True,
+        )
+        # Sorting only sources must fail against the ORIGINAL mapping oracle.
+        wrong = physical_copy(ordered["active_src"][bank], plan["dst"][:, :65])
+        with pytest.raises(RuntimeError, match="value mismatch"):
+            pair_cli.validate_sm(
+                torch, host, wrong, plan["active_src"][bank], plan["dst"][:, :65]
+            )
+        actual.flatten()[-1] = 123
+        with pytest.raises(RuntimeError, match="untouched slots or page padding"):
+            pair_cli.validate_sm(
+                torch,
+                host,
+                actual,
+                plan["active_src"][bank],
+                plan["dst"][:, :65],
+                check_untouched=True,
+            )
+
+
 def test_nvml_matches_uuid_rather_than_assuming_cuda_is_physical_index(
     pair_cli, monkeypatch
 ):
@@ -255,7 +349,11 @@ def test_nvml_matches_uuid_rather_than_assuming_cuda_is_physical_index(
     assert not sample["errors"]
 
 
-def captured_pair_fixture(device_source_control=False, copy_load_policy_control=False):
+def captured_pair_fixture(
+    device_source_control=False,
+    copy_load_policy_control=False,
+    source_order_control=False,
+):
     report = dict(
         success=True,
         profile_success=False,
@@ -267,6 +365,7 @@ def captured_pair_fixture(device_source_control=False, copy_load_policy_control=
             bulk_ce_mib=1,
             device_source_control=device_source_control,
             copy_load_policy_control=copy_load_policy_control,
+            source_order_control=source_order_control,
         ),
         devices={},
         waves=[],
@@ -313,6 +412,8 @@ def captured_pair_fixture(device_source_control=False, copy_load_policy_control=
                 device=device,
                 all_payload_bytes_checked=True,
                 graph_replay_checked=True,
+                untouched_bytes_checked=source_order_control
+                and method in SM_LOAD_POLICIES,
             )
         )
     return report, trace
@@ -349,6 +450,31 @@ def test_cache_policy_variants_require_full_coverage_and_remain_host_copies(
     assert text.count("load_policy=cg source=host h2d_bytes_per_copy=1000") == 4
     report["profile_waves"] = [
         w for w in report["profile_waves"] if w["method"] != "sm_cg"
+    ]
+    assert not validate_profile(report, events)
+
+
+@pytest.mark.parametrize("with_hbm,expected", [(False, 14), (True, 22)])
+def test_ordered_variants_require_full_activity_coverage_and_hbm_is_not_h2d(
+    with_hbm, expected
+):
+    report, events = captured_pair_fixture(with_hbm, source_order_control=True)
+    assert len(expected_case_keys(report)) == expected
+    assert validate_profile(report, events)
+    assert correctness_summary(report)["complete"]
+    text = compact_report(report)
+    assert "All source/destination pairs and counts are preserved" in text
+    assert text.count("source=device h2d_bytes_per_copy=0") == (8 if with_hbm else 0)
+    assert text.count("PROFILE B2-miss2 sm_ordered") == 2
+    assert (
+        f"UNTOUCHED_SM checked={16 if with_hbm else 8}/{16 if with_hbm else 8}" in text
+    )
+    next(r for r in report["correctness"] if r["method"] == "sm_ordered")[
+        "untouched_bytes_checked"
+    ] = False
+    assert not correctness_summary(report)["complete"]
+    report["profile_waves"] = [
+        w for w in report["profile_waves"] if w["method"] != "sm_ordered"
     ]
     assert not validate_profile(report, events)
 
@@ -427,3 +553,7 @@ def test_offline_cli_needs_no_site_packages_and_preserves_originals(
     rerun = subprocess.run(command, capture_output=True, text=True)
     assert rerun.returncode != 0
     assert (output / "pair-reanalyzed.json").read_bytes() == saved
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
