@@ -187,3 +187,6 @@ CPU gather、额外写入及后续 H2D；目标小载荷本次只节省8.99/13.4
 但不能据此推断整个 kernel 只有一笔在途读取。小 grid 的源码注释明确写出
 减少 SM 占用、与 side-stream compute 重叠的意图；它不证明原场景已经有足够带宽，
 也没有给出23 GB/s这种数值限额。当前尚未证明在途请求不足是剩余差距的根因。
+
+后续已完成[跨KV依赖与预取空间分析](README_h2d_prefetch_analysis.md)：
+源码、旧SASS及CPU遍历核对支持跨request两项暂存候选，尚无该候选的GPU性能结果。
