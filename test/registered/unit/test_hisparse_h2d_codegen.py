@@ -40,21 +40,31 @@ def test_manifest_selects_mapped_library_not_newest_cache_entry(tmp_path):
         loaded_copy_artifacts(maps + "\n" + libraries(second))
 
 
-def sass_fixture():
-    return """arch = sm_90a
-Function : void sglang::copy_cache_planned_kernel<1024, true, true, false, 4>()
-/*0010*/ @!P0 LDG.E.128 R4, [R2.64] ; /* 0x00000000 */
-/*0020*/ LDG.E.64 R8, [R12.64] ; /* 0x00000000 */
+def sass_fixture(demangled=False):
+    name = (
+        "void sglang::copy_cache_planned_kernel<1024, true, true, false, 4>()"
+        if demangled
+        else "_Z25copy_cache_planned_kernelILi1024ELb1ELb1ELb0ELi4EEvv"
+    )
+    return f"""arch = sm_90a
+Function : {name}
+/*0010*/ @!P0 LDG.E.128.STRONG.SM R4, [R2.64] ; /* 0x00000000 */
+/*0020*/ LDG.E.64.STRONG.SM R8, [R12.64] ; /* 0x00000000 */
 /*0030*/ STG.E.64 [R6.64], R8 ; /* 0x00000000 */
 Function : unrelated()
 /*0010*/ LDG.E.128 R4, [R2.64] ; /* 0x00000000 */
 """
 
 
-def test_sass_counts_only_copy_kernel_and_preserves_memory_instructions():
-    kernels = kernel_memory_ops(sass_fixture())
+@pytest.mark.parametrize("demangled", [False, True])
+def test_sass_counts_only_copy_kernel_and_preserves_memory_instructions(demangled):
+    kernels = kernel_memory_ops(sass_fixture(demangled))
     assert len(kernels) == 1 and kernels[0]["arch"] == "sm_90a"
-    assert kernels[0]["opcodes"] == {"LDG.E.128": 1, "LDG.E.64": 1, "STG.E.64": 1}
+    assert kernels[0]["opcodes"] == {
+        "LDG.E.128.STRONG.SM": 1,
+        "LDG.E.64.STRONG.SM": 1,
+        "STG.E.64": 1,
+    }
     assert len(kernels[0]["memory_ops"]) == 3
     with pytest.raises(ValueError):
         kernel_memory_ops("No device code")
@@ -79,6 +89,11 @@ def test_offline_dump_hash_checks_before_running_cuobjdump(tmp_path, monkeypatch
         calls.append(command)
         if command[-1] == "--version":
             return SimpleNamespace(stdout="test version")
+        # CUDA 12.6/13.0 cuobjdump rejects --demangle. Exercise the CLI with
+        # only the supported dump option and an actual manifest library path.
+        assert len(command) == 3
+        assert command[1] in ("--dump-sass", "--dump-resource-usage")
+        assert command[2] in {artifact["path"] for artifact in artifacts}
         kwargs["stdout"].write(
             sass_fixture() if "--dump-sass" in command else "REG: 32"
         )

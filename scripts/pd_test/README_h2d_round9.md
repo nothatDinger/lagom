@@ -2,7 +2,7 @@
 
 分支 `perf/hisparse-h2d-diagnosis`，基于 hash_verify。目标仍是正常驻留 B32/W6 的
 decode H2D 和服务吞吐；物理 GPU4/5、NUMA1、原生 venv。
-本次先完成 §3 正确性、paired smoke 和离线 SASS 提取，再返回短报告；暂不跑 §4。
+§3 实机门禁已通过，当前进入 §4 的一个正式块；不必重复单测、smoke 或 SASS 提取。
 
 ## 1. 依据与待检验问题
 
@@ -50,7 +50,28 @@ HBM 的每次 H2D bytes 为 0，其 GB/s 仅为逻辑载荷处理率。CE 及 bu
 向量读取要求 16B 对齐：mmap/CUDA allocation 的源基址先检查，page stride37440、
 value stride576 和 lane offset16 都是 16B 的倍数；scale 仍是标量读取。
 
-## 3. 当前只执行本节
+## 3. 正确性、paired smoke 与 SASS（已完成，命令留作复现）
+
+2026-10-14 实机反馈：单测 **10 passed / 0 skipped**；smoke 的 correctness、graph、
+profile **38/38**，未触碰字节检查 **32/32**，身份 GPU4/5、host node1、Portable=1。
+实际加载库离线提取 **4/4**。两处 harness 兼容性修复已核对：Git ownership 检查失败
+只记录 `git=None` 与 `git_error`，七个源文件 SHA 保留；cuobjdump 不传其不支持的
+`--demangle`，解析器直接识别 mangled kernel 名。没有修改 ownership/safe.directory 设置。
+
+实测 SASS 摘要（四者另有 `LDG.E.CONSTANT ×4`、`STG.E.64 ×3`）：
+
+| policy | 其余 load opcode | registers | local / shared / stack |
+|---|---|---:|---|
+| legacy | `LDG.E.64.CONSTANT ×3` | 34 | 0 / 0 / 0 |
+| ca | `LDG.E.64.STRONG.SM ×3` | 34 | 0 / 0 / 0 |
+| ca_pair | `LDG.E.64.STRONG.SM ×3` | 32 | 0 / 0 / 0 |
+| ca_v2 | `LDG.E.128.STRONG.SM ×1` + `LDG.E.64.STRONG.SM ×1` | 32 | 0 / 0 / 0 |
+
+这确认 `ca_v2` 的宽 load 落到了 SASS，且 `ca_pair/ca_v2` 寄存器总数相同。
+128-bit 是每个参与 lane 的 16B load，并非 128B PCIe 事务，也不证明请求数减半。
+opcode 直方图不包含完整指令顺序、地址计算或依赖；不能仅据此称 legacy/ca
+“只有 cache modifier 不同”，或称 `ca_pair/ca_v2` 除 load 外的二进制完全相同。
+门禁支持测量候选，尚没有正式载荷下的性能结论。
 
 在实验 worktree 更新并设置环境。GPU 单测会覆盖五种 policy × host/HBM，共十项；
 包含 eager、动态 graph replay、非连续 plan stride、跨页目的、零 miss、padded request、
@@ -107,15 +128,15 @@ smoke 只验证功能与解析，不用于判断收益。失败保留原文件�
 `LDG` 还可能读取 GPU plan，静态条数也不是动态 PCIe 请求数；需要结合地址计算识别 source load。
 保留完整文件本地，仅返回 `codegen-compact.txt`（通常约十行）。
 
-本次反馈：单测门禁、paired smoke 门禁、身份/NUMA、`CODEGEN_ARTIFACTS` 行，
-以及 codegen compact。先核对 SASS 中是否存在预期的 load 宽度差异、寄存器/本地内存变化，
-再启动 §4；不需要上传 trace 或全部 SASS。
+上述门禁与 codegen compact 已核对；完整 trace/SASS 留在实机，无需上传。
 
-## 4. 后续正式对照（当前先不执行）
+## 4. 当前执行：一个正式对照块
 
 保持已验证的 B32、miss100/1272、512 MiB pool、plan stride3072。
 这轮无 profiler 主测选 `phase=compute`，每波先做相同计算预热；profile 也为 profile_compute。
 两者仍是独立测量段，不能拿一个段的 event 减另一个段的 activity。
+本次可直接使用实机上已通过 §3、含两处 harness 修复的版本运行；无需为了文档更新先同步
+分支或重跑门禁。`vector-main` 必须是新目录。若使用新 shell，先恢复 §3 的四个环境变量。
 
 ```bash
 CUDA_VISIBLE_DEVICES=4,5 numactl --cpunodebind=1 --membind=1 \

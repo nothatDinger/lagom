@@ -46,7 +46,7 @@ def main():
                 target = args.output_dir / f"{artifact['policy']}.{kind}.txt"
                 with target.open("w") as output:
                     result = subprocess.run(
-                        [tool, option, "--demangle", artifact["path"]],
+                        [tool, option, artifact["path"]],
                         text=True,
                         stdout=output,
                         stderr=subprocess.PIPE,

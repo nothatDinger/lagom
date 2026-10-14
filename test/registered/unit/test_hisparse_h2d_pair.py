@@ -204,6 +204,40 @@ def pair_cli(monkeypatch):
     return module
 
 
+@pytest.mark.parametrize(
+    "returncode,stdout,stderr,expected_git,expected_error",
+    [
+        (0, "abc123\n", "", "abc123", None),
+        (128, "", "fatal: dubious ownership\n", None, "fatal: dubious ownership"),
+        (1, "unusable output", "", None, "git exited 1"),
+    ],
+)
+def test_vector_provenance_keeps_hashes_when_git_rejects_worktree(
+    pair_cli, monkeypatch, returncode, stdout, stderr, expected_git, expected_error
+):
+    def run(command, **kwargs):
+        assert command == ["git", "rev-parse", "HEAD"]
+        assert kwargs["check"] is False
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr(pair_cli.subprocess, "run", run)
+    code = pair_cli.vector_provenance()
+    assert code["git"] == expected_git and code["git_error"] == expected_error
+    assert len(code["sha256"]) == 7
+    assert all(len(digest) == 64 for digest in code["sha256"].values())
+
+
+def test_vector_provenance_keeps_hashes_without_git_executable(pair_cli, monkeypatch):
+    def run(*args, **kwargs):
+        raise FileNotFoundError("git unavailable")
+
+    monkeypatch.setattr(pair_cli.subprocess, "run", run)
+    code = pair_cli.vector_provenance()
+    assert code["git"] is None
+    assert code["git_error"] == "FileNotFoundError: git unavailable"
+    assert len(code["sha256"]) == 7
+
+
 def test_shared_plan_uses_one_frozen_source_and_valid_request_destinations(pair_cli):
     args = SimpleNamespace(seed=0, batch=2, plan_stride=128, buffer_slots=128)
     geometry = copy_geometry(2, 70, 4 * 2**20, 4)

@@ -402,15 +402,27 @@ def vector_provenance():
         "python/sglang/kernels/jit/csrc/hisparse.cuh",
         "python/sglang/kernels/jit/include/sgl_kernel/deepseek_v4/kvcacheio.cuh",
     ]
-    commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
+    # Git identity is optional metadata: jobs may run under a different uid.
+    # Preserve the failure without bypassing Git's ownership check; file hashes
+    # still identify the code used by this acquisition.
+    git_commit, git_error = None, None
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if commit.returncode == 0:
+            git_commit = commit.stdout.strip()
+        else:
+            git_error = commit.stderr.strip() or f"git exited {commit.returncode}"
+    except OSError as exc:
+        git_error = f"{type(exc).__name__}: {exc}"
     return dict(
-        git=commit,
+        git=git_commit,
+        git_error=git_error,
         sha256={
             name: hashlib.sha256((root / name).read_bytes()).hexdigest()
             for name in paths
