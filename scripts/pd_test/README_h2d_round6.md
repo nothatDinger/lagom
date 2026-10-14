@@ -5,8 +5,10 @@
 用既有 paired 工具检验；微基准通过后，同一个开关直接进入原始工作负载。
 分支仍为 `perf/hisparse-h2d-diagnosis`，原生 venv，不要求 Docker。
 
-**当前进度：实机 §3 已 3 passed；§4 正反序均 correctness/profile coverage 18/18。
-选择 `ca` 进入 §5 的真实服务对照，`cg` 不进入本次服务验证。无需重跑 §3–4。**
+**当前进度：§3 已 3 passed；§4 正反序均 correctness/profile coverage 18/18；
+§5 的 12 次服务测量已完成，未观察到 ca 的服务收益，继续保留 legacy。
+两次 profile 因服务过早退出而未完成。下一步只执行 §5.2 补 legacy/ca 各一次 profile，
+无需重跑正确性、微基准或 12 次吞吐测量。**
 
 ## 1. 最新 A/B 的证据边界
 
@@ -282,13 +284,106 @@ PD 场景 JSONL 的 accept_length 可能为空或来自不同统计窗口，不�
 临界路径缩短 → 原始负载吞吐或 TPOT 的重复改善**。不能把连续 CE 的 55 GB/s
 视作此随机 gather 必须达到的保证，也不能把两卡微基准的倍率直接换算为 8 卡吞吐收益。
 
+### 5.1 已收到的服务结果及结论边界
+
+`server-compact.txt` 的 12 个 workload 均通过既定 token 数校验。保留全部样本：
+
+| 指标 | legacy（6 次） | ca（6 次） | ca 相对变化 |
+|---|---:|---:|---:|
+| 各次 output tok/s 的均值 | 3707.949837 | 3673.321886 | -0.934% |
+| 各次 mean TPOT 的均值（ms） | 7.478204 | 7.506187 | +0.374% |
+| 各次 output tok/s 的中位数 | 3750.807229 | 3735.032809 | -0.421% |
+| 各次 mean TPOT 的中位数（ms） | 7.479055 | 7.498935 | +0.266% |
+
+这些是 run 级描述统计，不把四个测量块里的重复视为完全独立实验，也没有做等效性检验。
+本轮没有可见的端到端改善，不将 ca 提升为默认生产策略。
+两个低吞吐 repeat（ca-2-3、legacy-2-2）原样保留；仅凭 TTFT/TPOT 均值尚不能把原因
+确定为排队或预热，更不能排除它们与其他条件的关联。中位数同样没有显示 ca 获益。
+
+目前不能推出“copy 不在关键路径”。这条 verify copy 在代码中是同步路径，
+copy 即使位于依赖链上，也可能因占比很小、其他 rank 限制或其他耗时变化而无法表现出可测吞吐改善。
+更基础的缺口是：约 5% 的微基准收益是否在真实四 rank、实际 miss 形状和 host pool 下保留，尚未测得。
+也不能把“不保留”直接命名为 PTX 交互抵消，必须先核对载荷、布局/放置、设备及编译策略。
+
+本轮稳态 accept len 约 4.9–5.3、rate 0.77–0.88，两策略没有明显分化；
+不同于早期 C 的约 5.6，换算每提交 token 的 copy 成本时应使用本次相应窗口的 acceptance。
+此次两份 `/start_profile` 200 ACK 只证明请求已受理；服务随后约 1 秒退出，
+没有 trace/probe 完整产物，因此不把这两次记为有效 profile。
+
+### 5.2 仅补 profile：等待本次 capture 的产物完成
+
+等原 8 卡资源空闲后，按原启动命令分别跑 legacy/ca 两个 profile block。
+每种策略按同样流程预热一次，随后发起一次原 64 请求负载；不重复三次吞吐测量。
+在启动各自 decode **之前**设置（第二个 block 将 legacy 改为 ca）：
+
+```bash
+export SGLANG_PROFILE_V2=0
+export SGLANG_HISPARSE_DSV4_COPY_LOAD_POLICY=legacy
+export SGLANG_HISPARSE_H2D_PROBE_CAPACITY=16384
+export SGLANG_HISPARSE_H2D_PROBE_MAX_BATCH=1024
+```
+
+保持正常 residency、16K/4K、并发上限 32、原来的模型/DSPARK/Graph/NUMA 设置。
+确认四个 rank 策略正确，在日志里实际 B=32/W=6 已稳态且仍有足够输出 token 时，
+**以前台进程执行**下面的 collector；第二次使用全新的 `profile-only-ca-v2` 目录：
+
+```bash
+"$LAGOM_PY" scripts/pd_test/collect_h2d_profile.py \
+  --decode-url http://127.0.0.1:30000 \
+  --output-dir "$H2D_R6/profile-only-legacy-v2" --steps 64 \
+  --wait --expected-ranks 4 --timeout-seconds 600
+```
+
+等待依据来自当前 V1 exporter 的执行顺序：每个 rank 先完成 torch trace 导出，
+经过 rank 间 barrier，最后导出 `.h2d.json`，随后才打印 `Profiling done`。
+`--wait` 按**本次 profile_id**匹配 TP0–3 的文件，要求每个 rank 有非空 trace、
+可完整读取的 probe、匹配的 capture/PID/device、非空且无 overflow 的样本。
+旧日志的四条 `Profiling done`、旧 capture、半写入 JSON 和只有 HTTP ACK 都不会算成功。
+为避免每秒读取巨大 trace，等待阶段不解压 trace；完成后仍须运行现有 analyzer 验证 trace 内身份和配对。
+此等待选项限当前 V1 torch、每 TP 一个设备的未合并 profile；不要用于 nsys 或多副本合并采集。
+
+驱动的 `stop_all` 应放在 **collector 以 0 退出且本次 `capture-complete.json`
+的 `artifacts_complete=true`、四 rank 齐全之后**，并等待本次压测进程结束。
+不要因收到 ACK 或固定等待 1 秒就进入清理；也要检查 `finally`/EXIT trap 是否绕过这个条件。
+完成标记会原子写入，里面列出本次 capture_id、每 rank 的 PID/device、trace/probe 文件及样本数。
+它是产物导出的完成信号，`timing_analysis_validated=false` 明确表示尚未通过下游数据分析。
+
+超时会非零退出并保存 `capture-incomplete.json`，其中指出缺失的 rank/文件；
+不要将超时当作成功继续清理。保留服务和产物，先检查负载/日志，必要时续等：
+
+```bash
+"$LAGOM_PY" scripts/pd_test/collect_h2d_profile.py \
+  --output-dir "$H2D_R6/profile-only-legacy-v2" \
+  --wait-only --expected-ranks 4 --timeout-seconds 600
+```
+
+`--wait-only` 使用该目录已保存的请求，**不会再次 POST**。先前已经终止的失败进程
+无法靠续等补出 trace，应在新目录开始此次重跑。客户端需能看到服务写入的同一路径。
+
+完成后用首轮 analyzer 分别生成两组四 rank 的分析 JSON，再用现有紧凑工具汇总。
+保留未过滤的 B/captured/W 分布；若出现尾部 B30/31，不与 B32 混算，保留相应筛选说明。
+优先比较同 B/W、同层及相近 bytes 的 copy 时间和占主导的 1–4 MB 载荷桶。
+
+| 补采结果 | 下一步依据 |
+|---|---|
+| 四 rank 的真实 copy 都稳定更快 | 微基准收益在服务中保留；从这些已有 trace 提取完整 verify 边界、其他 kernels/等待，判断占比与抵消因素 |
+| GPU4/5 获益、GPU6/7 无改善或更慢 | 查 TP 慢 rank 的约束，不用两卡结果推广四 rank |
+| 真实 copy 没有改善 | 查实际 miss 形状、host NUMA 放置、状态和读取策略；不以端到端负结果代替 kernel 结论 |
+| 两组 B/W、载荷或放置不匹配 | 先按可比样本分析并明确限制，不直接用总 copy 时间之比归因 |
+
+一对 profile 是方向性证据，不是新一轮吞吐统计。若需更细时间线，先从本次保存的
+trace 离线提取，不先安排新的 GPU 重跑。
+
 ## 6. 本次只需反馈
 
-§3–4 已完成，不需要再反馈旧数据。下一次优先给 §5 的 `service-compact.txt`，
-每块稳态 accept len/rate，以及四 rank 策略、实际 B/W、probe=0 和无 profiler 的确认。
-待原 8 卡资源可用再执行服务对照；仅有两卡时保留现有结果，无需追加微基准来等待。
+只需 §5.2 的两次 profile 反馈，不需要再发已收到的吞吐或微基准数据：
 
-单独 profile 后，反馈 legacy/ca 两组各 rank 的紧凑 H2D 表，包含 bytes、copy 时间、
-GB/s、B/captured/W、完整 layer/cycle 数和 recorder 开销；可沿用
-`summarize_h2d_report.py --analysis-dir ... --max-layers 21`。不上传 trace 或完整服务日志。
-如果暂不能提取完整 verify 临界路径边界，明确标为未测，不用 copy 时长之和替代完整迭代。
+1. 两组 capture_id、完成的四个 rank，以及 analyzer 是否通过。
+2. 每 rank 的 bytes、copy 时间/GB/s、B/captured/W、完整 layer/cycle 数、copy ms/cycle、
+   主导 1–4 MB 桶的带宽/时间占比及 recorder 开销。可沿用
+   `summarize_h2d_report.py --analysis-dir ... --max-layers 21`，两个目录各自只放一组 capture。
+3. 对应窗口附近的 accept len/rate、physical GPU4–7 映射；probe 已记录 host_numa_snapshot，
+   如两组实际 KV pool 的 NUMA 放置不同，请标出，不把 VMA 的总页数当作某个 buffer 的独占页数。
+
+无需上传 trace 或完整服务日志。完整 verify 时间/临界路径未提取时标为未测，
+不能用每周期 copy 时长之和替代整次迭代，也不能用此推断 copy 不在临界路径。
