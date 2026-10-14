@@ -35,11 +35,65 @@ def grid(text):
         raise argparse.ArgumentTypeError("Use BxW: B in {1,4}, W in {1,4,16,32}")
 
 
+def capture_on_device(torch, functions, device):
+    """Never reuse torch.cuda.graph's process-wide default capture stream."""
+    expected = torch.device("cuda", device)
+    with torch.cuda.device(device):
+        stream = torch.cuda.Stream(device=device)
+        if stream.device != expected:
+            raise RuntimeError(
+                f"Capture stream is on {stream.device}, expected {expected}"
+            )
+
+        def checked_call(fn):
+            # Check before the custom FFI launch, not after a possible bad access.
+            if (
+                torch.cuda.current_device() != device
+                or torch.cuda.current_stream().device != expected
+            ):
+                raise RuntimeError(f"Capture launch context is not {expected}")
+            fn()
+
+        graph, events = capture_wave(
+            torch,
+            [lambda fn=fn: checked_call(fn) for fn in functions],
+            stream=stream,
+        )
+        event_devices = {str(event.device) for pair in events for event in pair}
+        if not events or event_devices != {str(expected)}:
+            raise RuntimeError(
+                f"Captured events are on {sorted(event_devices)}, expected {expected}"
+            )
+    return (
+        graph,
+        events,
+        stream,
+        dict(
+            capture_device=str(stream.device),
+            event_devices=sorted(event_devices),
+            device_checked=True,
+        ),
+    )
+
+
 class ReadCase:
     def __init__(
-        self, torch, module, source, device, plan, nodes, stride, blocks, warps, samples
+        self,
+        torch,
+        module,
+        source,
+        device,
+        plan,
+        nodes,
+        stride,
+        blocks,
+        warps,
+        samples,
+        progress,
     ):
         self.torch, self.device = torch, device
+        self.progress = progress
+        progress["stage"] = "allocate"
         self.expected = plan["expected"]
         self.total_reads = len(plan["nodes"])
         # %smid values need not be dense, so validate against PTX %nsmid below.
@@ -62,14 +116,24 @@ class ReadCase:
             )
 
         functions = [lambda out=out[1:-1]: run(out) for out in self.output]
+        progress["stage"] = "eager_launch"
         functions[0]()  # Compile and exercise eager before capture.
         torch.cuda.synchronize(device)
+        progress["stage"] = "eager_check"
         self.eager_check = self.check(first_only=True)
-        self.graph, self.events = capture_wave(torch, functions)
+        progress["eager_passed"] = True
+        progress["stage"] = "capture"
+        self.graph, self.events, self.capture_stream, self.capture_check = (
+            capture_on_device(torch, functions, device)
+        )
+        progress.update(self.capture_check)
+        progress["stage"] = "graph_replay"
         self.output.fill_(-1)
         self.graph.replay()
         torch.cuda.synchronize(device)
+        progress["stage"] = "graph_check"
         self.graph_check = self.check()
+        progress["graph_passed"] = True
 
     def check(self, *, first_only=False):
         outputs = self.output[:1] if first_only else self.output
@@ -77,17 +141,20 @@ class ReadCase:
 
     def measure(self, warmer, observer, warm_ms):
         torch = self.torch
+        self.progress["stage"] = "measure_warmup"
         warmer.run(warm_ms)
         # Warm translation state consistently; .cv still re-fetches host data.
         self.graph.replay()
         torch.cuda.synchronize(self.device)
         self.output.fill_(-1)
         before = observer.sample(self.device)
+        self.progress["stage"] = "measure_replay"
         self.graph.replay()
         self.events[-1][1].synchronize()
         after = observer.sample(self.device)
         samples = [a.elapsed_time(b) * 1000 for a, b in self.events]
         timing = time_stats(samples, self.total_reads, len(self.starts))
+        self.progress["stage"] = "measure_check"
         return dict(
             event_us=samples,
             timing=timing,
@@ -197,6 +264,7 @@ def main():
         correctness=[],
         plans=[],
         waves=[],
+        current_case=dict(stage="setup"),
         expected_correctness=len(shapes) * 2 * len(args.devices),
     )
     registered = False
@@ -233,6 +301,9 @@ def main():
                 hbm[device] = torch.empty(host.shape, dtype=host.dtype, device=device)
 
         for index, (stride, blocks, warps) in enumerate(shapes):
+            report["current_case"] = dict(
+                stride=stride, blocks=blocks, warps=warps, stage="prepare_plan"
+            )
             for device in args.devices:
                 torch.cuda.synchronize(device)  # Finish readers before modifying host.
             plan = make_chains(order, blocks * warps)
@@ -255,10 +326,26 @@ def main():
             )
             cases = {}
             for device in args.devices:
+                report["current_case"] = dict(
+                    stride=stride,
+                    blocks=blocks,
+                    warps=warps,
+                    device=device,
+                    stage="prepare_hbm_source",
+                )
                 with torch.cuda.device(device):
                     hbm[device].copy_(host)
                     torch.cuda.synchronize(device)
                     for source in ("host", "hbm"):
+                        progress = dict(
+                            stride=stride,
+                            blocks=blocks,
+                            warps=warps,
+                            source=source,
+                            device=device,
+                            stage="construct",
+                        )
+                        report["current_case"] = progress
                         case = ReadCase(
                             torch,
                             module,
@@ -270,6 +357,7 @@ def main():
                             blocks,
                             warps,
                             args.samples,
+                            progress,
                         )
                         cases[source, device] = case
                         report["correctness"].append(
@@ -281,13 +369,17 @@ def main():
                                 device=device,
                                 eager=case.eager_check,
                                 graph=case.graph_check,
+                                capture=case.capture_check,
                             )
                         )
             sources = ("host", "hbm") if index % 2 == 0 else ("hbm", "host")
             for source in sources:
                 for wave, device in enumerate(abba):
+                    case = cases[source, device]
+                    report["current_case"] = case.progress
+                    case.progress["wave"] = wave
                     with torch.cuda.device(device):
-                        measurement = cases[source, device].measure(
+                        measurement = case.measure(
                             warmers[device], observer, args.warm_ms
                         )
                     report["waves"].append(
@@ -306,7 +398,9 @@ def main():
         report["success"] = len(report["correctness"]) == report[
             "expected_correctness"
         ] and len(report["waves"]) == len(shapes) * 2 * len(abba)
+        report.pop("current_case")
     except Exception:
+        report["failure_context"] = dict(report["current_case"])
         report["error"] = traceback.format_exc()
         traceback.print_exc()
     finally:

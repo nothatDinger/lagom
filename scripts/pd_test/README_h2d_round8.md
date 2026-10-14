@@ -91,6 +91,33 @@ HBM 仍使用同一 kernel/opcode，但 `.cv` 的 system-memory 行为不等同�
 
 ## 3. 先 smoke
 
+### 首次 smoke 失败与修复
+
+旧版本 `1d908a739` 的读探针调用 `capture_wave` 时没有传入 stream。
+PyTorch 的 `torch.cuda.graph.default_capture_stream` 是类级复用的 stream，
+首次在逻辑 GPU0 建立后，切换逻辑 GPU1 不会自动重新建立。
+已有双卡 copy 探针显式传入每设备 stream；新读探针遗漏了这一点。
+
+旧 `reads.json` 已确认：stride=128、grid=1×1、device=0 的 host/HBM 两项均通过
+eager 和 graph；接下来 device=1 的 host eager 通过，失败在 `graph_check`。
+因此 `correctness=2/16` 是两项完整通过、第三项中断、其余十三项未执行，
+不能解释为十四项都失败，更没有执行到 4×32。此序列与跨设备默认 stream 缺陷吻合。
+本地 CPU 回归通过真实 PyTorch graph Python 上下文、模拟 CUDA 原语复现了
+旧调用在 device=1 时仍进入 device=0 capture context 的行为；这不是 GPU 运行验证。
+
+修复为每项创建并保留明确属于目标设备的 capture stream，在 FFI launch 前核验
+当前设备和 stream，在 replay 前核验全部 Event 的设备。
+JSON 记录每项 `capture` 校验；失败时 compact 输出 `FAILURE_CONTEXT` 与已完成的
+`COMPLETED` 项，区分 eager、capture、graph replay/check、测量阶段。
+kernel、`.cv` 指令、地址集合、链布局和计时方式均保持原样。
+需要下面的实机重试验证修复；旧失败运行没有可用的性能结论。
+
+`expected=[24,32640]` 的含义是 `[终点 node ID, 访问的 node ID 总和]`；
+256 个节点恰好遍历一次时，`sum(range(256))=32640`。这两个字段不是指针。
+源表保存 next-node ID，实际读取地址为 `source_base + node_id * stride`，
+每次加载前先检查 `node_id < nodes`。`actual=[-1,-1]` 表示输出仍为哨兵，
+不能单凭它断言某一跳读到了坏 host 指针。清理阶段 rc=700 也不是注册地址错误的证明。
+
 更新实验 worktree 后，在物理 GPU4/5 空闲时执行。使用新目录保留旧数据：
 
 ```bash
@@ -106,12 +133,15 @@ CUDA_VISIBLE_DEVICES=4,5 numactl --cpunodebind=1 --membind=1 \
   "$LAGOM_PY" scripts/pd_test/bench_h2d_reads.py \
   --nodes 256 --total-reads 256 --grids 1x1 4x32 \
   --samples 2 --epochs 1 --warm-ms 20 \
-  --output-dir "$H2D_R8/read-smoke" >"$H2D_R8/read-smoke.log" 2>&1
+  --output-dir "$H2D_R8/read-smoke-v2" >"$H2D_R8/read-smoke-v2.log" 2>&1
 ```
 
-需要退出 0，`success=True correctness=16/16`，身份为物理 GPU4/5，host 在 node1，
+需要退出 0，`success=True correctness=16/16`、`CAPTURE_DEVICE_CHECK 16/16`，
+身份为物理 GPU4/5，host 在 node1，
 每个 eager/graph/测量校验通过、event 时间均为正。失败则返回 compact 的 ERROR 或日志末尾，
 停在 smoke。smoke 性能不用于判读。此工具不请求 profiler，故没有 profile_success 门禁。
+**这次修复先只重跑 smoke，返回通过状态；暂不启动 §4。** 若仍失败，返回
+`FAILURE_CONTEXT`、`COMPLETED` 和 traceback 即可，无需额外打印大批指针或上传原始文件。
 
 本地仅有 CPU，CUDA 编译和运行需由此 smoke 验证；不将 CPU 检查表述为 GPU 已通过。
 

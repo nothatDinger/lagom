@@ -88,7 +88,17 @@ def compact_report(report):
         f'host={report.get("host_buffers", [])}',
     ]
     if "error" in report:
+        lines.append(f'FAILURE_CONTEXT {report.get("failure_context", {})}')
+        for case in report["correctness"]:
+            fields = {
+                k: case[k] for k in ("stride", "blocks", "warps", "source", "device")
+            }
+            lines.append(f"COMPLETED {fields} eager=True graph=True")
         lines.append(f'ERROR {report["error"]}')
+    captures = [case.get("capture", {}) for case in report["correctness"]]
+    lines.append(
+        f'CAPTURE_DEVICE_CHECK {sum(c.get("device_checked", False) for c in captures)}/{report["expected_correctness"]}'
+    )
     keys = sorted(
         {(w["stride"], w["blocks"], w["warps"], w["source"]) for w in report["waves"]}
     )
