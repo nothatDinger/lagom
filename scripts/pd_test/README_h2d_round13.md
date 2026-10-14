@@ -17,6 +17,11 @@ B32/miss100 下每 warp 有25条 KV、相邻任务全部跨请求，简单展开
 | iterator-D1 | 跨 request 游标 | load(A) → store(A) | 识别遍历重写/编译变化 |
 | iterator-D2 | 与 D1 共用游标 | load(A) → load(B) → store(A) → store(B) | 相对 D1 识别两项暂存的增量 |
 
+当前修正版在上述 value load 前先完成本组一条/两条 KV 的游标推进和 GPU plan 准备。
+D2 的两项有效分支在 host load 前选择；该分支的两次 host 读取之间没有源码级
+`next()`、`SHFL` 或逐项有效性判断。单项尾部使用与D1相同的路径。
+编译器仍可能重排，不能以此替代新 SASS 核对。
+
 游标保留原 warp 的扁平任务序列 `w, w+128, ...`，counts 仍按32个请求的窗口读取和分发。
 两项分组可跨 request/32-request 窗口，末尾不足两项时只读写有效项。
 两候选使用相同 legacy C++ scalar load、lane分工、C4 value/scale地址和 CTA4/1024。
@@ -25,6 +30,30 @@ B32/miss100 下每 warp 有25条 KV、相邻任务全部跨请求，简单展开
 新增独立 `hisparse_copy_iterator.cuh` 和 `copy_cache_planned_mla_iterator(depth=1|2)` 诊断入口；
 服务调用路径仍用 legacy，没有环境变量切换。原 `hisparse.cuh`、`kvcacheio.cuh` 未修改。
 这一步用独立 JIT 编译产物检查假设，不把源码写成“两项”就当作硬件已做到重叠。
+
+### 首版反馈与修正依据（0c50eaeec）
+
+首版实机正确性12/12，每项graph 6/6全部通过；legacy/D1/D2分别34/26/32寄存器，
+LOCAL、STACK均为0。D2有六条source LDG排在首个STG之前，但这个条件不足以通过。
+用户补充的完整高位控制字段给出以下明确对应（位编号相对指令的高64-bit word）：
+
+| 位置 | 高64-bit word或其高24位 | write barrier | read barrier | wait mask |
+|---|---|---:|---:|---|
+| A：0530、0540 | `0x000368000c1e9b00` | 5 | 1 | 0 |
+| A：0550 | `0x000f62000c1e9b00` | 5 | 7（无） | 0 |
+| 0770 SHFL | 高24位 `0222a4` | 2 | 1 | `0x22`，即barrier 1、5 |
+| B：0a20、0a30、0a40 | 随后发起source load | — | — | — |
+
+字段为 `W=(word>>46)&7`、`R=(word>>49)&7`、`M=(word>>52)&0x3f`。
+0770虽只读GPU count的R6，附带的wait mask仍包含A source load所用的barrier 5。
+在经过0770的路径上，B发起前要求对应依赖就绪；如果更早已经等完，也不能恢复A/B读取重叠。
+这不意味着0770一定产生可测停顿：A可能已经自然完成。此处证明的是强制完成约束。
+
+B32/miss100的相邻任务全部跨request，需要再次执行counts分发SHFL，因而这个路径对目标载荷重要。
+同request多miss的路径可能跳过它，不能把首版所有执行路径都判为串行。
+**首版不进入本轮性能对照**：其结果无法干净检验目标跨request读取重叠。
+这是新增候选的调度问题，不能当作原服务23 GB/s的根因或预取无效的证据。
+修正版把metadata准备移到host load之前，先重新验证正确性和实际codegen；仍使用既有工具。
 
 ## 2. 正确性覆盖
 
@@ -57,7 +86,7 @@ export LAGOM_PY=/home/jovyan/td69032/lagom_h2d_latency_test/.venv/bin/python3
 若 `cuobjdump` 不在 PATH，可设置 `H2D_CUOBJDUMP=/已有/CUDA/bin/cuobjdump`；不安装新版本。
 
 ```bash
-bash scripts/pd_test/run_h2d_iterator_check.sh "$PWD/work/h2d-round13/iterator-check"
+bash scripts/pd_test/run_h2d_iterator_check.sh "$PWD/work/h2d-round13/iterator-check-v2"
 ```
 
 目录必须全新；重复执行时换目录名。首次运行包含 JIT 编译时间。
@@ -72,6 +101,8 @@ wrapper 先执行 `check_h2d_iterator.py`，成功后才执行离线 `collect_h2
   `capture_device` 与逻辑设备一致，共72次 graph 结果检查。
 - 身份为物理GPU4（98:00.0）/GPU5（b8:00.0）。
 - `CODEGEN success=True artifacts=3/3 performance_ready=False review_required=True`。
+- 各组 `CTRL_LOAD64 ... complete=True`：完整高64-bit控制字全部解析；
+  `CTRL_WAITS` 给出全kernel非零wait mask及DEPBAR，包含地址区间外的跳转辅助块。
 
 **`performance_ready=False` 是有意保留的人工判读状态，不是失败。**
 CODEGEN success 只说明三份产物已提取，不宣称 D2 生成了目标指令顺序。
@@ -82,6 +113,8 @@ CODEGEN success 只说明三份产物已提取，不宣称 D2 生成了目标指
 
 - `check/iterator-compact.txt`：正确性、capture设备、身份。
 - `codegen/codegen-compact.txt`：寄存器/local/stack、load/store形状及关键指令顺序。
+  现在同时给出 `CTRL_LOAD64`（W/R/M及完整高64-bit word）与 `CTRL_WAITS`；原样回传即可，
+  不需要手工截断机器码或自行给出“无等待”的结论。
 
 其余 `.so`、JSON、SASS 留在本地。失败时给对应 `check.log` 或 `codegen.log` 尾部约30行及
 active case，无需重跑或上传整份日志。若摘要不足以确认依赖，再从现成文本提取指定片段即可。
@@ -101,6 +134,10 @@ active case，无需重跑或上传整份日志。若摘要不足以确认依赖
 前到最后store后的**连续指令**，便于检查被摘要省略的消费者与等待。
 `read64_before_first_store_static_hint` 只是定位提示，可能包含plan读取或互斥路径，
 不是自动通过条件，也不是动态事务数或硬件队列深度。
+控制字段目前只解码SM90/SM90a；格式缺失/截断或其他架构保留unknown，不推断无等待。
+`CTRL_WAITS` 也不自动判为失败：metadata准备阶段的等待及store前的必要等待都合理，
+必须结合分支路径、barrier分配/复用和value寄存器判断。即便排除了强制等待，
+也只能说明允许跨KV重叠；是否实际重叠及收益仍需要后续测量。
 
 本轮执行到提取完毕即可。确认正确性及 codegen 后，再准备一次固定分散源、
 B32/miss100主目标、host/HBM对照的三组配对性能实验；不预先安排线程/深度扫描。
@@ -110,7 +147,8 @@ D2/D1回答增加暂存是否有用，D2/legacy回答净收益；有收益也仍
 
 CPU 遍历核对的4,204组现在同时比较 legacy、D1、D2 与独立扁平oracle。
 CPU 单测覆盖字节oracle、尾项/padding、API隔离、实际JIT产物识别、SASS提取和资源信息缺失。
-本地24项CPU测试通过，Python静态检查、两个CLI加载及shell语法检查通过；
+修正版26项CPU测试通过，包含两项新增控制字段测试，覆盖已提供的legacy/D2机器码及缺失字段。
+Python静态检查、两个CLI加载及shell语法检查通过；
 6项CUDA测试因无GPU跳过，没有计入通过数。
 开发环境没有 NVCC/GPU，不能验证 CUDA 编译、真实寄存器分配或 graph 执行；
-本轮实机正确性作业就是这些事项的首次验证，不能用 CPU 通过代替。
+首版CUDA已在实机验证；修正版的CUDA编译/执行及新SASS仍须实机复核，不能用 CPU 通过代替。

@@ -13,6 +13,34 @@ LIBRARIES = {
 }
 
 
+def decode_sm90_control(raw, arch):
+    """Decode the upper 64-bit word, not the LDG opcode suffix.
+
+    SM90 uses upper-word bits 46:48 / 49:51 / 52:57 for write dependency,
+    read dependency and wait mask. Barrier IDs are 0..5; 7 means unassigned.
+    This labels static scheduling fields, not elapsed waits or live requests.
+    Keep unsupported architectures or missing/truncated control words unknown.
+    """
+    if arch not in ("sm_90", "sm_90a"):
+        return None
+    words = [
+        match[1]
+        for line in raw[1:]
+        if (match := re.fullmatch(r"\s*/\*\s*0x([0-9a-fA-F]{16})\s*\*/\s*", line))
+    ]
+    if len(words) != 1:
+        return None
+    value = int(words[0], 16)
+    mask = (value >> 52) & 0x3F
+    return dict(
+        upper_word=f"0x{value:016x}",
+        write_barrier=(value >> 46) & 7,
+        read_barrier=(value >> 49) & 7,
+        wait_mask=mask,
+        wait_barriers=[i for i in range(6) if mask & (1 << i)],
+    )
+
+
 def loaded_iterator_artifacts(maps_text=None):
     maps_text = Path("/proc/self/maps").read_text() if maps_text is None else maps_text
     paths = {
@@ -68,6 +96,12 @@ def instruction_order(sass, kernel_name):
         raise ValueError(f"Missing populated SASS for {kernel_name}")
     for kernel in kernels:
         instructions = kernel["instructions"]
+        for row in instructions:
+            row["control"] = decode_sm90_control(row["raw"], kernel["arch"])
+        kernel["controls_decoded"] = sum(
+            row["control"] is not None for row in instructions
+        )
+        kernel["controls_complete"] = kernel["controls_decoded"] == len(instructions)
         first_store = next(
             (
                 i

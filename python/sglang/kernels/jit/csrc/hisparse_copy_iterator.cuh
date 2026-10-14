@@ -40,6 +40,11 @@ struct MissIterator {
   }
 };
 
+struct KVPlan {
+  int32_t source;
+  int32_t destination;
+};
+
 struct PendingKV {
   int64_t prefix0;
   int64_t prefix1;
@@ -86,23 +91,36 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_planned_iterator_ker
   const int warps = gridDim.x * (BLOCK_SIZE / 32);
   MissIterator iterator(counts, num_real_reqs[0], warps, lane, warp);
   while (true) {
-    PendingKV pending[DEPTH];
+    // Finish both cursor walks (including SHFL) and GPU plan reads before
+    // issuing host loads. Interleaving next(B) with load(A) caused the old D2
+    // SHFL to wait on the scoreboard barrier also used by A's source loads.
+    KVPlan plans[DEPTH];
     int filled = 0;
 #pragma unroll
     for (int slot = 0; slot < DEPTH; ++slot) {
       int request, miss;
       if (iterator.next(request, miss)) {
         const auto offset = static_cast<int64_t>(request) * stride + miss;
-        pending[slot] = read_kv(
-            host_cache, static_cast<int32_t>(sources[offset]), destinations[offset], lane);
+        plans[slot] = {static_cast<int32_t>(sources[offset]), destinations[offset]};
         ++filled;
       }
     }
     if (filled == 0) break;
-#pragma unroll
-    for (int slot = 0; slot < DEPTH; ++slot) {
-      if (slot < filled) write_kv(device_buffer, pending[slot], lane);
+    if constexpr (DEPTH == 2) {
+      // Branch before either source read, not between the two reads. There is
+      // no iterator/SHFL or per-item validity branch inside the full-pair body.
+      // Actual instruction scheduling and barrier reuse still need SASS review.
+      if (filled == 2) {
+        const auto a = read_kv(host_cache, plans[0].source, plans[0].destination, lane);
+        const auto b = read_kv(host_cache, plans[1].source, plans[1].destination, lane);
+        write_kv(device_buffer, a, lane);
+        write_kv(device_buffer, b, lane);
+        continue;
+      }
     }
+    // D1 and the odd D2 tail share the same single-item path.
+    const auto a = read_kv(host_cache, plans[0].source, plans[0].destination, lane);
+    write_kv(device_buffer, a, lane);
   }
 }
 

@@ -16,6 +16,7 @@ from sglang.benchmark.hisparse_h2d_iterator import (
 )
 from sglang.benchmark.hisparse_h2d_iterator_codegen import (
     LIBRARIES,
+    decode_sm90_control,
     instruction_order,
     loaded_iterator_artifacts,
     resource_summary,
@@ -222,6 +223,41 @@ def test_resource_report_distinguishes_spills_and_missing_evidence():
     assert resource_summary("REG:40")["no_local_or_stack"] is None
 
 
+def test_sm90_control_decodes_reported_loads_and_unrelated_register_wait():
+    # Real legacy load/store control words from round 9, and round-13 D2
+    # load/SHFL prefixes. The SHFL low 40 bits are unused in this field test.
+    for word, write, read, wait in [
+        ("000ea2000c1e9b00", 2, 7, 0),
+        ("000f2a000c1e9b00", 4, 7, 0),
+        ("000f62000c1e9b00", 5, 7, 0),
+        ("0043e8000c101b06", 7, 1, 0x04),
+        ("0103e8000c101b06", 7, 1, 0x10),
+        ("0203e2000c101b06", 7, 1, 0x20),
+        ("000368000c1e9b00", 5, 1, 0),
+        ("0222a40000000000", 2, 1, 0x22),
+        ("000fce0000000000", 7, 7, 0),
+        ("000fc60000000000", 7, 7, 0),
+    ]:
+        decoded = decode_sm90_control(["instruction", f"/* 0x{word} */"], "sm_90a")
+        assert (
+            decoded["write_barrier"],
+            decoded["read_barrier"],
+            decoded["wait_mask"],
+        ) == (write, read, wait)
+    assert decode_sm90_control(
+        ["SHFL R22, R6, R5", "/* 0x0222a40000000000 */"], "sm_90a"
+    )["wait_barriers"] == [1, 5]
+
+
+def test_sm90_control_requires_full_upper_word_and_known_architecture():
+    assert decode_sm90_control(["/* 0x000368000c1e9b00 */"], "sm_90a") is None
+    assert decode_sm90_control(["LDG", "/* 0xc1e9b00 */"], "sm_90a") is None
+    assert decode_sm90_control(["LDG", "/* 0x000368000c1e9b00 */"], "sm_80") is None
+    report = instruction_order(sass(), "copy_cache_planned_iterator_kernel")[0]
+    assert report["controls_decoded"] == 6 and not report["controls_complete"]
+    assert report["instructions"][0]["control"]["write_barrier"] == 2
+
+
 def test_offline_collector_checks_all_hashes_and_never_claims_performance_ready(
     tmp_path, monkeypatch
 ):
@@ -264,6 +300,9 @@ def test_offline_collector_checks_all_hashes_and_never_claims_performance_ready(
     report = json.loads((output / "codegen.json").read_text())
     assert report["success"] and report["performance_ready"] is False
     assert "MOV R18, R0" in (output / "iterator_d2.read-window.txt").read_text()
+    compact = (output / "codegen-compact.txt").read_text()
+    assert "CTRL_LOAD64 iterator_d2 complete=False" in compact
+    assert "W2/R7/M0x00/0x000ea2000c1e9b00" in compact
     Path(artifacts[-1]["path"]).write_bytes(b"changed")
     monkeypatch.setattr(
         sys,

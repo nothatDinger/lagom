@@ -100,6 +100,7 @@ def main():
     lines = [
         f'CODEGEN success={report["success"]} artifacts={len(report["artifacts"])}/3 performance_ready=False review_required=True',
         "Read64-before-first-store is a static hint: review predicates/branches/addresses and earlier register consumers in *.read-window.txt; no queue-depth measurement.",
+        "CTRL fields are static SM90 dependency controls from the full upper word; W/R=7 means unassigned. Wait masks require path/barrier-lifetime review, not register operands alone.",
     ]
     for artifact in report["artifacts"]:
         variant, resource = artifact["variant"], artifact["resources"]
@@ -112,6 +113,23 @@ def main():
             )
             sequence = [f'{row["offset"]}:{row["text"]}' for row in kernel["order"]]
             lines.append(f"ORDER {variant} {sequence}")
+            loads, waits = [], []
+            for row in kernel["instructions"]:
+                control = row["control"]
+                if control is None:
+                    continue
+                if row["opcode"].startswith("LDG.") and ".64." in row["opcode"]:
+                    loads.append(
+                        f'{row["offset"]}:W{control["write_barrier"]}/R{control["read_barrier"]}/M{control["wait_mask"]:#04x}/{control["upper_word"]}'
+                    )
+                if control["wait_mask"] or row["opcode"].startswith("DEPBAR"):
+                    waits.append(
+                        f'{row["offset"]}:{row["text"]} M{control["wait_mask"]:#04x}/{control["upper_word"]}'
+                    )
+            lines.append(
+                f'CTRL_LOAD64 {variant} complete={kernel["controls_complete"]} decoded={kernel["controls_decoded"]}/{len(kernel["instructions"])} {loads}'
+            )
+            lines.append(f"CTRL_WAITS {variant} {waits}")
     if "error" in report:
         lines.append("ERROR " + report["error"])
     text = "\n".join(lines) + "\n"
