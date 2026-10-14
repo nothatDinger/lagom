@@ -3,10 +3,10 @@
 分支仍为 `perf/hisparse-h2d-diagnosis`，基于 `hash_verify`。本轮只用空闲物理 GPU4/5、
 NUMA1、原生 venv；生产默认仍为 legacy。先 smoke，再一个正式对照，不重跑 8 卡服务。
 
-**当前进度：用户确认 smoke/main 的全部门禁通过，两列均取自同一个 profiled wave。
-但简表的部分 event/activity 数值与当前校验条件不相容，先按 §6 只读原 JSON 核对。
-按现有简表，1.87 MB 排序改善不足 1%，23.77 MB 有小幅改善，卡间差距没有收敛；
-本轮不推进排序进入生产。后续 §7 是只读 PCIe 配置检查，不增加 GPU 重跑。**
+**当前进度：smoke/main 全部门禁通过；§6 的大载荷原字段已核对，计时自洽，旧简表的
+event 列已更正。大载荷 host activity 降低 5.69% / 3.25%，卡间比值从 1.358 变为
+1.393；正常驻留小载荷此前报告改善不足 1%。本轮不推进排序进入生产。
+下一步执行 §7 的只读 PCIe 配置检查，不增加 GPU 重跑。**
 
 ## 1. 本轮依据与问题
 
@@ -129,30 +129,39 @@ smoke 通过可用一行说明门禁，再给正式运行：
 
 完整 JSON/trace 留在本机，不需上传。排序成本、真实 plan 收益和端到端收益本轮均未测。
 
-## 6. 已收到的结果与口径核对
+## 6. 已核对的大载荷结果
 
 用户已从原 JSON 确认：smoke/main 均 success=True、profile_success=True，correctness、
 graph replay、profile coverage 全部 22/22，errors=[]；UNTOUCHED_SM 16/16，
 两档 ORDERED_PLANS pairs_preserved=True，Portable=1。
-用户也确认两列均来自 `profile_waves/phase=profile_compute` 的同一条记录；
-独立的无 profiler `waves/phase=copy` 只作基线。此前“可能跨阶段取数”的推测撤回，
-不能当作已查明原因。
+用户反馈的原字段摘录来自 `order-main/pair.json`：
 
-下面是直接用用户简表重算的 ordered/random，尚未核对原 JSON：
+- 文件 SHA256：`151b40a96ed249e76d789e53254414608895f7e496297d0ea73e309fac0d9461`。
+- 提取时 HEAD：`b90500741793b314925a80d000b941f18b8adb68`，不当作采集时版本证明。
+- 提取时 helper SHA256：`7929898c0f471523064d1e10943737c05b8ff9673d1b9d428d2d9f549cf79af6`，
+  与当前仓库的 `python/sglang/benchmark/hisparse_h2d_pair.py` 一致。
+- 八条记录均为 `phase=profile_compute`，banks/event_count/activities 均 22，
+  `stored_event_matches_sum=True`、`current_timer_gate=True`、`valid=True`。
+- 最后一行转录的重复键已由用户更正：sm_hbm_ordered/device1 的 event 总量为
+  `6167.3919558525085 µs`，与 event_sum_us 相同。下面均按正确总量除以 22 重算。
 
-| 来源/载荷 | GPU4 event 比 | GPU5 event 比 | GPU4 activity 比 | GPU5 activity 比 |
+以下 event/activity 确实来自同一个 profiled wave；独立无 profiler 基线用于性能参照。
+**旧简表的大载荷 event 数字与本次原字段不符，旧 event 列及其卡间比值作废；activity 数字一致。**
+旧 event 数字具体从哪里转录而来尚未查明，不再用“来自不同阶段”解释它。
+
+| 方法，23.77 MB | GPU4 event / activity µs | GPU5 event / activity µs | GPU4 / GPU5 gap µs |
+|---|---:|---:|---:|
+| sm | 733.193 / 728.937 | 994.311 / 990.050 | 4.256 / 4.261 |
+| sm_ordered | 691.703 / 687.461 | 962.191 / 957.888 | 4.242 / 4.303 |
+| sm_hbm | 276.505 / 272.231 | 282.868 / 278.627 | 4.274 / 4.241 |
+| sm_hbm_ordered | 284.650 / 280.463 | 280.336 / 276.079 | 4.187 / 4.257 |
+
+| ordered / random | GPU4 event 比 | GPU5 event 比 | GPU4 activity 比 | GPU5 activity 比 |
 |---|---:|---:|---:|---:|
-| host 1.87 MB | 0.994 | 0.996 | 0.993 | 0.991 |
-| host 23.77 MB | 0.937 | 0.967 | 0.943 | 0.968 |
-| HBM 1.87 MB | 0.998 | 0.997 | 1.000 | 0.998 |
-| HBM 23.77 MB | 1.003 | 1.003 | 1.030 | 0.991 |
+| host 23.77 MB | 0.9434 | 0.9677 | 0.9431 | 0.9675 |
+| HBM 23.77 MB | 1.0295 | 0.9910 | 1.0302 | 0.9909 |
 
-例如大载荷 HBM activity 是 `280.46/272.23=1.030`、`276.08/278.63=0.991`，
-不是简报末尾的 1.003/1.004。host 大载荷 activity 也应为 0.943/0.968，
-而不是 0.946/0.964。
-
-还有一个必须闭合的字段定义矛盾。当前 `b0e3c0f53` 的
-`python/sglang/benchmark/hisparse_h2d_pair.py::activity_check` 中：
+计时定义仍为 `activity_check` 中的：
 
 ```python
 active = sum(e["dur"] for e in copies)   # activity_gpu_us，总量
@@ -164,27 +173,24 @@ if active > interval + max(1, 0.5 * len(copies)):
 `copy_us` 来自 CUDA Event 的 `start.elapsed_time(end) * 1000`。
 **event_gpu_us 不是 CPU 或 GPU user_annotation 的持续时间**；CPU 标注范围用于筛选该波的
 GPU activity，External id 也不是 CUDA Event 的计时来源。
-compact 的两个 mean 使用同一个分母 `activity_check.activities`。
-当 N≥2 时，门禁最多容许 activity 平均每次超过 event 0.5 µs。
-表中 GPU4 HBM 小载荷为 `31.36−30.20=1.16 µs`，大载荷为
-`272.23−258.39=13.84 µs`，均无法在这版代码中同时得到 valid=True。
-两位小数的舍入不足以解释差异。
+compact 的两个 mean 使用同一个分母 `activity_check.activities`，本次都是 22。
+原字段 gap 范围为 4.187–4.303 µs，没有旧表中的负 gap；大载荷的计时一致性疑点已闭合。
+这次只展开了大载荷，小载荷不再使用旧 event 列作配对解释。
 
-因此，已报告的通过状态与简表数值尚不能同时复核；需要定位原字段、汇总或代码版本的差异。
-目前证据不足以判断 profiler 或 CUDA 计时本身是否有问题。
+本轮判读：
 
-按现有简表可保留的方向性观察（数值待原字段核对）是：
+- 大载荷 host activity 下降 GPU4 5.69%、GPU5 3.25%，event 同向，改善发生在 kernel 内。
+  GPU5/GPU4 activity 比值从 1.3582 变为 1.3934，主要卡间差距仍然存在。
+- HBM 排序后 GPU4 activity **增加 3.02%**、GPU5 降低 0.91%，不能继续描述成两卡都不变。
+  排序也改变目的写入次序及 plan 到 warp 的映射；GPU 端对照也出现小幅时间变化。
+  一次 profiled wave 不足以将几个百分点的变化提升为稳定收益，更不能相减得到 PCIe 耗时。
+- 正常驻留目标的小载荷 host activity，此前简报为下降约 0.75% / 0.89%；本次未展开其原字段。
+  排序暂不进入生产候选：目标载荷尚无足够收益，实际排序成本也未计入。
+- 源升序没有消除 host SM 特有的主要卡间差距。**仍未排除地址转换或请求并行度因素**：
+  排序保留源页集合，未直接测量 TLB/ATS、事务大小、在途请求数量或单次读延迟。
 
-- 小载荷 host 排序改善不足 1%；主要卡间差距仍在。
-- 大载荷 host 排序有约 3–6% 的改善，GPU4 收益更大。activity 的 GPU5/GPU4
-  从约 1.358 变为 1.393；event 列从约 1.358 变为 1.400，均未收敛。
-- 目前不把源排序作为生产候选继续推进：正常驻留目标载荷改善不足 1%，且实际排序成本尚未计入。
-- **未排除地址转换开销**。排序保留了源页集合，首次访问和地址转换工作仍可能存在；
-  排序收益小并不证明 TLB/ATS 无关，也不测量真实在途读请求数。
-
-请直接运行以下纯标准库命令，读取已经存在的 `order-main/pair.json`。
-仅输出 1 行文件/版本信息和 8 条大载荷原字段汇总；不导入 torch，不加载 trace，不重跑 GPU。
-请原样反馈输出，不重新手算或转表。`current_git` 是提取时版本，不能替代采集时版本。
+以下纯标准库提取命令留档，**本轮已完成，无需重复运行**。它只读现有 JSON，输出文件/版本
+信息和八条大载荷记录，不导入 torch，不加载 trace。`current_git` 仅为提取时版本。
 
 ```bash
 python3 - work/h2d-round7/order-main/pair.json <<'PY'
@@ -220,9 +226,8 @@ if len(rows) != 8:
 PY
 ```
 
-若路径不同，只替换输入文件路径。从仓库根目录执行，以便记录当前 helper 的哈希。
-若这 8 行自洽，则修正简表并继续；若存储 valid=True 但 current_timer_gate=False，
-再核对采集时实际加载的 helper 和离线重解析版本。完整 pair.json 与 trace 继续留在本机。
+如将来需要复查，从仓库根目录执行，并按实际位置替换输入文件路径。
+完整 pair.json 与 trace 继续留在本机。
 
 ## 7. 下一步：读取 PCIe 请求配置，不占用 GPU 计算
 
@@ -274,4 +279,5 @@ rg '^[0-9a-fA-F]{4}:|DevCap|DevCtl|MaxPayload|MaxReadReq|ExtTag|10BitTag|ATSCap|
 
 优先贴出不一致的原始行；完全相同的部分可汇总为“相同”，无需上传全部配置。
 配置差异本身不是因果证明，MRRS/Tag 能力也不等于实际 SM 事务大小或实测在途深度。
+上游端口自己的 DevCtl 参数也不能直接当作 GPU endpoint 的生效请求参数。
 若可见配置一致，下一轮再隔离 host SM 读请求延迟和并行度；目前不增加 GPU 重跑。
