@@ -2,7 +2,8 @@
 
 分支 `perf/hisparse-h2d-diagnosis`，基于 hash_verify。目标仍是正常驻留 B32/W6 的
 decode H2D 和服务吞吐；物理 GPU4/5、NUMA1、原生 venv。
-§3 实机门禁已通过，当前进入 §4 的一个正式块；不必重复单测、smoke 或 SASS 提取。
+§3 与 §4 首个正式块均已返回结果。当前不推进反序或服务验证；见 §5 的判读。
+下一步为 [第十轮 NCU 工具兼容性检查](README_h2d_round10.md)，不是再次运行策略扫描。
 
 ## 1. 依据与待检验问题
 
@@ -71,7 +72,7 @@ profile **38/38**，未触碰字节检查 **32/32**，身份 GPU4/5、host node1
 128-bit 是每个参与 lane 的 16B load，并非 128B PCIe 事务，也不证明请求数减半。
 opcode 直方图不包含完整指令顺序、地址计算或依赖；不能仅据此称 legacy/ca
 “只有 cache modifier 不同”，或称 `ca_pair/ca_v2` 除 load 外的二进制完全相同。
-门禁支持测量候选，尚没有正式载荷下的性能结论。
+这些门禁支持测量候选；正式载荷结果另见 §5，不能用 smoke 时延判断收益。
 
 在实验 worktree 更新并设置环境。GPU 单测会覆盖五种 policy × host/HBM，共十项；
 包含 eager、动态 graph replay、非连续 plan stride、跨页目的、零 miss、padded request、
@@ -130,7 +131,7 @@ smoke 只验证功能与解析，不用于判断收益。失败保留原文件�
 
 上述门禁与 codegen compact 已核对；完整 trace/SASS 留在实机，无需上传。
 
-## 4. 当前执行：一个正式对照块
+## 4. 首个正式对照块（已返回，命令留作复现）
 
 保持已验证的 B32、miss100/1272、512 MiB pool、plan stride3072。
 这轮无 profiler 主测选 `phase=compute`，每波先做相同计算预热；profile 也为 profile_compute。
@@ -164,3 +165,82 @@ mean event/activity、四波均值，以及对应 HBM 和 CE 比值/状态。大
 10% 是减少无效服务实验的筛选门槛，不是统计显著性证明。
 回到服务时沿用第六轮经验：micro 收益必须在 B32/W6 过滤后的真实 copy 中出现，
 再检查 TPOT/吞吐。不能重复把未进入服务的 5% micro 收益解释为已完成优化。
+
+## 5. 正式块反馈与当前决定（2026-10-14）
+
+用户报告采集版本 `6a5f23465`，物理 GPU4/5、共享 host pool node1、Portable=1。
+主测 `success=True profile_success=True`，profile scope 均为一个 CPU annotation。
+STATE 摘要两卡 SM 1455–1485、MEM 2619、P0、Gen5 x16、throttle 0x4、errors=0；
+这不是每个 kernel 内状态恒定的证明。正式块已补充确认 correctness/payload/graph/profile
+均为 **38/38**、未触碰字节检查 **32/32**、profile errors 为空；不依赖 smoke 计数代替。
+
+miss100 的无 profiler event 是本轮性能主口径；profile activity 用于内核内耗时分析。
+两段分别计算，所有百分比按用户提供的四舍五入均值推算：
+
+| 同卡比较 | 无 profile event d0 / d1 | profile host activity d0 / d1 |
+|---|---|---|
+| ca / legacy | −3.54% / −4.22% | −2.75% / −7.29% |
+| ca_pair / ca | −0.89% / −1.82% | −0.48% / −1.51% |
+| ca_v2 / ca_pair | +0.22% / −0.17% | −1.50% / −0.52% |
+| ca_v2 / ca | −0.67% / −1.99% | −1.98% / −2.03% |
+| ca_v2 / legacy | −4.19% / −6.12% | −4.67% / −9.17% |
+
+无 profile 的 legacy 为 66.18 / 86.12 µs，ca_v2 为 63.41 / 80.85 µs。
+慢卡节省 5.27 µs/次；不能把另一段 activity 的 9.17% 当成无 profile 性能收益。
+profile 的 event−activity gap 保持约 4.2 µs，只说明这段区间外开销相近；
+它不证明 profiler、运行次序或状态对各次 kernel 内部时间的影响相同。
+暂不计算显著性或宣称 1–2% 的差异稳定可重复。
+
+d1 四个无 profile wave 的均值如下，每波 64 个样本：
+
+| policy | 四波均值（µs） | 最大−最小（µs） |
+|---|---|---:|
+| legacy | 85.95 / 86.23 / 86.19 / 86.12 | 0.28 |
+| ca | 82.27 / 82.98 / 82.66 / 82.06 | 0.92 |
+| ca_pair | 80.84 / 80.53 / 80.53 / 82.08 | 1.55 |
+| ca_v2 | 81.25 / 80.78 / 80.62 / 80.76 | 0.63 |
+
+不能概括为“四波抖动均不超过 0.5 µs”。按波序号比较，ca_v2 前三波略慢于 ca_pair、
+第四波较快；平均仅快 0.14 µs。不同方法依次测量，序号对应也不等于同时测量或独立重复实验。
+约 2.0% 指 ca_v2 相对 ca，约 0.2% 才是相对 ca_pair；两种分母不可互换。
+
+HBM 对照也发生变化：
+
+| 同卡比较 | profile HBM activity d0 / d1 |
+|---|---|
+| ca / legacy | +3.25% / +2.63% |
+| ca_pair / ca | +5.75% / +7.31% |
+| ca_v2 / ca_pair | −6.10% / −6.56% |
+| ca_v2 / legacy | +2.52% / +2.91% |
+
+`ca_v2/ca_pair` 在 HBM 下明显下降，在 host 下变化很小；支持更宽 load 的 GPU 端收益
+受到 host 读取限制，但没有独立定位限制发生在哪一级。HBM 的两卡比值接近 1 不等于
+四种方法在 HBM 的耗时相同，不能概括为“通用 GPU 执行无影响”或相减得到 PCIe 耗时。
+CE 两卡 activity 36.27 / 36.44 µs，沿用其连续传输参照身份。
+
+代码与归因边界：
+
+- `ca_pair/ca` 的 lane 重排只显示小幅变化；不足以解释或解决主要差距，不能推广为 lane 分配无影响。
+- `ca_v2/ca_pair` 的向量化在目标 host 载荷没有明确的额外收益。大载荷用户给出的
+  activity 比值为 0.9996 / 0.9970；未据此宣称其他大载荷指标已核验。
+- `ca/legacy` 已包含本组大部分 host 改善，但只能归因到这两个**实现整体**的差异。
+  SASS opcode 统计不提供完整指令调度、依赖、cache 命中率、物理事务或翻译计数。
+  `.CONSTANT` 与 `.STRONG.SM` 的出现不能单独证明某个 cache modifier 是硬件根因。
+- `transfer_item` 的 `tail_item` 同样调用 `load_item_word<LoadPolicy>`：legacy→ca
+  还改变了尾部 64B value 与 8B scale 的 load 策略；仅 ca→ca_pair→ca_v2 保持这部分一致。
+  因此“四组只改前 512B”不是准确的全组描述。
+
+**当前不推进 ca_pair/ca_v2 的反序及服务实验，服务仍使用 legacy。**
+慢卡无 profile 的 ca_v2/legacy 为约 −6.1%，相对已有 ca 仅约 −2.0%；未达到本轮约 10%
+的筛选目标。第六轮 ca 的 micro 收益没有进入真实服务，不能仅凭本轮单个 profile 波再晋升。
+这不是判定硬件根因已经找到，也不是判定 copy 不在端到端关键路径。
+
+下一步先确认 Nsight Compute 的可用性，随后针对真实 legacy gather 采集访存与等待证据。
+保持同一 host 分配、plan、目的 buffer，并配本卡 HBM 参照；先区分读流量放大与等量读取更慢，
+再决定是否干预事务组织、并发或地址转换。计数器名称/权限需依实机工具确认，
+暂不承诺某个 PCIe/TLB/队列指标可用，也不把 L1/L2 sector 数直接称作 PCIe TLP 数。
+NCU replay/缓存/时钟策略会改变测量条件，届时单独核验；其 profile 时延不替代无 profile 基线。
+
+所需旧数据已补齐，不需要继续提取第九轮文件。工具条件也已确认：`/usr/bin/ncu`
+为 2022.4.1.0，`RmProfilingAdminOnly: 0`。该参数放开驱动的管理员限制，但不证明
+此 NCU 版本已能采集当前 CUDA 13/JIT 产物；第十轮先验证兼容性，不修改驱动设置。
