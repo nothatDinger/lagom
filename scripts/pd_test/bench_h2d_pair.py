@@ -21,6 +21,12 @@ from sglang.benchmark.hisparse_h2d_diagnostics import (
     copy_geometry,
     process_snapshot,
 )
+from sglang.benchmark.hisparse_h2d_layout import (
+    layout_compact_report,
+    layout_geometries,
+    layout_method_pairs,
+    prepare_adjacent_source,
+)
 from sglang.benchmark.hisparse_h2d_pair import (
     SM_LOAD_POLICIES,
     abba_order,
@@ -114,9 +120,10 @@ class Warmer:
 def make_plan(torch, args, geometry, case_index, misses):
     rng = torch.Generator().manual_seed(args.seed + case_index + 1)
     banks, entries = geometry["banks"], geometry["entries"]
-    active = torch.randperm(geometry["host_tokens"], generator=rng)[
-        : banks * entries
-    ].reshape(banks, args.batch, misses)
+    source_tokens = geometry.get("random_tokens", geometry["host_tokens"])
+    source_start = geometry.get("random_token_start", 0)
+    active = torch.randperm(source_tokens, generator=rng)[: banks * entries]
+    active = active.reshape(banks, args.batch, misses) + source_start
     src = torch.zeros((banks, args.batch, args.plan_stride), dtype=torch.int64)
     src[:, :, :misses] = active
     padded = ((args.buffer_slots + PAGE_TOKENS - 1) // PAGE_TOKENS + 1) * PAGE_TOKENS
@@ -236,14 +243,15 @@ class CopyCase:
                             "SM variant requires the matching host-SM case"
                         )
                     # Share counts and destination allocation. HBM/cache variants
-                    # also share GPU plans; ordered SM replaces only paired plans.
+                    # also share GPU plans; layout/order controls replace sources.
                     src = shared_sm.plan_src
                     kwargs = dict(shared_sm.sm_kwargs, host_cache=source)
-                    if method == "sm_ordered":
-                        # Counts, source allocation and destination buffer stay
-                        # identical to random SM; only the paired plan order changes.
+                    if method in ("sm_ordered", "sm_adjacent"):
+                        # Adjacent sources remap only the source plan. Sorting
+                        # reorders both plans to preserve source/destination pairs.
                         src = plan["src"].to(device="cuda")
-                        kwargs["miss_dst"] = plan["dst"].to(device="cuda")
+                        if method == "sm_ordered":
+                            kwargs["miss_dst"] = plan["dst"].to(device="cuda")
                 else:
                     src = plan["src"].to(device="cuda")
                     kwargs = dict(
@@ -280,8 +288,8 @@ class CopyCase:
                 ]
 
                 def validate(bank):
-                    # Ordered variants must produce the ORIGINAL mapping, not
-                    # an oracle derived from the possibly faulty ordered plan.
+                    # Layout/order variants must produce the ORIGINAL mapping,
+                    # independently of their transformed source plan.
                     reference = oracle_plan if oracle_plan is not None else plan
                     validate_sm(
                         torch,
@@ -310,7 +318,11 @@ class CopyCase:
             else:
                 raise ValueError(f"Unknown copy method: {method}")
 
-            self.verified_banks = sorted({0, banks - 1})
+            self.verified_banks = (
+                list(range(banks))
+                if args.source_layout_control
+                else sorted({0, banks - 1})
+            )
             for bank in self.verified_banks:
                 output.zero_()
                 self.functions[bank]()
@@ -467,6 +479,11 @@ def main():
     )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument(
+        "--source-layout-control",
+        action="store_true",
+        help="Pack the SAME KV into adjacent C4 source slots before timing, preserving original destination/oracle",
+    )
+    parser.add_argument(
         "--source-order-control",
         action="store_true",
         help="Sort the SAME source/destination pairs by source address outside timing",
@@ -503,10 +520,16 @@ def main():
         )
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         parser.error("Use one process, without torchrun")
-    geometries = [
-        copy_geometry(args.batch, m, args.source_mib * 2**20, args.max_banks)
-        for m in args.misses
-    ]
+    geometries = (
+        layout_geometries(
+            args.batch, args.misses, args.source_mib * 2**20, args.max_banks
+        )
+        if args.source_layout_control
+        else [
+            copy_geometry(args.batch, m, args.source_mib * 2**20, args.max_banks)
+            for m in args.misses
+        ]
+    )
     host_bytes = geometries[0]["host_bytes"]
     if args.bulk_ce_mib <= 0:
         parser.error("Bulk CE size must be positive")
@@ -549,8 +572,17 @@ def main():
         correctness=[],
     )
     host, registered = None, False
-    if args.copy_vector_control:
+    if args.copy_vector_control or args.source_layout_control:
         report["code"] = vector_provenance()
+        if args.source_layout_control:
+            for name in (
+                "python/sglang/benchmark/hisparse_h2d_layout.py",
+                "python/sglang/benchmark/hisparse_h2d_diagnostics.py",
+            ):
+                root = Path(__file__).resolve().parents[2]
+                report["code"]["sha256"][name] = hashlib.sha256(
+                    (root / name).read_bytes()
+                ).hexdigest()
     try:
         host = HostTensorAllocator().allocate(
             (geometries[0]["host_pages"], PAGE_BYTES), torch.uint8, "cpu"
@@ -577,6 +609,23 @@ def main():
             ]
         )
         report["hugepage_setting"] = os.environ.get("SGLANG_HUGEPAGE_SIZE", "")
+        prepared_plans = {}
+        if args.source_layout_control:
+            started = time.monotonic_ns()
+            # Reserve/pack ALL cases before making any HBM shadow or graph.
+            # The random region is outside the reservations for every case.
+            for case_index, (misses, geometry) in enumerate(
+                zip(args.misses, geometries)
+            ):
+                plan = make_plan(torch, args, geometry, case_index, misses)
+                adjacent, evidence = prepare_adjacent_source(
+                    torch, host, plan, geometry
+                )
+                prepared_plans[case_index] = (plan, adjacent)
+                report.setdefault("layout_plans", []).append(
+                    dict(case=f"B{args.batch}-miss{misses}", **evidence)
+                )
+            report["layout_prepare_us"] = (time.monotonic_ns() - started) / 1000
         device_sources = {}
         if args.device_source_control:
             # One identical full source per GPU, shared across miss shapes.
@@ -591,7 +640,11 @@ def main():
             ]
         cases = {}
         for case_index, (misses, geometry) in enumerate(zip(args.misses, geometries)):
-            plan = make_plan(torch, args, geometry, case_index, misses)
+            plan = (
+                prepared_plans[case_index][0]
+                if args.source_layout_control
+                else make_plan(torch, args, geometry, case_index, misses)
+            )
             label = f"B{args.batch}-miss{misses}"
             ordered_plan = None
             base_plan = plan
@@ -603,7 +656,12 @@ def main():
                 )
             for method in methods:
                 ordered = method in ("sm_ordered", "sm_hbm_ordered")
-                anchor = "sm_ordered" if method == "sm_hbm_ordered" else "sm"
+                adjacent = method in ("sm_adjacent", "sm_hbm_adjacent")
+                anchor = (
+                    "sm_adjacent"
+                    if method == "sm_hbm_adjacent"
+                    else "sm_ordered" if method == "sm_hbm_ordered" else "sm"
+                )
                 cases[(label, method)] = {
                     device: CopyCase(
                         torch,
@@ -614,7 +672,11 @@ def main():
                         geometry["payload_bytes"],
                         geometry["banks"],
                         args,
-                        ordered_plan if ordered else base_plan,
+                        (
+                            prepared_plans[case_index][1]
+                            if adjacent
+                            else ordered_plan if ordered else base_plan
+                        ),
                         misses,
                         device_sources.get(device),
                         cases.get((label, anchor), {}).get(device),
@@ -622,6 +684,51 @@ def main():
                     )
                     for device in args.devices
                 }
+            if args.source_layout_control:
+                for device in args.devices:
+                    selected = [
+                        cases[(label, method)][device]
+                        for method in methods
+                        if method != "ce"
+                    ]
+                    root_kwargs = selected[0].sm_kwargs
+                    checks = {
+                        key: all(
+                            case.sm_kwargs[key].data_ptr()
+                            == root_kwargs[key].data_ptr()
+                            for case in selected
+                        )
+                        for key in (
+                            "miss_dst",
+                            "miss_count",
+                            "num_real_reqs",
+                            "device_buffer",
+                        )
+                    }
+                    checks["source_plan_shape_stride"] = all(
+                        case.plan_src.shape == selected[0].plan_src.shape
+                        and case.plan_src.stride() == selected[0].plan_src.stride()
+                        for case in selected
+                    )
+                    checks["unchanged_launch_policy"] = all(
+                        case.sm_kwargs["load_policy"] == "legacy"
+                        and case.sm_kwargs["num_blocks"] == 4
+                        and case.sm_kwargs["block_size"] == 1024
+                        for case in selected
+                    )
+                    checks["same_source_allocation_per_kind"] = (
+                        selected[0].source.data_ptr() == selected[1].source.data_ptr()
+                        and selected[2].source.data_ptr()
+                        == selected[3].source.data_ptr()
+                    )
+                    valid = all(checks.values())
+                    report.setdefault("layout_bindings", []).append(
+                        dict(case=label, device=device, valid=valid, checks=checks)
+                    )
+                    if not valid:
+                        raise RuntimeError(
+                            "Layout variants changed shared plans, output or launch"
+                        )
         label = f"bulk-ce-{args.bulk_ce_mib}MiB"
         cases[(label, "ce")] = {
             device: CopyCase(
@@ -657,6 +764,30 @@ def main():
         if args.reverse_method_order:
             cases = dict(reversed(list(cases.items())))
         for phase in args.phases:
+            if args.source_layout_control:
+                labels = [f"B{args.batch}-miss{m}" for m in args.misses]
+                if args.reverse_method_order:
+                    labels.reverse()
+                for label in labels:
+                    for trial, device in enumerate(order):
+                        for method in layout_method_pairs(
+                            methods, trial, args.reverse_method_order
+                        ):
+                            with torch.cuda.device(device):
+                                case = cases[(label, method)][device]
+                                case.warm(torch, phase, warmers[device], args)
+                                report["waves"].append(
+                                    case.measure(torch, observer, phase, trial)
+                                )
+                    print(f"Completed {phase} {label} layout pairs", flush=True)
+                for trial, device in enumerate(order):
+                    with torch.cuda.device(device):
+                        case = cases[(f"bulk-ce-{args.bulk_ce_mib}MiB", "ce")][device]
+                        case.warm(torch, phase, warmers[device], args)
+                        report["waves"].append(
+                            case.measure(torch, observer, phase, trial)
+                        )
+                continue
             for (label, method), devices in cases.items():
                 for trial, device in enumerate(order):
                     with torch.cuda.device(device):
@@ -676,6 +807,14 @@ def main():
         try:
             target.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
             (args.output_dir / "pair-compact.txt").write_text(compact_report(report))
+            if args.source_layout_control:
+                try:
+                    layout_text = layout_compact_report(report)
+                except Exception as exc:
+                    # Preserve the acquisition error and raw report even if a
+                    # partial wave cannot be paired after an interrupted run.
+                    layout_text = f"ready_for_main=False\nAcquisition error: {report.get('error')}\nLayout summary error: {type(exc).__name__}: {exc}\n"
+                (args.output_dir / "layout-compact.txt").write_text(layout_text)
         finally:
             if registered:
                 for device in args.devices:

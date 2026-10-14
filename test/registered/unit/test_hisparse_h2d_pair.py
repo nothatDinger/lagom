@@ -389,6 +389,7 @@ def captured_pair_fixture(
     copy_load_policy_control=False,
     source_order_control=False,
     copy_vector_control=False,
+    source_layout_control=False,
 ):
     report = dict(
         success=True,
@@ -403,6 +404,7 @@ def captured_pair_fixture(
             copy_load_policy_control=copy_load_policy_control,
             source_order_control=source_order_control,
             copy_vector_control=copy_vector_control,
+            source_layout_control=source_layout_control,
         ),
         devices={},
         waves=[],
@@ -449,7 +451,9 @@ def captured_pair_fixture(
                 device=device,
                 all_payload_bytes_checked=True,
                 graph_replay_checked=True,
-                untouched_bytes_checked=(source_order_control or copy_vector_control)
+                untouched_bytes_checked=(
+                    source_order_control or copy_vector_control or source_layout_control
+                )
                 and method in SM_LOAD_POLICIES,
             )
         )
@@ -549,6 +553,40 @@ def test_vector_controls_cover_all_sources_and_guard_bytes():
         w for w in report["profile_waves"] if w["method"] != "sm_hbm_ca_v2"
     ]
     assert not validate_profile(report, events)
+
+
+def test_layout_controls_cover_adjacent_sources_without_changing_kernel_policy():
+    report, events = captured_pair_fixture(True, source_layout_control=True)
+    assert len(expected_case_keys(report)) == 22
+    assert validate_profile(report, events)
+    assert correctness_summary(report)["complete"]
+    assert all(
+        SM_LOAD_POLICIES[name] == "legacy"
+        for name in copy_methods(report["config"])
+        if name != "ce"
+    )
+    text = compact_report(report)
+    assert "UNTOUCHED_SM checked=16/16" in text
+    assert "ORIGINAL scattered-source oracle" in text
+    assert text.count("source=device h2d_bytes_per_copy=0") == 8
+    report["profile_waves"] = [
+        w for w in report["profile_waves"] if w["method"] != "sm_adjacent"
+    ]
+    assert not validate_profile(report, events)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {},
+        {"device_source_control": True, "source_order_control": True},
+        {"device_source_control": True, "copy_load_policy_control": True},
+        {"device_source_control": True, "copy_vector_control": True},
+    ],
+)
+def test_layout_control_rejects_missing_hbm_or_other_interventions(extra):
+    with pytest.raises(ValueError):
+        copy_methods(dict(source_layout_control=True, **extra))
 
 
 @pytest.mark.parametrize(

@@ -18,6 +18,8 @@ SM_LOAD_POLICIES = {
     "sm_hbm_ca": "ca",
     "sm_hbm_ca_pair": "ca_pair",
     "sm_hbm_ca_v2": "ca_v2",
+    "sm_adjacent": "legacy",
+    "sm_hbm_adjacent": "legacy",
 }
 
 
@@ -26,10 +28,29 @@ def source_kind(method):
 
 
 def check_untouched(config):
-    return bool(config.get("source_order_control") or config.get("copy_vector_control"))
+    return bool(
+        config.get("source_order_control")
+        or config.get("copy_vector_control")
+        or config.get("source_layout_control")
+    )
 
 
 def copy_methods(config):
+    if config.get("source_layout_control", False):
+        if not config.get("device_source_control", False):
+            raise ValueError("Source layout control requires --device-source-control")
+        if any(
+            config.get(key)
+            for key in (
+                "source_order_control",
+                "copy_load_policy_control",
+                "copy_vector_control",
+            )
+        ):
+            raise ValueError(
+                "Run source layout separately from ordering/cache/vector sweeps"
+            )
+        return ("sm", "sm_adjacent", "sm_hbm", "sm_hbm_adjacent", "ce")
     if config.get("copy_vector_control", False):
         if not config.get("device_source_control", False):
             raise ValueError("Vector control requires --device-source-control")
@@ -391,6 +412,12 @@ def compact_report(report):
             "Sorting is outside timing; this is a mechanism control, not a production speedup."
         )
         lines.append(f'ORDERED_PLANS {report.get("ordered_plans", [])}')
+    if report["config"].get("source_layout_control", False):
+        lines.append(
+            "SOURCE_LAYOUT sm/sm_hbm=scattered; sm_adjacent/sm_hbm_adjacent=adjacent C4 slots. "
+            "Value/scale packing is outside timing. All GPU outputs use the ORIGINAL scattered-source oracle. "
+            "Counts/destination/launch/load policy are shared; virtual footprint changes."
+        )
     groups = defaultdict(lambda: defaultdict(list))
     for wave in report.get("waves", []):
         groups[(wave["phase"], wave["case"], wave["method"])][wave["device"]].append(
