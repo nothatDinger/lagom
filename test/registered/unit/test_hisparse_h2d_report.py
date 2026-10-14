@@ -1,10 +1,11 @@
 import copy
 import importlib.util
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
-
 from sglang.benchmark.hisparse_h2d import summarize
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -16,9 +17,10 @@ compact = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(compact)
 
 
-def analysis(device=0, slowdown=1):
+def analysis(device=0, slowdown=1, batches=(32, 32), widths=None):
     rows, events = [], []
-    for cycle in range(2):
+    widths = widths or [6] * len(batches)
+    for batch, width in zip(batches, widths):
         for layer, misses, us in [(0, 0, 10), (1, 1, 20), (2, 320, 60)]:
             index = len(rows)
             start = index * 1000
@@ -26,17 +28,17 @@ def analysis(device=0, slowdown=1):
                 dict(
                     index=index,
                     layer=layer,
-                    verify_width=6,
-                    real_batch=32,
+                    verify_width=width,
+                    real_batch=batch,
                     captured_batch=32,
                     item_bytes=584,
                     copy_blocks=4,
                     copy_threads=1024,
                     skip_io=False,
                     gpu_stamp_ns=start + 1,
-                    misses_per_request=[misses] * 32,
-                    unique_misses=misses * 32,
-                    h2d_bytes=misses * 32 * 584,
+                    misses_per_request=[misses] * batch,
+                    unique_misses=misses * batch,
+                    h2d_bytes=misses * batch * 584,
                 )
             )
             for name, ts, dur in [
@@ -89,6 +91,79 @@ def test_cycle_cost_is_not_guessed_from_partial_or_interleaved_layers():
     altered = copy.deepcopy(rows)
     altered[3]["index"] += 1
     assert compact.cycles(altered) is None
+
+
+def test_geometry_subset_recomputes_totals_and_keeps_zero_payload_and_source():
+    report = analysis(batches=(1, 14, 32, 32, 32), widths=(6, 6, 6, 6, 5))
+    original = copy.deepcopy(report)
+    selected = compact.select_analysis(report, batch_size=32, verify_width=6)
+    assert selected["samples"] == report["samples"][6:12]
+    assert compact.validate_analysis(selected)
+    summary = selected["summary"]
+    assert summary["samples"] == 6
+    assert summary["h2d_bytes"] == 2 * 321 * 32 * 584
+    assert summary["copy_gpu_us"] == summary["copy_gpu_union_us"] == 180
+    assert summary["copy_gpu_overlap_us"] == 0
+    assert summary["recorder_gpu_us"] == 12
+    assert summary["recorder_over_copy_pct"] == pytest.approx(100 * 12 / 180)
+    assert compact.cycles(selected["samples"])["iterations"] == 2
+    assert report == original
+    assert "retained=6/15" in selected["selection"]
+    assert len(compact.select_analysis(report, batch_size=32)["samples"]) == 9
+    assert len(compact.select_analysis(report, verify_width=6)["samples"]) == 12
+
+
+def test_geometry_subset_does_not_stitch_disjoint_cycles():
+    report = analysis(batches=(32, 1, 32))
+    selected = compact.select_analysis(report, batch_size=32)
+    assert [s["index"] for s in selected["samples"]] == [0, 1, 2, 6, 7, 8]
+    assert compact.cycles(selected["samples"]) is None
+
+
+def test_geometry_filter_rejects_unassigned_empty_and_corrupt_inputs(tmp_path):
+    report = analysis()
+    report["pairing"]["mode"] = "capture_totals_only"
+    with pytest.raises(ValueError, match="serialized recorder"):
+        compact.select_analysis(report, batch_size=32)
+    with pytest.raises(ValueError, match="No samples"):
+        compact.select_analysis(analysis(), batch_size=1)
+    report = analysis(batches=(1, 32, 32))
+    # A filter must not conceal a corrupt excluded sample from validation.
+    report["samples"][1]["h2d_bytes"] += 1
+    (tmp_path / "TP0.json").write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="byte sum"):
+        compact.analysis_text(tmp_path, 21, batch_size=32)
+
+
+def test_geometry_filter_cli_needs_no_torch_or_raw_trace(tmp_path):
+    source = tmp_path / "TP0.json"
+    original = json.dumps(analysis(batches=(1, 14, 32, 32, 32), widths=(6, 6, 6, 6, 5)))
+    source.write_text(original)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            str(path),
+            "--analysis-dir",
+            str(tmp_path),
+            "--batch-size",
+            "32",
+            "--verify-width",
+            "6",
+            "--max-layers",
+            "21",
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert "retained=6/15" in result.stdout
+    assert "3/2 0.090" in result.stdout
+    assert "32/32/6 n=6" in result.stdout
+    assert "zero 0.00,11.1" in result.stdout
+    assert "d0:GB/s,time%,mean_MB,n" in result.stdout
+    assert "0 0.00,11.1,0.000,2" in result.stdout
+    assert source.read_text() == original
 
 
 def test_aggregate_only_captures_do_not_invent_layer_timing(tmp_path):
@@ -229,3 +304,7 @@ def test_numa_report_preserves_mixed_nodes_and_partial_vma_scope(tmp_path):
     assert '"whole_vma": false' in text
     assert '"nodes": {"0": 3, "1": 7}' in text
     assert "KV=layer17" in text
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

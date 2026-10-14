@@ -7,8 +7,9 @@
 
 **当前进度：§3 已 3 passed；§4 正反序均 correctness/profile coverage 18/18；
 §5 的 12 次服务测量已完成，未观察到 ca 的服务收益，继续保留 legacy。
-两次 profile 因服务过早退出而未完成。下一步只执行 §5.2 补 legacy/ca 各一次 profile，
-无需重跑正确性、微基准或 12 次吞吐测量。**
+§5.2 的补采结果已收到：四 rank 的全窗口单位字节 copy 时间改善约 0–1.34%，
+没有复现微基准约 5% 的量级。下一步只执行 §5.3，从已有分析 JSON 筛选 B32/W6，
+无需重新占用 GPU，也不重跑正确性、微基准或吞吐测量。**
 
 ## 1. 最新 A/B 的证据边界
 
@@ -302,15 +303,18 @@ PD 场景 JSONL 的 accept_length 可能为空或来自不同统计窗口，不�
 
 目前不能推出“copy 不在关键路径”。这条 verify copy 在代码中是同步路径，
 copy 即使位于依赖链上，也可能因占比很小、其他 rank 限制或其他耗时变化而无法表现出可测吞吐改善。
-更基础的缺口是：约 5% 的微基准收益是否在真实四 rank、实际 miss 形状和 host pool 下保留，尚未测得。
+当时更基础的缺口是：约 5% 的微基准收益是否在真实四 rank、实际 miss 形状和 host pool 下保留。
+现已补采，其全窗口结果和剩余的 B32 可比性检查见 §5.3。
 也不能把“不保留”直接命名为 PTX 交互抵消，必须先核对载荷、布局/放置、设备及编译策略。
 
 本轮稳态 accept len 约 4.9–5.3、rate 0.77–0.88，两策略没有明显分化；
 不同于早期 C 的约 5.6，换算每提交 token 的 copy 成本时应使用本次相应窗口的 acceptance。
-此次两份 `/start_profile` 200 ACK 只证明请求已受理；服务随后约 1 秒退出，
+最初两份 `/start_profile` 200 ACK 只证明请求已受理；服务随后约 1 秒退出，
 没有 trace/probe 完整产物，因此不把这两次记为有效 profile。
 
 ### 5.2 仅补 profile：等待本次 capture 的产物完成
+
+本节的补采已经完成，保留以下流程供复现；当前下一步是 §5.3 的离线筛选。
 
 等原 8 卡资源空闲后，按原启动命令分别跑 legacy/ca 两个 profile block。
 每种策略按同样流程预热一次，随后发起一次原 64 请求负载；不重复三次吞吐测量。
@@ -374,16 +378,67 @@ export SGLANG_HISPARSE_H2D_PROBE_MAX_BATCH=1024
 一对 profile 是方向性证据，不是新一轮吞吐统计。若需更细时间线，先从本次保存的
 trace 离线提取，不先安排新的 GPU 重跑。
 
+### 5.3 已收到的生产 copy 结果：仅离线筛选 B32/W6
+
+用户补采简报给出的总量如下。MB/GB 均为十进制；从已四舍五入的 bytes/time
+计算 `1 - (T_ca / bytes_ca) / (T_legacy / bytes_legacy)`，因此百分比只取近似值：
+
+| rank / 物理 GPU | legacy MB / ms | ca MB / ms | ca 单位字节耗时下降 |
+|---|---:|---:|---:|
+| TP0 / GPU4 | 2840.2 / 91.75 | 2848.7 / 91.95 | 约 0.08% |
+| TP1 / GPU5 | 2839.2 / 125.05 | 2849.3 / 124.21 | 约 1.02% |
+| TP2 / GPU6 | 2839.9 / 125.53 | 2848.3 / 124.22 | 约 1.34% |
+| TP3 / GPU7 | 2840.3 / 124.25 | 2847.8 / 123.82 | 约 0.61% |
+
+生产 profile 的全窗口没有复现此前两卡微基准约 3%/5% 的加速，
+因而不能继续沿用“生产 copy 已快 5%，只是端到端掩盖了收益”的前提。
+这仍不能证明 copy 不在关键路径，也不能将差异直接归因于 PTX 交互或四 rank 竞争。
+TP0 约 31 GB/s、其他 rank 约 23 GB/s 的主要差距仍在，ca 没有解决它。
+
+两组各 1344 个样本，但只有 **1155 个是 B32/W6**；另有 B1/W6 的 168 个样本，
+以及 legacy B12 / ca B14 的 21 个样本。完整层序列若通过验证，1155 对应 21 层 × 55 周期，
+不能将全部 64 周期都称为 B32 稳态。总字节归一化并不能消除不同 batch/层载荷的混合影响。
+稳态 acceptance 范围相近（legacy 4.71–5.12、ca 4.75–5.03），目前只有范围、没有
+与这些 55 周期对齐的加权均值；不据此计算精确的每提交 token 成本或临界路径占比。
+
+更新后的紧凑工具可直接筛选**已经保存的 analyzer JSON**，不用读取大 trace、启动服务或导入 torch。
+每个目录仍只放同一策略的一次 capture 的四 rank 分析 JSON。
+将下面两个目录替换成这次实际的 legacy/ca 分析目录，从仓库根目录运行：
+
+```bash
+python3 -S scripts/pd_test/summarize_h2d_report.py \
+  --analysis-dir /path/to/analysis-legacy \
+  --analysis-dir /path/to/analysis-ca \
+  --batch-size 32 --verify-width 6 --max-layers 21 \
+  --output-file work/h2d-round6/service-b32-compact.txt
+```
+
+工具先验证原分析总量，再筛选真实 batch（不是 captured batch），重新计算 bytes、GPU 时间、
+recorder 开销和各层/桶统计。保留零载荷 kernel 耗时及原始 index；不会把被删去的间隔拼成连续周期。
+配对模式不是 `serialized_recorders`、没有匹配样本或输入总量不自洽时会拒绝筛选。
+原始文件不变，输出的 hash 仍指向完整输入；`FILTER retained=1155/1344` 标出选择范围。
+层表为每个 rank 分别提供 GB/s、时间占比、平均 MB/copy 和 n，便于核对同层载荷。
+只有在序列连续且完整时才显示 `21/55`；否则显示 `unverified`，不能只拿 1155/21 猜周期数。
+
+比较每个 rank 的 B32 总体及主导 1–4 MB 桶，然后比较相同层的平均 payload 和单位字节耗时。
+两份 capture 的周期并非一一匹配；平均 payload 接近也不证明具体地址/每请求 misses 分布相同。
+
+- 若可比的 B32/主导层仍只有约 0–1% 改善，本轮停止推进 ca；后续回到 host-backed SM
+  读取的主差距，针对真实 miss/地址分布和四 rank 并发条件设计更有区分力的对照。
+- 若 B32/主导层恢复了约 5%，说明全窗口混合确实影响判断，再从已有 trace 分析
+  verify 依赖链及慢 rank；仍不能仅凭 copy 时间推断端到端收益。
+- 若载荷差异明显，标为不可比；不通过挑选少数有利层给 ca 下结论。
+
+默认策略继续为 legacy。这里不追加 GPU 重跑，也不把一个 profile 窗口当作统计显著性证据。
+
 ## 6. 本次只需反馈
 
-只需 §5.2 的两次 profile 反馈，不需要再发已收到的吞吐或微基准数据：
+只需 §5.3 生成的短文本，不需要再发已收到的吞吐、微基准或 acceptance 范围：
 
-1. 两组 capture_id、完成的四个 rank，以及 analyzer 是否通过。
-2. 每 rank 的 bytes、copy 时间/GB/s、B/captured/W、完整 layer/cycle 数、copy ms/cycle、
-   主导 1–4 MB 桶的带宽/时间占比及 recorder 开销。可沿用
-   `summarize_h2d_report.py --analysis-dir ... --max-layers 21`，两个目录各自只放一组 capture。
-3. 对应窗口附近的 accept len/rate、physical GPU4–7 映射；probe 已记录 host_numa_snapshot，
-   如两组实际 KV pool 的 NUMA 放置不同，请标出，不把 VMA 的总页数当作某个 buffer 的独占页数。
+1. 八行 B32 rank 汇总（bytes、copy ms、GB/s、rec%、layer/cycle）及对应 FILTER/pairing 行。
+2. 两组的 21 层表和载荷桶表；每层每 rank 的平均 payload 已由工具列出。
+3. 仅补充已有记录中发现的异常：四 rank 是否实际选中了预期 policy、
+   两组 host_numa_snapshot 的 KV pool 放置是否不同。未核实的项目写“未核实”，无需补采。
 
 无需上传 trace 或完整服务日志。完整 verify 时间/临界路径未提取时标为未测，
 不能用每周期 copy 时长之和替代整次迭代，也不能用此推断 copy 不在临界路径。

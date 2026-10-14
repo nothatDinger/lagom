@@ -6,11 +6,13 @@ JSONs from hisparse_h2d.py, not its shortened stdout or raw profiler traces.
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import math
 import re
 import statistics
 from collections import Counter, defaultdict, deque
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -89,7 +91,47 @@ def bucket(byte_count):
     return "[16,inf)"
 
 
-def analysis_text(directory, max_layers):
+@lru_cache(maxsize=1)
+def load_analysis_helpers():
+    # Load the standard-library-only analyzer without importing sglang/torch.
+    path = (
+        Path(__file__).resolve().parents[2] / "python/sglang/benchmark/hisparse_h2d.py"
+    )
+    spec = importlib.util.spec_from_file_location("h2d_analysis_helpers", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def select_analysis(report, batch_size=None, verify_width=None):
+    """Build a display-only subset, retaining original sample indices."""
+    if batch_size is None and verify_width is None:
+        return report
+    if report.get("pairing", {}).get("mode") != "serialized_recorders":
+        raise ValueError("Geometry filtering requires serialized recorder timing")
+    rows = [
+        s
+        for s in report["samples"]
+        if (batch_size is None or s["real_batch"] == batch_size)
+        and (verify_width is None or s["verify_width"] == verify_width)
+    ]
+    if not rows:
+        raise ValueError("No samples match the requested B/W geometry")
+    return dict(
+        device=report["device"],
+        pid=report["pid"],
+        pairing=report["pairing"],
+        samples=rows,
+        summary=load_analysis_helpers()._summarize(rows),
+        selection=(
+            f"real_batch={batch_size} verify_width={verify_width} "
+            f"retained={len(rows)}/{len(report['samples'])}; "
+            "original indices retained; source digest covers the full input"
+        ),
+    )
+
+
+def analysis_text(directory, max_layers, *, batch_size=None, verify_width=None):
     artifacts = []
     for path in sorted(directory.rglob("*.json")):
         data = path.read_bytes()
@@ -97,6 +139,7 @@ def analysis_text(directory, max_layers):
         if "summary" not in report or "samples" not in report:
             continue
         timed = validate_analysis(report)
+        report = select_analysis(report, batch_size, verify_width)
         artifacts.append(
             (report, path.name, hashlib.sha256(data).hexdigest()[:12], timed)
         )
@@ -115,6 +158,8 @@ def analysis_text(directory, max_layers):
     groups, totals = [], []
     for report, name, digest, timed in artifacts:
         summary, rows = report["summary"], report["samples"]
+        if "selection" in report:
+            lines.append(f"  device={report['device']} FILTER {report['selection']}")
         cycle = cycles(rows) if timed else None
         cycle_text = (
             f'{cycle["layers"]}/{cycle["iterations"]} {cycle["copy_ms"]:.3f}'
@@ -180,18 +225,23 @@ def analysis_text(directory, max_layers):
     if max_layers >= len(all_layers):
         selected = all_layers
     lines.append(
-        "Layers: reference mean_MB/copy; each device cell=GB/s,time% (per-rank totals). selected="
+        "Layers: each device cell=GB/s,time%,mean_MB/copy,n (per-rank totals). selected="
         + str(selected)
     )
-    lines.append("layer mean_MB " + " ".join(f"d{d}:GB/s,time%" for d in devices))
+    lines.append("layer " + " ".join(f"d{d}:GB/s,time%,mean_MB,n" for d in devices))
     for layer in selected:
         cells = [stats(g[layer]) if layer in g else None for g in groups]
-        reference = cells[0]
-        mean_mb = f'{reference["nbytes"]/reference["n"]/1e6:.3f}' if reference else "NA"
         lines.append(
-            f"{layer} {mean_mb} "
+            f"{layer} "
             + " ".join(
-                f'{c["GBps"]:.2f},{100*c["us"]/t:.1f}' if c else "NA"
+                (
+                    (
+                        f'{c["GBps"]:.2f},{100*c["us"]/t:.1f},'
+                        f'{c["nbytes"]/c["n"]/1e6:.3f},{c["n"]}'
+                    )
+                    if c
+                    else "NA"
+                )
                 for c, t in zip(cells, totals)
             )
         )
@@ -396,19 +446,38 @@ def main():
     parser.add_argument("--copy-dir", type=Path)
     parser.add_argument("--decode-log", type=Path)
     parser.add_argument("--max-layers", type=int, default=8)
+    parser.add_argument(
+        "--batch-size", type=int, help="Filter analysis samples by real batch"
+    )
+    parser.add_argument(
+        "--verify-width", type=int, help="Filter analysis samples by verify width"
+    )
     parser.add_argument("--output-file", type=Path)
     args = parser.parse_args()
     if args.max_layers < 1 or not (
         args.analysis_dir or args.numa_file or args.copy_dir or args.decode_log
     ):
         parser.error("Provide inputs and a positive --max-layers")
+    if any(v is not None and v < 1 for v in (args.batch_size, args.verify_width)):
+        parser.error("Geometry filters must be positive")
+    if (
+        args.batch_size is not None or args.verify_width is not None
+    ) and not args.analysis_dir:
+        parser.error("Geometry filters require --analysis-dir")
     try:
         lines = [
             "H2D compact report; GB/s = decimal payload / GPU time. No TP rank times are summed.",
             "Per-cycle copy sum excludes other kernels; ratios across captures do not establish causation.",
         ]
         for directory in args.analysis_dir:
-            lines.extend(analysis_text(directory, args.max_layers))
+            lines.extend(
+                analysis_text(
+                    directory,
+                    args.max_layers,
+                    batch_size=args.batch_size,
+                    verify_width=args.verify_width,
+                )
+            )
         if args.numa_file:
             lines.extend(numa_text(args.numa_file))
         if args.copy_dir:
