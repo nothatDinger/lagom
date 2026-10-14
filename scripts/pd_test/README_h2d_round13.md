@@ -4,6 +4,9 @@
 本轮只编译、验证字节正确性并离线提取 SASS；没有性能计时、模型服务或 NCU。
 使用已有 CUDA/venv/cuobjdump，无需安装新工具或 Docker。
 
+修正版实机正确性与SASS已核对，后续操作见[第十四轮配对性能对照](README_h2d_round14.md)。
+补充文件中的0950 BRA有M0x02，但未等待A写入的barrier 5；不能描述为“中间完全无非零wait”。
+
 ## 1. 为什么现在做这个候选
 
 [第十二轮分析](README_h2d_prefetch_analysis.md)已确认：相邻 KV 的源数据没有算法依赖，
@@ -151,4 +154,5 @@ CPU 单测覆盖字节oracle、尾项/padding、API隔离、实际JIT产物识�
 Python静态检查、两个CLI加载及shell语法检查通过；
 6项CUDA测试因无GPU跳过，没有计入通过数。
 开发环境没有 NVCC/GPU，不能验证 CUDA 编译、真实寄存器分配或 graph 执行；
-首版CUDA已在实机验证；修正版的CUDA编译/执行及新SASS仍须实机复核，不能用 CPU 通过代替。
+该段记录开发时的验证边界；随后修正版的实机12/12与新SASS核对结果已归档到
+[第十四轮§1](README_h2d_round14.md#1-第十三轮判读结果)，不以CPU通过代替CUDA验证。

@@ -28,11 +28,13 @@ from sglang.benchmark.hisparse_h2d_layout import (
     prepare_adjacent_source,
 )
 from sglang.benchmark.hisparse_h2d_pair import (
+    SM_ITERATOR_DEPTHS,
     SM_LOAD_POLICIES,
     abba_order,
     check_untouched,
     compact_report,
     copy_methods,
+    iterator_call_options,
     pci_path,
     source_kind,
     validate_profile,
@@ -278,8 +280,16 @@ class CopyCase:
                 output = kwargs["device_buffer"]
                 dst = kwargs["miss_dst"]
                 copy_kwargs = {k: v for k, v in kwargs.items() if k != "miss_dst"}
+                copy_fn = copy_cache_planned_mla
+                if method in SM_ITERATOR_DEPTHS:
+                    from sglang.kernels.ops.kvcache.hisparse import (
+                        copy_cache_planned_mla_iterator,
+                    )
+
+                    copy_fn = copy_cache_planned_mla_iterator
+                    copy_kwargs = iterator_call_options(copy_kwargs, method)
                 self.functions = [
-                    lambda bank=bank: copy_cache_planned_mla(
+                    lambda bank=bank: copy_fn(
                         miss_src=src[bank],
                         miss_dst=dst[bank] if dst.ndim == 3 else dst,
                         **copy_kwargs,
@@ -478,6 +488,12 @@ def main():
         "--phases", nargs="+", choices=["copy", "compute"], default=["copy", "compute"]
     )
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--copy-iterator-control", action="store_true")
+    parser.add_argument(
+        "--iterator-evidence",
+        type=Path,
+        help="Existing iterator-check-v2 directory containing check/ and codegen/",
+    )
     parser.add_argument(
         "--source-layout-control",
         action="store_true",
@@ -509,6 +525,16 @@ def main():
         methods = copy_methods(vars(args))
     except ValueError as exc:
         parser.error(str(exc))
+    iterator_evidence = None
+    if args.copy_iterator_control:
+        if args.iterator_evidence is None:
+            parser.error("Iterator control requires --iterator-evidence")
+        from sglang.benchmark.hisparse_h2d_iterator_perf import load_iterator_evidence
+
+        # Read full local evidence before any CUDA setup or timing.
+        iterator_evidence = load_iterator_evidence(
+            args.iterator_evidence, Path(__file__).resolve().parents[2]
+        )
     if args.register_device not in args.devices:
         parser.error("Registration device must be one of --devices")
     order = abba_order(args.devices, args.epochs, args.reverse_order)
@@ -562,6 +588,9 @@ def main():
         config={
             **vars(args),
             "output_dir": str(args.output_dir),
+            "iterator_evidence": (
+                str(args.iterator_evidence) if args.iterator_evidence else None
+            ),
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
@@ -572,8 +601,23 @@ def main():
         correctness=[],
     )
     host, registered = None, False
-    if args.copy_vector_control or args.source_layout_control:
+    if (
+        args.copy_vector_control
+        or args.source_layout_control
+        or args.copy_iterator_control
+    ):
         report["code"] = vector_provenance()
+        if args.copy_iterator_control:
+            report["iterator_evidence"] = iterator_evidence
+            root = Path(__file__).resolve().parents[2]
+            for name in (
+                "python/sglang/kernels/jit/csrc/hisparse_copy_iterator.cuh",
+                "python/sglang/benchmark/hisparse_h2d_iterator_perf.py",
+                "python/sglang/benchmark/hisparse_h2d_iterator_codegen.py",
+            ):
+                report["code"]["sha256"][name] = hashlib.sha256(
+                    (root / name).read_bytes()
+                ).hexdigest()
         if args.source_layout_control:
             for name in (
                 "python/sglang/benchmark/hisparse_h2d_layout.py",
@@ -684,6 +728,31 @@ def main():
                     )
                     for device in args.devices
                 }
+            if args.copy_iterator_control:
+                from sglang.benchmark.hisparse_h2d_iterator_perf import (
+                    iterator_bindings,
+                )
+
+                for device in args.devices:
+                    checks = iterator_bindings(
+                        {
+                            method: cases[(label, method)][device]
+                            for method in methods
+                            if method != "ce"
+                        }
+                    )
+                    report.setdefault("iterator_bindings", []).append(
+                        dict(
+                            case=label,
+                            device=device,
+                            valid=all(checks.values()),
+                            checks=checks,
+                        )
+                    )
+                    if not all(checks.values()):
+                        raise RuntimeError(
+                            "Iterator variants changed shared inputs/output or geometry"
+                        )
             if args.source_layout_control:
                 for device in args.devices:
                     selected = [
@@ -752,6 +821,18 @@ def main():
                         ),
                     )
                 )
+        if args.copy_iterator_control:
+            from sglang.benchmark.hisparse_h2d_iterator_codegen import (
+                loaded_iterator_artifacts,
+            )
+            from sglang.benchmark.hisparse_h2d_iterator_perf import (
+                match_iterator_artifacts,
+            )
+
+            report["jit_artifacts"] = loaded_iterator_artifacts()
+            report["iterator_artifacts_match"] = match_iterator_artifacts(
+                iterator_evidence, report["jit_artifacts"]
+            )
         if args.copy_vector_control:
             from sglang.benchmark.hisparse_h2d_codegen import loaded_copy_artifacts
 
@@ -764,6 +845,38 @@ def main():
         if args.reverse_method_order:
             cases = dict(reversed(list(cases.items())))
         for phase in args.phases:
+            if args.copy_iterator_control:
+                from sglang.benchmark.hisparse_h2d_iterator_perf import (
+                    iterator_method_order,
+                )
+
+                for misses in args.misses:
+                    label = f"B{args.batch}-miss{misses}"
+                    local_trials = {device: 0 for device in args.devices}
+                    for trial, device in enumerate(order):
+                        method_order = iterator_method_order(
+                            local_trials[device], args.reverse_method_order
+                        )
+                        for position, method in enumerate(method_order):
+                            with torch.cuda.device(device):
+                                case = cases[(label, method)][device]
+                                case.warm(torch, phase, warmers[device], args)
+                                wave = case.measure(torch, observer, phase, trial)
+                                wave.update(
+                                    method_position=position,
+                                    local_trial=local_trials[device],
+                                )
+                                report["waves"].append(wave)
+                        local_trials[device] += 1
+                    print(f"Completed {phase} {label} iterator pairs", flush=True)
+                for trial, device in enumerate(order):
+                    with torch.cuda.device(device):
+                        case = cases[(f"bulk-ce-{args.bulk_ce_mib}MiB", "ce")][device]
+                        case.warm(torch, phase, warmers[device], args)
+                        report["waves"].append(
+                            case.measure(torch, observer, phase, trial)
+                        )
+                continue
             if args.source_layout_control:
                 labels = [f"B{args.batch}-miss{m}" for m in args.misses]
                 if args.reverse_method_order:
@@ -807,6 +920,18 @@ def main():
         try:
             target.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
             (args.output_dir / "pair-compact.txt").write_text(compact_report(report))
+            if args.copy_iterator_control:
+                from sglang.benchmark.hisparse_h2d_iterator_perf import (
+                    iterator_compact_report,
+                )
+
+                try:
+                    iterator_text = iterator_compact_report(report)
+                except Exception as exc:
+                    iterator_text = f"results_valid=False\nAcquisition error: {report.get('error')}\nSummary error: {type(exc).__name__}: {exc}\n"
+                (args.output_dir / "iterator-perf-compact.txt").write_text(
+                    iterator_text
+                )
             if args.source_layout_control:
                 try:
                     layout_text = layout_compact_report(report)

@@ -20,7 +20,30 @@ SM_LOAD_POLICIES = {
     "sm_hbm_ca_v2": "ca_v2",
     "sm_adjacent": "legacy",
     "sm_hbm_adjacent": "legacy",
+    "sm_iter_d1": "legacy",
+    "sm_iter_d2": "legacy",
+    "sm_hbm_iter_d1": "legacy",
+    "sm_hbm_iter_d2": "legacy",
 }
+
+SM_ITERATOR_DEPTHS = {
+    "sm_iter_d1": 1,
+    "sm_iter_d2": 2,
+    "sm_hbm_iter_d1": 1,
+    "sm_hbm_iter_d2": 2,
+}
+
+
+def iterator_call_options(kwargs, method):
+    """Translate only the diagnostic call; retain shared reporting kwargs."""
+    return {
+        **{
+            k: v
+            for k, v in kwargs.items()
+            if k not in ("item_size_bytes", "is_dsv4_layout", "load_policy")
+        },
+        "depth": SM_ITERATOR_DEPTHS[method],
+    }
 
 
 def source_kind(method):
@@ -32,10 +55,33 @@ def check_untouched(config):
         config.get("source_order_control")
         or config.get("copy_vector_control")
         or config.get("source_layout_control")
+        or config.get("copy_iterator_control")
     )
 
 
 def copy_methods(config):
+    if config.get("copy_iterator_control", False):
+        if not config.get("device_source_control", False):
+            raise ValueError("Iterator control requires --device-source-control")
+        if any(
+            config.get(k)
+            for k in (
+                "source_layout_control",
+                "source_order_control",
+                "copy_load_policy_control",
+                "copy_vector_control",
+            )
+        ):
+            raise ValueError("Run iterator control separately from other sweeps")
+        return (
+            "sm",
+            "sm_iter_d1",
+            "sm_iter_d2",
+            "sm_hbm",
+            "sm_hbm_iter_d1",
+            "sm_hbm_iter_d2",
+            "ce",
+        )
     if config.get("source_layout_control", False):
         if not config.get("device_source_control", False):
             raise ValueError("Source layout control requires --device-source-control")
@@ -170,11 +216,17 @@ def activity_check(events, wave):
         and e["ts"] + e.get("dur", 0) <= hi
     ]
     if wave["method"] in SM_LOAD_POLICIES:
+        depth = SM_ITERATOR_DEPTHS.get(wave["method"])
+        kernel_name = (
+            f"copy_cache_planned_iterator_kernel<1024,{depth}>"
+            if depth is not None
+            else "copy_cache_planned_kernel"
+        )
         copies = [
             e
             for e in candidates
             if "kernel" in e.get("cat", "").lower()
-            and "copy_cache_planned_kernel" in e["name"]
+            and kernel_name in e["name"].replace(" ", "")
         ]
     elif wave["method"] == "ce":
         copies = [
