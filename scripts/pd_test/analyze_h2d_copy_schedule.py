@@ -47,10 +47,43 @@ def flat_oracle(counts, warps, real):
     return output
 
 
+def iterator_schedule(counts, warps, real, depth):
+    """Model the candidate's persistent cursor and guarded one/two-item groups."""
+    assert depth in (1, 2)
+    output = [[] for _ in range(warps)]
+    for warp in range(warps):
+        flat, row, start, end = warp, -1, 0, 0
+        while True:
+            pending = []
+            for _ in range(depth):
+                if row >= real:
+                    continue
+                while flat >= end:
+                    row += 1
+                    if row >= real:
+                        break
+                    start, end = end, end + counts[row]
+                if row < real:
+                    pending.append((row, flat - start, flat))
+                    flat += warps
+            if not pending:
+                break
+            output[warp].extend(pending)
+    return output
+
+
 def verify(counts, warps, real=None):
     real = len(counts) if real is None else real
     actual = kernel_schedule(counts, warps, real)
-    assert actual == flat_oracle(counts, warps, real), (counts, warps, real)
+    oracle = flat_oracle(counts, warps, real)
+    assert actual == oracle, (counts, warps, real)
+    for depth in (1, 2):
+        assert iterator_schedule(counts, warps, real, depth) == oracle, (
+            counts,
+            warps,
+            real,
+            depth,
+        )
     return actual
 
 
@@ -94,7 +127,9 @@ def main():
             # Negative padding makes an accidental traversal of inactive rows fail.
             verify(counts + [-999] * 3, 128, real)
             checks += 1
-    print(f"CPU_TRAVERSAL_CHECK passed={checks}; no CUDA execution or bandwidth model")
+    print(
+        f"CPU_TRAVERSAL_CHECK passed={checks} variants=legacy,D1,D2; no CUDA execution or bandwidth model"
+    )
     summarize("B32-miss100", [100] * 32)
     summarize("B32-miss1272", [1272] * 32)
     summarize("B32-miss2", [2] * 32)

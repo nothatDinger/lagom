@@ -128,6 +128,93 @@ def _jit_dsv4_transfer_module(block_size: int) -> Module:
     )
 
 
+@functools.cache
+def _jit_copy_iterator_module(block_size: int, depth: int) -> Module:
+    template_args = make_cpp_args(block_size, depth)
+    return load_jit(
+        "sparse_copy_iterator",
+        block_size,
+        depth,
+        cuda_files=["hisparse_copy_iterator.cuh"],
+        cuda_wrappers=[
+            (
+                "copy_cache_planned_iterator",
+                f"copy_cache_planned_iterator<{template_args}>",
+            )
+        ],
+    )
+
+
+def copy_cache_planned_mla_iterator(
+    *,
+    miss_src: torch.Tensor,
+    miss_dst: torch.Tensor,
+    miss_count: torch.Tensor,
+    num_real_reqs: torch.Tensor,
+    host_cache: torch.Tensor,
+    device_buffer: torch.Tensor,
+    depth: int,
+    num_blocks: int = 4,
+    block_size: int = 1024,
+) -> None:
+    """Diagnostic CUDA DSv4 C4 copy with one/two KV slots per warp.
+
+    Separate JIT entry point; the service does not select it via environment.
+    Both depths use legacy scalar loads and identical traversal. Inspect actual
+    codegen for staging and spills before interpreting performance.
+    """
+    if depth not in (1, 2) or torch.version.hip is not None:
+        raise ValueError("Iterator copy requires NVIDIA CUDA and depth 1 or 2")
+    if num_blocks != 4 or block_size != 1024:
+        raise ValueError("Iterator diagnostic fixes the launch at CTA4/1024")
+    if (
+        miss_src.dtype != torch.int64
+        or miss_dst.dtype != torch.int32
+        or miss_count.dtype != torch.int32
+        or num_real_reqs.dtype != torch.int32
+        or miss_src.ndim != 2
+        or miss_dst.shape != miss_src.shape
+        or miss_src.stride(1) != 1
+        or miss_dst.stride(1) != 1
+        or miss_src.stride(0) != miss_dst.stride(0)
+        or miss_count.shape != (miss_src.shape[0],)
+        or not miss_count.is_contiguous()
+        or num_real_reqs.numel() != 1
+    ):
+        raise ValueError("Invalid iterator miss plan/counts shape, dtype or stride")
+    if any(
+        tensor.dtype != torch.uint8
+        or tensor.ndim != 2
+        or tensor.shape[1] != 37440
+        or not tensor.is_contiguous()
+        for tensor in (host_cache, device_buffer)
+    ):
+        raise ValueError(
+            "Iterator copy requires contiguous uint8 C4 rows of 37440 bytes"
+        )
+    if miss_src.device.type != "cuda" or any(
+        tensor.device != miss_src.device
+        for tensor in (miss_dst, miss_count, num_real_reqs, device_buffer)
+    ):
+        raise ValueError(
+            "Iterator plans, counts and destination must share one CUDA device"
+        )
+    if host_cache.device.type != "cpu" and host_cache.device != miss_src.device:
+        raise ValueError(
+            "Iterator source must be pinned CPU memory or the same CUDA device"
+        )
+    module = _jit_copy_iterator_module(block_size, depth)
+    module.copy_cache_planned_iterator(
+        miss_src,
+        miss_dst,
+        miss_count,
+        num_real_reqs,
+        host_cache,
+        device_buffer,
+        num_blocks,
+    )
+
+
 def transfer_cache_dsv4_mla(
     src_ptrs: torch.Tensor,
     dst_ptrs: torch.Tensor,
