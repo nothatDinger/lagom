@@ -110,7 +110,7 @@ eager 和 graph；接下来 device=1 的 host eager 通过，失败在 `graph_ch
 JSON 记录每项 `capture` 校验；失败时 compact 输出 `FAILURE_CONTEXT` 与已完成的
 `COMPLETED` 项，区分 eager、capture、graph replay/check、测量阶段。
 kernel、`.cv` 指令、地址集合、链布局和计时方式均保持原样。
-需要下面的实机重试验证修复；旧失败运行没有可用的性能结论。
+修复现已由下面记录的实机 smoke 验证；旧失败运行没有可用的性能结论。
 
 `expected=[24,32640]` 的含义是 `[终点 node ID, 访问的 node ID 总和]`；
 256 个节点恰好遍历一次时，`sum(range(256))=32640`。这两个字段不是指针。
@@ -118,7 +118,8 @@ kernel、`.cv` 指令、地址集合、链布局和计时方式均保持原样�
 每次加载前先检查 `node_id < nodes`。`actual=[-1,-1]` 表示输出仍为哨兵，
 不能单凭它断言某一跳读到了坏 host 指针。清理阶段 rc=700 也不是注册地址错误的证明。
 
-更新实验 worktree 后，在物理 GPU4/5 空闲时执行。使用新目录保留旧数据：
+以下为 smoke 复现命令；已完成本节门禁的机器直接进入 §4，无需重复 smoke。
+更新实验 worktree 后，在物理 GPU4/5 空闲时执行，使用新目录保留旧数据：
 
 ```bash
 git fetch origin perf/hisparse-h2d-diagnosis
@@ -140,10 +141,22 @@ CUDA_VISIBLE_DEVICES=4,5 numactl --cpunodebind=1 --membind=1 \
 身份为物理 GPU4/5，host 在 node1，
 每个 eager/graph/测量校验通过、event 时间均为正。失败则返回 compact 的 ERROR 或日志末尾，
 停在 smoke。smoke 性能不用于判读。此工具不请求 profiler，故没有 profile_success 门禁。
-**这次修复先只重跑 smoke，返回通过状态；暂不启动 §4。** 若仍失败，返回
+若失败，返回
 `FAILURE_CONTEXT`、`COMPLETED` 和 traceback 即可，无需额外打印大批指针或上传原始文件。
 
-本地仅有 CPU，CUDA 编译和运行需由此 smoke 验证；不将 CPU 检查表述为 GPU 已通过。
+### 实机 smoke-v2 已通过（2026-10-14，用户简报）
+
+修复提交 `3c0912e1c` 的重试退出码为 0，`success=True correctness=16/16`、
+`CAPTURE_DEVICE_CHECK 16/16`。全部 eager、graph、测量输出校验通过，event 时间均正。
+物理 GPU4/5 的 UUID、BDF 均匹配；共享 host pool 为 1 MiB，256 页全部 node1，
+两条 PCIe 通路均 Gen5 x16。两卡均 P0、MEM 2619，Telemetry errors=0。
+这闭合了探针跨卡 capture 缺陷的修复验证，生产 H2D 差距的根因仍未闭合。
+
+本次 smoke 只有两档 grid（1×1、4×32），因此输出是八条 READ 行。
+N=128 时每链仅 `256/128=2` 跳，几微秒固定开销不可忽略；源分配也仅 1 MiB。
+不能用这些数值宣布单读延迟相同、并行响应相同或排除地址转换因素。
+正式运行将总读数增至 32768、源分配增至 512 MiB；N=128 时每链 256 跳。
+本地仍仅有 CPU，GPU 门禁依据用户的上述实机简报。
 
 ## 4. smoke 通过后只跑一次正式对照
 
@@ -153,14 +166,17 @@ CUDA_VISIBLE_DEVICES=4,5 numactl --cpunodebind=1 --membind=1 \
   --output-dir "$H2D_R8/read-main" >"$H2D_R8/read-main.log" 2>&1
 ```
 
-要求 `success=True correctness=64/64`，每配置每源 8 个 ABBA wave、每卡 4 个 wave，
+要求退出码 0，`success=True correctness=64/64`、`CAPTURE_DEVICE_CHECK 64/64`，
+每配置每源 8 个 ABBA wave、每卡 4 个 wave，
 每 wave 3 个计时样本。全部图完成后修改源表，初始化/拷贝/注册/预热都在计时外。
 原始 JSON 保存所有样本、代码 SHA、实际 GPU、host 页位置和每波 NVML 状态。
 先不做反序、生产修改或 8 卡重测。
 
 短反馈只需：
 
-1. smoke/main 的 success/correctness，UUID→GPU4/5、host node1，STATE 是否匹配。
+1. main 的退出码、success/correctness、CAPTURE_DEVICE_CHECK，UUID→GPU4/5、
+   512 MiB host pool 在 node1，以及原样的两条 STATE（含 SM_MHz）和 Telemetry errors。
+   已通过的 smoke 无需重复或再次贴数值。
 2. 从 `read-main/reads-compact.txt` 取两种 stride、host/HBM 的 **1x1、1x16、4x32**
    共 12 条 READ 行，保留 us/hop_ns/Mloads/s/四波均值/SMs；其余配置先留在本机。
 
