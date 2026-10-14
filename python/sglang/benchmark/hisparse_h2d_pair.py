@@ -1,5 +1,6 @@
 """Standard-library checks and short reports for the shared-host GPU control."""
 
+import json
 import math
 import re
 import statistics
@@ -24,7 +25,17 @@ SM_LOAD_POLICIES = {
     "sm_iter_d2": "legacy",
     "sm_hbm_iter_d1": "legacy",
     "sm_hbm_iter_d2": "legacy",
+    "sm_cta8": "legacy",
+    "sm_hbm_cta8": "legacy",
 }
+
+SM_GRID_BLOCKS = {"sm": 4, "sm_cta8": 8, "sm_hbm": 4, "sm_hbm_cta8": 8}
+
+
+def grid_call_options(kwargs, method):
+    """Change only the runtime grid; keep the legacy JIT specialization."""
+    return dict(kwargs, num_blocks=SM_GRID_BLOCKS[method])
+
 
 SM_ITERATOR_DEPTHS = {
     "sm_iter_d1": 1,
@@ -56,10 +67,26 @@ def check_untouched(config):
         or config.get("copy_vector_control")
         or config.get("source_layout_control")
         or config.get("copy_iterator_control")
+        or config.get("copy_grid_control")
     )
 
 
 def copy_methods(config):
+    if config.get("copy_grid_control", False):
+        if not config.get("device_source_control", False):
+            raise ValueError("Grid control requires --device-source-control")
+        if any(
+            config.get(k)
+            for k in (
+                "source_layout_control",
+                "source_order_control",
+                "copy_load_policy_control",
+                "copy_vector_control",
+                "copy_iterator_control",
+            )
+        ):
+            raise ValueError("Run grid control separately from other sweeps")
+        return ("sm", "sm_cta8", "sm_hbm", "sm_hbm_cta8", "ce")
     if config.get("copy_iterator_control", False):
         if not config.get("device_source_control", False):
             raise ValueError("Iterator control requires --device-source-control")
@@ -162,6 +189,22 @@ def abba_order(devices, epochs, reverse=False):
     return [a, b, b, a] * epochs
 
 
+def launch_shape(value):
+    """Read Kineto launch dimensions; keep absent/unsupported data unknown."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    if (
+        not isinstance(value, (tuple, list))
+        or len(value) != 3
+        or any(type(x) is not int or x <= 0 for x in value)
+    ):
+        return None
+    return tuple(value)
+
+
 def activity_check(events, wave):
     """Validate all copy nodes in one synchronized CPU annotation range.
 
@@ -258,6 +301,26 @@ def activity_check(events, wave):
                 key=str,
             ),
         )
+    launch_evidence = {}
+    if wave.get("grid_control") and wave["method"] in SM_LOAD_POLICIES:
+        blocks = SM_GRID_BLOCKS.get(wave["method"])
+        grids = [launch_shape(e.get("args", {}).get("grid")) for e in copies]
+        threads = [launch_shape(e.get("args", {}).get("block")) for e in copies]
+        launch_evidence = dict(
+            grid_verified=False,
+            grids=sorted(set(map(str, grids))),
+            blocks=sorted(set(map(str, threads))),
+        )
+        if (
+            wave.get("num_blocks") != blocks
+            or wave.get("block_size") != 1024
+            or any(g != (blocks, 1, 1) for g in grids)
+            or any(b != (1024, 1, 1) for b in threads)
+        ):
+            return invalid(
+                "Missing or mismatched grid/block in GPU activities", **launch_evidence
+            )
+        launch_evidence["grid_verified"] = True
     for copy in copies:
         if not math.isfinite(copy["dur"]) or copy["dur"] <= 0:
             return invalid("Invalid GPU activity duration")
@@ -280,6 +343,7 @@ def activity_check(events, wave):
         )
     return dict(
         valid=True,
+        **launch_evidence,
         scope_evidence=evidence,
         activities=len(copies),
         activity_gpu_us=active,
@@ -439,7 +503,12 @@ def compact_report(report):
             f'host={buf["name"]} address={buf["address"]} nbytes={buf["nbytes"]} VMA={placement}'
         )
     lines.append(
-        "Rates use total payload / total time, decimal GB/s. SM uses CTA4/1024 threads."
+        "Rates use total payload / total time, decimal GB/s. "
+        + (
+            "Grid control uses legacy CTA4/CTA8, 1024 threads per CTA."
+            if report["config"].get("copy_grid_control")
+            else "SM uses CTA4/1024 threads."
+        )
     )
     if report["config"].get("copy_load_policy_control", False):
         lines.append(

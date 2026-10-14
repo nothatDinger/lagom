@@ -34,6 +34,7 @@ from sglang.benchmark.hisparse_h2d_pair import (
     check_untouched,
     compact_report,
     copy_methods,
+    grid_call_options,
     iterator_call_options,
     pci_path,
     source_kind,
@@ -213,6 +214,7 @@ class CopyCase:
         self.nbytes, self.banks = nbytes, banks
         self.host = host
         self.source_kind = source_kind(method)
+        self.grid_control = getattr(args, "copy_grid_control", False)
         self.functions = []
         with torch.cuda.device(device):
             if method in SM_LOAD_POLICIES:
@@ -276,6 +278,8 @@ class CopyCase:
                         is_dsv4_layout=True,
                     )
                 kwargs["load_policy"] = SM_LOAD_POLICIES[method]
+                if self.grid_control:
+                    kwargs = grid_call_options(kwargs, method)
                 self.plan_src, self.sm_kwargs = src, kwargs
                 output = kwargs["device_buffer"]
                 dst = kwargs["miss_dst"]
@@ -370,6 +374,17 @@ class CopyCase:
             case=self.label,
             method=self.method,
             load_policy=SM_LOAD_POLICIES.get(self.method, "CE"),
+            grid_control=self.grid_control,
+            num_blocks=(
+                self.sm_kwargs["num_blocks"]
+                if self.method in SM_LOAD_POLICIES
+                else None
+            ),
+            block_size=(
+                self.sm_kwargs["block_size"]
+                if self.method in SM_LOAD_POLICIES
+                else None
+            ),
             source_kind=self.source_kind,
             h2d_bytes_per_copy=0 if self.source_kind == "device" else self.nbytes,
             device=self.device,
@@ -488,6 +503,11 @@ def main():
         "--phases", nargs="+", choices=["copy", "compute"], default=["copy", "compute"]
     )
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--copy-grid-control",
+        action="store_true",
+        help="Compare legacy CTA4/CTA8 with identical shared plans and buffers",
+    )
     parser.add_argument("--copy-iterator-control", action="store_true")
     parser.add_argument(
         "--iterator-evidence",
@@ -605,8 +625,15 @@ def main():
         args.copy_vector_control
         or args.source_layout_control
         or args.copy_iterator_control
+        or args.copy_grid_control
     ):
         report["code"] = vector_provenance()
+        if args.copy_grid_control:
+            name = "python/sglang/benchmark/hisparse_h2d_grid_perf.py"
+            root = Path(__file__).resolve().parents[2]
+            report["code"]["sha256"][name] = hashlib.sha256(
+                (root / name).read_bytes()
+            ).hexdigest()
         if args.copy_iterator_control:
             report["iterator_evidence"] = iterator_evidence
             root = Path(__file__).resolve().parents[2]
@@ -728,6 +755,29 @@ def main():
                     )
                     for device in args.devices
                 }
+            if args.copy_grid_control:
+                from sglang.benchmark.hisparse_h2d_grid_perf import grid_bindings
+
+                for device in args.devices:
+                    checks = grid_bindings(
+                        {
+                            method: cases[(label, method)][device]
+                            for method in methods
+                            if method != "ce"
+                        }
+                    )
+                    report.setdefault("grid_bindings", []).append(
+                        dict(
+                            case=label,
+                            device=device,
+                            valid=all(checks.values()),
+                            checks=checks,
+                        )
+                    )
+                    if not all(checks.values()):
+                        raise RuntimeError(
+                            "Grid control changed shared inputs/output or launch policy"
+                        )
             if args.copy_iterator_control:
                 from sglang.benchmark.hisparse_h2d_iterator_perf import (
                     iterator_bindings,
@@ -833,6 +883,10 @@ def main():
             report["iterator_artifacts_match"] = match_iterator_artifacts(
                 iterator_evidence, report["jit_artifacts"]
             )
+        if args.copy_grid_control:
+            from sglang.benchmark.hisparse_h2d_grid_perf import loaded_grid_artifact
+
+            report["jit_artifacts"] = [loaded_grid_artifact()]
         if args.copy_vector_control:
             from sglang.benchmark.hisparse_h2d_codegen import loaded_copy_artifacts
 
@@ -845,16 +899,21 @@ def main():
         if args.reverse_method_order:
             cases = dict(reversed(list(cases.items())))
         for phase in args.phases:
-            if args.copy_iterator_control:
-                from sglang.benchmark.hisparse_h2d_iterator_perf import (
-                    iterator_method_order,
-                )
+            if args.copy_iterator_control or args.copy_grid_control:
+                if args.copy_grid_control:
+                    from sglang.benchmark.hisparse_h2d_grid_perf import (
+                        grid_method_order as paired_method_order,
+                    )
+                else:
+                    from sglang.benchmark.hisparse_h2d_iterator_perf import (
+                        iterator_method_order as paired_method_order,
+                    )
 
                 for misses in args.misses:
                     label = f"B{args.batch}-miss{misses}"
                     local_trials = {device: 0 for device in args.devices}
                     for trial, device in enumerate(order):
-                        method_order = iterator_method_order(
+                        method_order = paired_method_order(
                             local_trials[device], args.reverse_method_order
                         )
                         for position, method in enumerate(method_order):
@@ -868,7 +927,7 @@ def main():
                                 )
                                 report["waves"].append(wave)
                         local_trials[device] += 1
-                    print(f"Completed {phase} {label} iterator pairs", flush=True)
+                    print(f"Completed {phase} {label} paired control", flush=True)
                 for trial, device in enumerate(order):
                     with torch.cuda.device(device):
                         case = cases[(f"bulk-ce-{args.bulk_ce_mib}MiB", "ce")][device]
@@ -920,6 +979,14 @@ def main():
         try:
             target.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
             (args.output_dir / "pair-compact.txt").write_text(compact_report(report))
+            if args.copy_grid_control:
+                from sglang.benchmark.hisparse_h2d_grid_perf import grid_compact_report
+
+                try:
+                    grid_text = grid_compact_report(report)
+                except Exception as exc:
+                    grid_text = f"results_valid=False\nAcquisition error: {report.get('error')}\nSummary error: {type(exc).__name__}: {exc}\n"
+                (args.output_dir / "grid-compact.txt").write_text(grid_text)
             if args.copy_iterator_control:
                 from sglang.benchmark.hisparse_h2d_iterator_perf import (
                     iterator_compact_report,

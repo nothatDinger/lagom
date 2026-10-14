@@ -5,6 +5,9 @@
 沿用第十三轮修正版 CUDA 内核，不增加线程、深度、布局或 cache policy 扫描。
 使用现有 venv、PyTorch profiler 和 gpuq，无需 Docker、NCU 或安装工具。
 
+本轮实测host相对legacy无稳定净收益，HBM有明显改善。
+后续仅核验legacy CTA4/CTA8，见[第十五轮](README_h2d_round15.md)；不自动扩大暂存深度扫描。
+
 ## 1. 第十三轮判读结果
 
 作业 `job-20261014-100527-1b05f0a8` 的正确性12/12，每项 eager 和6次动态 graph replay通过。
