@@ -1,10 +1,10 @@
 """Byte-exact DSv4 load-policy checks, including dynamic CUDA graph replay."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
-
 from sglang.benchmark.hisparse_h2d_diagnostics import (
     ITEM_BYTES,
     PAGE_BYTES,
@@ -112,9 +112,13 @@ def assert_copy_matches(case, active_counts, real_count, *, policy, phase):
     )
 
 
-@pytest.mark.parametrize("policy", ["legacy", "ca", "cg"])
-def test_paged_copy_policy_preserves_bytes_padding_and_dynamic_graph(policy):
+@pytest.mark.parametrize("policy", ["legacy", "ca", "cg", "ca_pair", "ca_v2"])
+@pytest.mark.parametrize("source_kind", ["host", "hbm"])
+def test_paged_copy_policy_preserves_bytes_padding_and_dynamic_graph(
+    policy, source_kind
+):
     case = make_copy_case("cuda")
+    source = case.host if source_kind == "host" else case.host.to("cuda")
 
     def run():
         copy_cache_planned_mla(
@@ -122,7 +126,7 @@ def test_paged_copy_policy_preserves_bytes_padding_and_dynamic_graph(policy):
             miss_dst=case.dst,
             miss_count=case.counts,
             num_real_reqs=case.real,
-            host_cache=case.host,
+            host_cache=source,
             device_buffer=case.output,
             item_size_bytes=ITEM_BYTES,
             is_dsv4_layout=True,
@@ -146,6 +150,8 @@ def test_paged_copy_policy_preserves_bytes_padding_and_dynamic_graph(policy):
     ]:
         # Exercise changing host bytes between replays, as well as padded/zero rows.
         case.host.bitwise_xor_(255)
+        if source_kind == "hbm":
+            source.copy_(case.host)
         case.counts.copy_(torch.tensor(active_counts, dtype=torch.int32))
         case.real.fill_(real_count)
         case.output.fill_(165)
@@ -154,3 +160,7 @@ def test_paged_copy_policy_preserves_bytes_padding_and_dynamic_graph(policy):
         assert_copy_matches(
             case, active_counts, real_count, policy=policy, phase="graph_replay"
         )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

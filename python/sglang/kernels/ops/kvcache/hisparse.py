@@ -6,7 +6,6 @@ import os
 from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.kernels.jit.utils import load_jit, make_cpp_args
 
 if TYPE_CHECKING:
@@ -27,13 +26,14 @@ def _dsv4_copy_load_policy_from_env() -> str:
 def _resolve_copy_load_policy(policy: str | None, is_dsv4_layout: bool) -> int:
     if policy is None:
         policy = _dsv4_copy_load_policy_from_env() if is_dsv4_layout else "legacy"
-    if policy not in ("legacy", "ca", "cg"):
+    policies = {"legacy": 0, "ca": 1, "cg": 2, "ca_pair": 3, "ca_v2": 4}
+    if policy not in policies:
         raise ValueError(f"Invalid planned-copy load policy: {policy!r}")
     if policy != "legacy" and (not is_dsv4_layout or torch.version.hip is not None):
         raise ValueError(
             "Explicit planned-copy cache policies require NVIDIA DSv4 layout"
         )
-    return {"legacy": 0, "ca": 1, "cg": 2}[policy]
+    return policies[policy]
 
 
 @functools.cache
@@ -364,10 +364,14 @@ def copy_cache_planned_mla(
     DSv4 ``load_policy=None`` uses SGLANG_HISPARSE_DSV4_COPY_LOAD_POLICY, resolved
     once per process (default: legacy). Explicit legacy/ca/cg overrides that value.
     Restart the process and recapture CUDA graphs when changing the environment.
+    ``ca_pair``/``ca_v2`` are explicit diagnostic-only arguments, unavailable
+    through the environment. The latter requires a 16-byte aligned source base.
     """
     assert miss_src.dtype == torch.int64 and miss_dst.dtype == torch.int32
     assert miss_count.dtype == torch.int32
     policy = _resolve_copy_load_policy(load_policy, is_dsv4_layout)
+    if policy == 4 and host_cache.data_ptr() % 16:
+        raise ValueError("ca_v2 requires a 16-byte aligned source base")
     module = _jit_copy_planned_module(block_size, True, is_dsv4_layout, skip_io, policy)
     empty = torch.empty(0)
     module.copy_cache_planned(

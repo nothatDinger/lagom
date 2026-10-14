@@ -13,14 +13,39 @@ SM_LOAD_POLICIES = {
     "sm_hbm": "legacy",
     "sm_ordered": "legacy",
     "sm_hbm_ordered": "legacy",
+    "sm_ca_pair": "ca_pair",
+    "sm_ca_v2": "ca_v2",
+    "sm_hbm_ca": "ca",
+    "sm_hbm_ca_pair": "ca_pair",
+    "sm_hbm_ca_v2": "ca_v2",
 }
 
 
 def source_kind(method):
-    return "device" if method in ("sm_hbm", "sm_hbm_ordered") else "host"
+    return "device" if method.startswith("sm_hbm") else "host"
+
+
+def check_untouched(config):
+    return bool(config.get("source_order_control") or config.get("copy_vector_control"))
 
 
 def copy_methods(config):
+    if config.get("copy_vector_control", False):
+        if not config.get("device_source_control", False):
+            raise ValueError("Vector control requires --device-source-control")
+        if config.get("source_order_control") or config.get("copy_load_policy_control"):
+            raise ValueError("Run vector control separately from ordering/cache sweeps")
+        return (
+            "sm",
+            "sm_ca",
+            "sm_ca_pair",
+            "sm_ca_v2",
+            "sm_hbm",
+            "sm_hbm_ca",
+            "sm_hbm_ca_pair",
+            "sm_hbm_ca_v2",
+            "ce",
+        )
     methods = ["sm"]
     if config.get("copy_load_policy_control", False):
         methods.extend(("sm_ca", "sm_cg"))
@@ -218,12 +243,12 @@ def correctness_summary(report):
     replay = sum(r.get("graph_replay_checked") is True for r in rows)
     guarded = (
         [r for r in rows if r["method"] in SM_LOAD_POLICIES]
-        if report["config"].get("source_order_control", False)
+        if check_untouched(report["config"])
         else []
     )
     guard_expected = (
         sum(method in SM_LOAD_POLICIES for _, method, _ in expected)
-        if report["config"].get("source_order_control", False)
+        if check_untouched(report["config"])
         else 0
     )
     guard_checked = sum(r.get("untouched_bytes_checked") is True for r in guarded)
@@ -295,6 +320,13 @@ def compact_report(report):
     ]
     if report.get("error"):
         lines.append("ERROR " + report["error"])
+    if "code" in report:
+        lines.append(f'CODE {report["code"]}')
+    if report["config"].get("copy_vector_control", False):
+        lines.append(
+            f'CODEGEN_ARTIFACTS captured={len(report.get("jit_artifacts", []))}/4 '
+            f'error={report.get("jit_artifacts_error", None)}'
+        )
     if "correctness" in report:
         check = correctness_summary(report)
         lines.append(
@@ -343,10 +375,15 @@ def compact_report(report):
         )
     if report["config"].get("device_source_control", False):
         lines.append(
-            "sm_hbm / sm_hbm_ordered: SAME kernel from local GPU memory; reported GB/s is logical payload throughput, NOT H2D. "
+            "sm_hbm*: SAME kernel from local GPU memory; reported GB/s is logical payload throughput, NOT H2D. "
             "Its timed copies have h2d_bytes_per_copy=0; setup copies are outside timing."
         )
         lines.append(f'DEVICE_SOURCES {report.get("device_sources", [])}')
+    if report["config"].get("copy_vector_control", False):
+        lines.append(
+            "VECTOR_CONTROL ca=scalar striped; ca_pair=scalar paired words; ca_v2=128-bit PTX prefix load with paired words. "
+            "Same 584B payload, plans, buffers, tail/scale and CTA4/1024. Verify emitted SASS before attributing changes to instruction width."
+        )
     if report["config"].get("source_order_control", False):
         lines.append(
             "SOURCE_ORDER sm/sm_hbm=random; sm_ordered/sm_hbm_ordered=ascending source indices per bank. "

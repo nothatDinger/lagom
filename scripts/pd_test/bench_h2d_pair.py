@@ -5,9 +5,11 @@ The portable registration flag is explicit because the allocation is shared.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -22,6 +24,7 @@ from sglang.benchmark.hisparse_h2d_diagnostics import (
 from sglang.benchmark.hisparse_h2d_pair import (
     SM_LOAD_POLICIES,
     abba_order,
+    check_untouched,
     compact_report,
     copy_methods,
     pci_path,
@@ -286,7 +289,7 @@ class CopyCase:
                         output,
                         reference["active_src"][bank],
                         reference["dst"][:, :misses],
-                        check_untouched=getattr(args, "source_order_control", False),
+                        check_untouched=check_untouched(vars(args)),
                     )
 
             elif method == "ce":
@@ -388,6 +391,33 @@ def run_profiles(torch, args, cases, warmers, observer, report):
     validate_profile(report, events)
 
 
+def vector_provenance():
+    root = Path(__file__).resolve().parents[2]
+    paths = [
+        "scripts/pd_test/bench_h2d_pair.py",
+        "scripts/pd_test/bench_h2d_copy.py",
+        "python/sglang/benchmark/hisparse_h2d_pair.py",
+        "python/sglang/benchmark/hisparse_h2d_codegen.py",
+        "python/sglang/kernels/ops/kvcache/hisparse.py",
+        "python/sglang/kernels/jit/csrc/hisparse.cuh",
+        "python/sglang/kernels/jit/include/sgl_kernel/deepseek_v4/kvcacheio.cuh",
+    ]
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    return dict(
+        git=commit,
+        sha256={
+            name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+            for name in paths
+        },
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", required=True, type=Path)
@@ -435,12 +465,21 @@ def main():
         help="Compare legacy, explicit .ca and .cg source loads with shared plans and destination",
     )
     parser.add_argument(
+        "--copy-vector-control",
+        action="store_true",
+        help="Compare scalar striped/paired and vector paired .ca loads with matching HBM controls",
+    )
+    parser.add_argument(
         "--device-source-control",
         action="store_true",
         help="Also run the same SM kernel from local GPU memory; its payload rate is NOT H2D bandwidth",
     )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    try:
+        methods = copy_methods(vars(args))
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.register_device not in args.devices:
         parser.error("Registration device must be one of --devices")
     order = abba_order(args.devices, args.epochs, args.reverse_order)
@@ -498,6 +537,8 @@ def main():
         correctness=[],
     )
     host, registered = None, False
+    if args.copy_vector_control:
+        report["code"] = vector_provenance()
     try:
         host = HostTensorAllocator().allocate(
             (geometries[0]["host_pages"], PAGE_BYTES), torch.uint8, "cpu"
@@ -536,7 +577,6 @@ def main():
                 dict(device=device, address=source.data_ptr(), nbytes=source.numel())
                 for device, source in device_sources.items()
             ]
-        methods = copy_methods(vars(args))
         cases = {}
         for case_index, (misses, geometry) in enumerate(zip(args.misses, geometries)):
             plan = make_plan(torch, args, geometry, case_index, misses)
@@ -589,10 +629,18 @@ def main():
                         all_payload_bytes_checked=True,
                         graph_replay_checked=case.graph_verified,
                         untouched_bytes_checked=(
-                            args.source_order_control and method in SM_LOAD_POLICIES
+                            check_untouched(vars(args)) and method in SM_LOAD_POLICIES
                         ),
                     )
                 )
+        if args.copy_vector_control:
+            from sglang.benchmark.hisparse_h2d_codegen import loaded_copy_artifacts
+
+            try:
+                report["jit_artifacts"] = loaded_copy_artifacts()
+            except Exception as exc:
+                # Keep valid GPU results even if offline disassembly is blocked.
+                report["jit_artifacts_error"] = f"{type(exc).__name__}: {exc}"
         warmers = {device: Warmer(torch, device) for device in args.devices}
         if args.reverse_method_order:
             cases = dict(reversed(list(cases.items())))

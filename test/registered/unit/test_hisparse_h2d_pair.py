@@ -14,6 +14,7 @@ from sglang.benchmark.hisparse_h2d_pair import (
     abba_order,
     activity_check,
     compact_report,
+    copy_methods,
     correctness_summary,
     expected_case_keys,
     pci_path,
@@ -353,6 +354,7 @@ def captured_pair_fixture(
     device_source_control=False,
     copy_load_policy_control=False,
     source_order_control=False,
+    copy_vector_control=False,
 ):
     report = dict(
         success=True,
@@ -366,6 +368,7 @@ def captured_pair_fixture(
             device_source_control=device_source_control,
             copy_load_policy_control=copy_load_policy_control,
             source_order_control=source_order_control,
+            copy_vector_control=copy_vector_control,
         ),
         devices={},
         waves=[],
@@ -412,7 +415,7 @@ def captured_pair_fixture(
                 device=device,
                 all_payload_bytes_checked=True,
                 graph_replay_checked=True,
-                untouched_bytes_checked=source_order_control
+                untouched_bytes_checked=(source_order_control or copy_vector_control)
                 and method in SM_LOAD_POLICIES,
             )
         )
@@ -492,6 +495,39 @@ def test_correctness_and_profile_coverage_are_independent():
     assert not validate_profile(report, events)
     report["correctness"].pop()
     assert not correctness_summary(report)["complete"]
+
+
+def test_vector_controls_cover_all_sources_and_guard_bytes():
+    report, events = captured_pair_fixture(True, copy_vector_control=True)
+    assert len(expected_case_keys(report)) == 38
+    assert validate_profile(report, events)
+    assert correctness_summary(report)["complete"]
+    text = compact_report(report)
+    assert "UNTOUCHED_SM checked=32/32" in text
+    assert text.count("source=device h2d_bytes_per_copy=0") == 16
+    assert text.count("load_policy=ca_pair source=host") == 4
+    assert text.count("load_policy=ca_v2 source=device") == 4
+    next(r for r in report["correctness"] if r["method"] == "sm_ca_v2")[
+        "untouched_bytes_checked"
+    ] = False
+    assert not correctness_summary(report)["complete"]
+    report["profile_waves"] = [
+        w for w in report["profile_waves"] if w["method"] != "sm_hbm_ca_v2"
+    ]
+    assert not validate_profile(report, events)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {},
+        {"device_source_control": True, "source_order_control": True},
+        {"device_source_control": True, "copy_load_policy_control": True},
+    ],
+)
+def test_vector_control_rejects_missing_hbm_and_mixed_sweeps(extra):
+    with pytest.raises(ValueError):
+        copy_methods(dict(copy_vector_control=True, **extra))
 
 
 @pytest.mark.parametrize(
