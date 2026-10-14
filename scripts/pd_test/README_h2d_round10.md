@@ -1,8 +1,25 @@
 # 第十轮：真实 gather 的 NCU 计数器诊断
 
 分支 `perf/hisparse-h2d-diagnosis`，继续基于 hash_verify；物理 GPU4/5、NUMA1、原生 venv。
-首次 NCU 2022.4 smoke 在准备 kernel 时失败。当前先按 §2 核对已有工具安装，
-选定支持 CUDA 13 的版本后再复测同一 smoke；暂不改 replay/cache 参数。
+首次 NCU 2022.4 smoke 在准备 kernel 时失败；实机暂时无法安装新版工具。
+**当前暂停 NCU 路线，不把安装、版本检查或 §2 smoke 作为后续 H2D 实验的前置门禁。**
+§2 保留为工具条件具备时的可选操作，当前无需执行；不为此更换驱动、CUDA 或 Python 环境。
+
+### 当前决定：不依赖 NCU 继续诊断
+
+NCU 原计划提供读取量、活跃 warp 和等待原因的证据，帮助区分访问放大与请求等待；
+它本身不产生优化，也不能仅凭某个 stall 百分比证明硬件队列或地址转换是根因。
+已有 CUDA Event、PyTorch profiler、正确性校验与离线 SASS 路径仍然可用。
+
+后续实验优先回到真实 584 B gather，以固定 source/plan/destination 的受控变化建立因果证据，
+继续以无 profiler 的同卡对照为性能主口径，并保留双卡、HBM 与正确性对照。
+可检验的下一项是每个 CTA 的活跃 warp 数与工作分配：此前只增加 CTA、固定每 CTA
+1024 threads 的扫描，以及每 warp 仅一个 lane 的 8 B 依赖读，都没有覆盖真实 gather 的
+这一维度。需要单独实现并检查实验参数，不能直接将旧 bench 命令解释成该实验。
+
+这类对照能够验证 kernel 并行组织是否影响瓶颈；没有计数器时，仍不能据此声称已测得
+PCIe TLP 数、实际在途请求数或 ATS/TLB miss。有效候选最终仍须通过正常驻留服务的
+H2D 与吞吐/TPOT 验证。当前没有新的 GPU 运行要求。
 
 ## 1. 依据、目标与工具条件
 
@@ -41,7 +58,7 @@ gpuq `job-20261014-064638-cf009b9e` 失败，输出在该作业的 `stdout.log`�
 
 版本支持范围不匹配是优先验证的假设，错误字符串本身还不能证明是 SASS 解码、
 指令插桩还是其他准备步骤失败。H100 支持与 CUDA 13 产物支持也不是同一个问题。
-下一次优先只换 NCU 完整安装的可执行路径；不更换 driver、Python、编译器或 JIT 源码，
+以后恢复 NCU 路线时优先只换 NCU 完整安装的可执行路径；不更换 driver、Python、编译器或 JIT 源码，
 不清空 JIT cache。若新版通过，只能先确认旧工具条件造成阻塞，不能宣布 H2D 根因已找到。
 
 本轮不直接尝试三个建议选项，依据如下：
@@ -59,7 +76,7 @@ gpuq `job-20261014-064638-cf009b9e` 失败，输出在该作业的 `stdout.log`�
 `--print-units base`。离线摘要增加 raw CSV 宽表（metric 列 + 单位行）支持，保留长表
 支持及唯一 kernel/launch、完整指标、正值校验；不会把缺失计数当作零。
 
-## 2. 先选工具，再复测同一 eager kernel
+## 2. 可选：工具条件具备后复测同一 eager kernel（当前暂停）
 
 ### 2.1 先只读检查已有安装
 
@@ -80,8 +97,8 @@ nvidia-smi --query-gpu=driver_version --format=csv,noheader | sort -u
 ```
 
 优先选择已有 **2025.3.x**（CUDA 13.0 对应版本），返回路径、版本及 driver 号即可。
-若只有旧版本，反馈未找到；后续可以单独部署官方 NCU 到 work 下，不覆盖 `/usr/bin/ncu`
-或改驱动，具体包与路径另行确定。工具发布页的 recommended driver 不等于最低 driver
+若只有旧版本或环境不允许安装，跳过本节，不阻塞其他诊断。后续若允许独立部署工具，
+也无需覆盖 `/usr/bin/ncu` 或改驱动。工具发布页的 recommended driver 不等于最低 driver
 要求，不能仅因不满足推荐号就要求升级驱动。
 
 ### 2.2 匹配版本选定后才执行以下一次复测
