@@ -50,7 +50,7 @@ def counter_reader(observer, device, *, rx_only=False):
 class SustainedGraph:
     """One launch per chunk, with no internal Event nodes or CPU refill loop."""
 
-    def __init__(self, torch, case, chunk_ms):
+    def __init__(self, torch, case, chunk_ms, *, waves=None):
         self.torch, self.case = torch, case
         with torch.cuda.device(case.device):
             self.stream = torch.cuda.Stream(device=case.device)
@@ -59,23 +59,38 @@ class SustainedGraph:
                 bank_graph.replay()
                 torch.cuda.synchronize()
             pilots = [self.measure(bank_graph, 1)["gpu_us"] for _ in range(5)]
-            self.waves = max(1, math.ceil(chunk_ms * 1000 / statistics.median(pilots)))
+            self.waves = (
+                max(1, math.ceil(chunk_ms * 1000 / statistics.median(pilots)))
+                if waves is None
+                else waves
+            )
             # Bound capture size, rather than accidentally capturing an enormous
             # graph if a pilot is corrupt or returns an implausibly small time.
-            if self.waves * case.banks > 16384:
+            if self.waves <= 0 or self.waves * case.banks > 16384:
                 raise RuntimeError("Implausibly large sustained graph")
             self.graph = self.capture(self.waves)
-            self.case.rx_output.zero_()
+            if hasattr(self.case, "rx_reset"):
+                self.case.rx_reset()
+            else:
+                self.case.rx_output.zero_()
             self.graph.replay()
             torch.cuda.synchronize()
             self.case.rx_validate(case.banks - 1)
+            blocks = getattr(
+                case, "num_blocks", getattr(case, "sm_kwargs", {}).get("num_blocks")
+            )
             self.metadata = dict(
                 device=case.device,
-                method="sm" if case.method == "sm" else "ce_bulk",
+                method=getattr(
+                    case, "probe_method", "sm" if case.method == "sm" else "ce_bulk"
+                ),
                 capture_device=case.device,
                 per_copy_timing_events=0,
                 launches_per_chunk=1,
                 banks=case.banks,
+                nbytes=case.nbytes,
+                num_blocks=blocks,
+                block_size=1024 if blocks is not None else None,
                 waves=self.waves,
                 copy_nodes=self.waves * case.banks,
                 bank_pilot_us=pilots,
