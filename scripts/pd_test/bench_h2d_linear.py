@@ -35,19 +35,28 @@ from sglang.benchmark.hisparse_h2d_rx import (
 
 
 class ContiguousCase:
-    def __init__(self, torch, device, method, inputs, shared=None):
+    def __init__(self, torch, device, method, inputs, shared=None, *, nbytes=PAYLOAD):
+        if (
+            nbytes <= 0
+            or nbytes % 8
+            or not inputs
+            or any(t.numel() != nbytes for t in inputs)
+        ):
+            raise ValueError("Require equal positive input sizes divisible by 8")
+        if shared is not None and (shared.device != device or shared.nbytes != nbytes):
+            raise ValueError("Shared output must match device and copy size")
         self.device, self.method, self.probe_method = device, method, method
-        self.nbytes, self.banks = PAYLOAD, len(inputs)
+        self.nbytes, self.banks = nbytes, len(inputs)
         self.num_blocks = {"linear4": 4, "linear8": 8}.get(method)
         self.inputs = inputs
         with torch.cuda.device(device):
             self.rx_output = (
                 shared.rx_output
                 if shared
-                else torch.empty(PAYLOAD + 256, dtype=torch.uint8, device="cuda")
+                else torch.empty(nbytes + 256, dtype=torch.uint8, device="cuda")
             )
             self.output = (
-                shared.output if shared else self.rx_output[128 : 128 + PAYLOAD]
+                shared.output if shared else self.rx_output[128 : 128 + nbytes]
             )
             if method == "ce_same":
                 self.functions = [
@@ -75,7 +84,9 @@ class ContiguousCase:
         # All guarded bytes, not just a checksum or the endpoints.
         import torch
 
-        validate_bytes(torch, self.rx_output, self.inputs[bank], PAYLOAD, prefix=128)
+        validate_bytes(
+            torch, self.rx_output, self.inputs[bank], self.nbytes, prefix=128
+        )
 
 
 def binding_record(device, cases, graphs):
