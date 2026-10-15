@@ -38,7 +38,7 @@ def loaded_copy_artifacts(maps_text=None):
     return result
 
 
-def kernel_memory_ops(sass):
+def kernel_memory_ops(sass, function_name="copy_cache_planned_kernel"):
     """Static opcode counts, not source attribution or dynamic transactions."""
     kernels = []
     arch, current = "unknown", None
@@ -49,7 +49,7 @@ def kernel_memory_ops(sass):
         if "Function :" in line:
             name = line.split("Function :", 1)[1].strip()
             current = None
-            if "copy_cache_planned_kernel" in name:
+            if function_name in name:
                 current = dict(
                     arch=arch, function=name, opcodes=Counter(), memory_ops=[]
                 )
@@ -61,5 +61,5 @@ def kernel_memory_ops(sass):
                 current["opcodes"][match[1]] += 1
                 current["memory_ops"].append(line.strip())
     if not kernels or any(not kernel["memory_ops"] for kernel in kernels):
-        raise ValueError("No populated copy_cache_planned_kernel SASS section")
+        raise ValueError(f"No populated {function_name} SASS section")
     return kernels

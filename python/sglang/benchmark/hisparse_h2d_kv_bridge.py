@@ -9,6 +9,13 @@ from sglang.benchmark.hisparse_h2d_diagnostics import (
     SCALE_BYTES,
     VALUE_BYTES,
 )
+from sglang.benchmark.hisparse_h2d_direct import (
+    DIRECT_BINDING_KEYS,
+    DIRECT_LIBRARY,
+    DIRECT_METHODS,
+    EDGE_COUNTS,
+    evidence_valid,
+)
 from sglang.benchmark.hisparse_h2d_grid_perf import LEGACY_LIBRARY
 from sglang.benchmark.hisparse_h2d_layout import _addresses, prepare_adjacent_source
 from sglang.benchmark.hisparse_h2d_linear import LINEAR_LIBRARY, PAYLOAD
@@ -136,7 +143,9 @@ def method_order(local_trial):
 
 def report_status(report):
     config = report["config"]
-    expected = {(d, m) for d in (0, 1) for m in METHODS}
+    direct = config.get("direct_index_control", False)
+    methods = DIRECT_METHODS if direct else METHODS
+    expected = {(d, m) for d in (0, 1) for m in methods}
     checks = report.get("correctness", [])
     correct = (
         len(checks) == 6
@@ -175,21 +184,44 @@ def report_status(report):
         and {b["device"] for b in bindings} == {0, 1}
         and all(
             b.get("valid") is True
-            and set(b["checks"]) == BINDING_KEYS
+            and set(b["checks"])
+            == BINDING_KEYS | (DIRECT_BINDING_KEYS if direct else set())
             and all(v is True for v in b["checks"].values())
             for b in bindings
         )
     )
     packed = all(report.get("packing", {}).get(k) is True for k in PACKING_KEYS)
     artifacts = report.get("jit_artifacts", [])
+    expected_artifacts = {("legacy", LEGACY_LIBRARY), ("linear", LINEAR_LIBRARY)}
+    if direct:
+        expected_artifacts.add(("direct", DIRECT_LIBRARY))
     jit = (
-        len(artifacts) == 2
-        and {(a["variant"], a["name"]) for a in artifacts}
-        == {("legacy", LEGACY_LIBRARY), ("linear", LINEAR_LIBRARY)}
+        len(artifacts) == len(expected_artifacts)
+        and {(a["variant"], a["name"]) for a in artifacts} == expected_artifacts
         and all(
             isinstance(a.get("sha256"), str) and len(a["sha256"]) == 64
             for a in artifacts
         )
+    )
+    edges = report.get("direct_edges", [])
+    edge_ok = not direct or (
+        report.get("direct_schedule")
+        == dict(valid=True, warps=128, items=3200, ordered_items_match=True)
+        and len(edges) == 16
+        and {(r["device"], r["count"], r["source"]) for r in edges}
+        == {(d, n, s) for d in (0, 1) for n in EDGE_COUNTS for s in ("host", "hbm")}
+        and all(
+            r["eager"] is True
+            and r["graph"] is True
+            and r["all_bytes"] is True
+            and r["capture_device"] == r["device"]
+            for r in edges
+        )
+    )
+    evidence = (
+        evidence_valid(report.get("codegen_evidence", {}), artifacts)
+        if direct
+        else True
     )
     common = (
         report.get("success") is True
@@ -198,12 +230,16 @@ def report_status(report):
         and bound
         and packed
         and jit
+        and edge_ok
+        and (not direct or config["mode"] != "main" or evidence)
     )
     windows = report.get("windows", [])
     sequence = [
         (t, d, m, p)
         for t, d in enumerate([0, 1, 1, 0])
-        for p, m in enumerate(method_order([0, 1, 1, 0][:t].count(d)))
+        for p, m in enumerate(
+            methods if [0, 1, 1, 0][:t].count(d) == 0 else tuple(reversed(methods))
+        )
     ]
     timing = config["mode"] == "main" and (
         len(windows) == 12
@@ -238,16 +274,28 @@ def report_status(report):
         jit=jit,
         timing=timing,
         drift=drift,
+        edges=edge_ok,
+        evidence=evidence,
     )
 
 
 def compact_report(report):
     status = report_status(report)
+    direct = report["config"].get("direct_index_control", False)
+    methods = DIRECT_METHODS if direct else METHODS
     lines = [
         "KV bridge: B32/miss100 CTA4/1024, 64 banks, same KV contents; no timed packing, CE, Rx sampler or service changes.",
         f'success={report["success"]} mode={report["config"]["mode"]} correctness={len(report.get("correctness",[]))}/6 correct={status["correctness"]} '
         f'graphs={len(report.get("chunk_graphs",[]))}/6 graph_valid={status["graphs"]} packing={status["packing"]} bindings={status["bindings"]} JIT={status["jit"]} results_valid={status["ready"]}',
     ]
+    if direct:
+        lines.append(
+            f'DIRECT_EDGE valid={status["edges"]} checked={len(report.get("direct_edges",[]))}/16 schedule={report.get("direct_schedule")}'
+        )
+        if report["config"]["mode"] == "main":
+            lines.append(
+                f'CODEGEN_EVIDENCE valid={status["evidence"]} path={report.get("codegen_evidence_path")}'
+            )
     if report.get("error"):
         lines.append(f'ERROR active={report.get("active_case")} {report["error"]}')
     lines.append(f'CONFIG {report["config"]}')
@@ -271,7 +319,7 @@ def compact_report(report):
         )
     index = {}
     for d in (0, 1):
-        for m in METHODS:
+        for m in methods:
             rows = [
                 w
                 for w in report.get("windows", [])
@@ -309,10 +357,16 @@ def compact_report(report):
                     for a, b in zip(index[d, denominator], index[d, numerator])
                 ]
 
-            lines.append(
-                f'RATIOS d{d} adjacent/random_us={ratio("gather_adjacent4", "gather4")} '
-                f'linear/adjacent_us={ratio("linear4", "gather_adjacent4")} linear/random_us={ratio("linear4", "gather4")}'
-            )
+            if direct:
+                lines.append(
+                    f'RATIOS d{d} direct/adjacent_us={ratio("direct4", "gather_adjacent4")} '
+                    f'linear/direct_us={ratio("linear4", "direct4")} linear/adjacent_us={ratio("linear4", "gather_adjacent4")}'
+                )
+            else:
+                lines.append(
+                    f'RATIOS d{d} adjacent/random_us={ratio("gather_adjacent4", "gather4")} '
+                    f'linear/adjacent_us={ratio("linear4", "gather_adjacent4")} linear/random_us={ratio("linear4", "gather4")}'
+                )
     lines.append(
         "Adjacent gather changes BOTH address layouts and their footprints; residual vs linear combines plan, C4, lane utilization and compiler effects. No PCIe/TLB attribution or production packing benefit."
     )

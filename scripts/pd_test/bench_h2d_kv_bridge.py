@@ -9,15 +9,24 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from bench_h2d_linear import ContiguousCase, acquire
-from bench_h2d_pair import CopyCase, Observer, make_plan, vector_provenance
+from bench_h2d_pair import CopyCase, Observer, make_plan, validate_sm, vector_provenance
 from bench_h2d_rx import SustainedGraph
 from sglang.benchmark.hisparse_h2d_diagnostics import PAGE_BYTES, process_snapshot
+from sglang.benchmark.hisparse_h2d_direct import (
+    DIRECT_METHODS,
+    EDGE_COUNTS,
+    DirectCase,
+    binding_checks,
+    check_edge,
+    evidence_valid,
+    loaded_direct_artifact,
+    schedule_check,
+)
 from sglang.benchmark.hisparse_h2d_grid_perf import loaded_grid_artifact
 from sglang.benchmark.hisparse_h2d_kv_bridge import (
     METHODS,
     bridge_geometry,
     compact_report,
-    method_order,
     prepare_bridge,
     report_status,
 )
@@ -74,7 +83,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("check", "main"))
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--direct-index-control", action="store_true")
+    parser.add_argument("--codegen-json", type=Path)
     cli = parser.parse_args()
+    if cli.direct_index_control and cli.mode == "main" and cli.codegen_json is None:
+        parser.error("Direct main requires --codegen-json from a passed direct check")
+    if cli.codegen_json is not None and not cli.codegen_json.is_file():
+        parser.error("--codegen-json must be an existing file")
     cli.output_dir.mkdir(parents=True, exist_ok=True)
     if any(
         (cli.output_dir / name).exists()
@@ -107,11 +122,13 @@ def main():
             duration_s=2.5,
             trim_s=0.3,
             rx_sampler=False,
+            direct_index_control=cli.direct_index_control,
         ),
         correctness=[],
         chunk_graphs=[],
         bindings=[],
         windows=[],
+        direct_edges=[],
     )
     host, registered, observer = None, False, None
     try:
@@ -148,6 +165,15 @@ def main():
             report["code"]["sha256"][name] = hashlib.sha256(
                 (root / name).read_bytes()
             ).hexdigest()
+        if cli.direct_index_control:
+            for name in (
+                "python/sglang/benchmark/hisparse_h2d_direct.py",
+                "python/sglang/kernels/jit/csrc/hisparse_c4_direct_probe.cuh",
+            ):
+                report["code"]["sha256"][name] = hashlib.sha256(
+                    (root / name).read_bytes()
+                ).hexdigest()
+            report["direct_schedule"] = schedule_check()
         geometry = bridge_geometry()
         report["geometry"] = geometry
         torch.cuda.set_device(1)
@@ -183,7 +209,20 @@ def main():
         )
         report["packing_us"] = (time.monotonic_ns() - started) / 1000
         cases, graphs = {}, {}
+        methods = DIRECT_METHODS if cli.direct_index_control else METHODS
         for device in (0, 1):
+            if cli.direct_index_control:
+                for count in EDGE_COUNTS:
+                    for source in ("host", "hbm"):
+                        report["active_case"] = dict(
+                            device=device,
+                            phase="direct_edge",
+                            count=count,
+                            source=source,
+                        )
+                        report["direct_edges"].append(
+                            check_edge(torch, host, device, count, source, validate_sm)
+                        )
             report["active_case"] = dict(
                 device=device, method="gather4", phase="eager/bank_graph"
             )
@@ -211,7 +250,15 @@ def main():
             )
             report["active_case"] = dict(device=device, method="linear4", phase="eager")
             linear = ContiguousCase(torch, device, "linear4", inputs)
-            group = dict(zip(METHODS, (original, packed, linear)))
+            reference = dict(zip(METHODS, (original, packed, linear)))
+            if cli.direct_index_control:
+                report["active_case"] = dict(
+                    device=device, method="direct4", phase="eager"
+                )
+                direct_case = DirectCase(torch, packed, adjacent)
+                group = dict(zip(DIRECT_METHODS, (packed, direct_case, linear)))
+            else:
+                group = reference
             captured = {}
             for method, case in group.items():
                 case.probe_method = method
@@ -231,24 +278,40 @@ def main():
                     torch,
                     case,
                     100,
-                    waves=None if method == "gather4" else captured["gather4"].waves,
+                    waves=None if method == methods[0] else captured[methods[0]].waves,
                 )
                 report["chunk_graphs"].append(captured[method].metadata)
             binding = binding_record(
-                torch, device, host, group, captured, plan, adjacent, inputs
+                torch, device, host, reference, captured, plan, adjacent, inputs
             )
+            if cli.direct_index_control:
+                binding["checks"].update(
+                    binding_checks(torch, packed, direct_case, adjacent)
+                )
+                binding["valid"] = all(binding["checks"].values())
             report["bindings"].append(binding)
             if not binding["valid"]:
                 raise ValueError(f"Bridge bindings failed: {binding}")
             cases[device], graphs[device] = group, captured
+        artifacts = [loaded_grid_artifact(), loaded_linear_artifact()]
+        if cli.direct_index_control:
+            artifacts.append(loaded_direct_artifact())
         report["jit_artifacts"] = [
-            dict(a, name=Path(a["path"]).name)
-            for a in (loaded_grid_artifact(), loaded_linear_artifact())
+            dict(a, name=Path(a["path"]).name) for a in artifacts
         ]
+        if cli.direct_index_control and cli.mode == "main":
+            report["active_case"] = dict(phase="codegen_evidence")
+            report["codegen_evidence_path"] = str(cli.codegen_json.resolve())
+            report["codegen_evidence"] = json.loads(cli.codegen_json.read_text())
+            if not evidence_valid(report["codegen_evidence"], report["jit_artifacts"]):
+                raise ValueError(
+                    "Codegen shape failed or current JIT hashes differ from check evidence"
+                )
         if cli.mode == "main":
             local = {0: 0, 1: 0}
             for trial, device in enumerate(report["config"]["order"]):
-                for position, method in enumerate(method_order(local[device])):
+                order = methods if local[device] == 0 else tuple(reversed(methods))
+                for position, method in enumerate(order):
                     report["active_case"] = dict(
                         device=device, method=method, trial=trial
                     )

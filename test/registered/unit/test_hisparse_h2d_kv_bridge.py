@@ -1,11 +1,25 @@
 import copy
 import importlib.util
+import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from sglang.benchmark import hisparse_h2d_direct as direct_module
 from sglang.benchmark.hisparse_h2d_diagnostics import PAGE_BYTES
+from sglang.benchmark.hisparse_h2d_direct import (
+    DIRECT_BINDING_KEYS,
+    DIRECT_LIBRARY,
+    DIRECT_METHODS,
+    EDGE_COUNTS,
+    binding_checks,
+    codegen_shape,
+    copy_direct,
+    evidence_valid,
+    schedule_check,
+)
 from sglang.benchmark.hisparse_h2d_grid_perf import LEGACY_LIBRARY
 from sglang.benchmark.hisparse_h2d_kv_bridge import (
     BINDING_KEYS,
@@ -13,7 +27,6 @@ from sglang.benchmark.hisparse_h2d_kv_bridge import (
     PACKING_KEYS,
     bridge_geometry,
     compact_report,
-    method_order,
     prepare_bridge,
     report_status,
 )
@@ -222,16 +235,48 @@ def test_invalid_reservations_fail_before_any_host_write(cli, fault):
     assert torch.equal(host, before)
 
 
-def report_fixture(mode="main"):
+def codegen_fixture():
+    return dict(
+        success=True,
+        kernels=[
+            dict(
+                variant=v,
+                sha256="a" * 64,
+                functions=[
+                    dict(
+                        arch="sm_90a",
+                        function=(
+                            "hisparse_c4_direct_kernel"
+                            if v == "direct"
+                            else "copy_cache_planned_kernel"
+                        ),
+                        opcodes={"LDG.E.64.CONSTANT": 3, "STG.E.64": 3},
+                    )
+                ],
+                resource_lines=["REG:28 STACK:0 SHARED:0 LOCAL:0"],
+            )
+            for v in ("legacy", "direct")
+        ],
+    )
+
+
+def report_fixture(mode="main", direct=False):
+    methods = DIRECT_METHODS if direct else METHODS
     r = dict(
         success=True,
-        config=dict(mode=mode),
+        config=dict(mode=mode, direct_index_control=direct),
         packing=dict.fromkeys(PACKING_KEYS, True),
         correctness=[],
         chunk_graphs=[],
         windows=[],
         bindings=[
-            dict(device=d, valid=True, checks=dict.fromkeys(BINDING_KEYS, True))
+            dict(
+                device=d,
+                valid=True,
+                checks=dict.fromkeys(
+                    BINDING_KEYS | (DIRECT_BINDING_KEYS if direct else set()), True
+                ),
+            )
             for d in (0, 1)
         ],
         jit_artifacts=[
@@ -240,7 +285,7 @@ def report_fixture(mode="main"):
         ],
     )
     for d in (0, 1):
-        for m in METHODS:
+        for m in methods:
             r["correctness"].append(
                 dict(
                     device=d, method=m, eager_banks=[0, 63], eager=True, all_bytes=True
@@ -264,7 +309,10 @@ def report_fixture(mode="main"):
             )
     if mode == "main":
         for t, d in enumerate((0, 1, 1, 0)):
-            for p, m in enumerate(method_order([0, 1, 1, 0][:t].count(d))):
+            order = (
+                methods if [0, 1, 1, 0][:t].count(d) == 0 else tuple(reversed(methods))
+            )
+            for p, m in enumerate(order):
                 r["windows"].append(
                     dict(
                         device=d,
@@ -278,12 +326,33 @@ def report_fixture(mode="main"):
                                 "gather4": 30,
                                 "gather_adjacent4": 40,
                                 "linear4": 50,
+                                "direct4": 45,
                             }[m],
                             max_enqueue_fraction=0.001,
                             chunk_gpu_cv=0.001,
                         ),
                     )
                 )
+    if direct:
+        r["direct_edges"] = [
+            dict(
+                device=d,
+                count=n,
+                source=s,
+                eager=True,
+                graph=True,
+                all_bytes=True,
+                capture_device=d,
+            )
+            for d in (0, 1)
+            for n in EDGE_COUNTS
+            for s in ("host", "hbm")
+        ]
+        r["direct_schedule"] = schedule_check()
+        r["jit_artifacts"].append(
+            dict(variant="direct", name=DIRECT_LIBRARY, sha256="a" * 64)
+        )
+        r["codegen_evidence"] = codegen_fixture()
     return r
 
 
@@ -353,6 +422,197 @@ def test_early_failure_produces_a_readable_compact():
         dict(success=False, config=dict(mode="check"), error="no GPU")
     )
     assert "results_valid=False" in text and "no GPU" in text
+
+
+@pytest.mark.parametrize(
+    "batch,misses", [(32, 100), (32, 1272), (2, 65), (100, 2), (1, 1)]
+)
+def test_direct_warp_order_matches_original_request_traversal(batch, misses):
+    assert schedule_check(batch, misses) == dict(
+        valid=True, warps=128, items=batch * misses, ordered_items_match=True
+    )
+
+
+@pytest.mark.parametrize("mode", ["check", "main"])
+def test_direct_report_requires_matching_evidence_before_performance(mode):
+    r = report_fixture(mode, direct=True)
+    assert report_status(r)["ready"]
+    text = compact_report(r)
+    assert "DIRECT_EDGE valid=True checked=16/16" in text
+    assert ("RATIOS" in text) == (mode == "main")
+    if mode == "main":
+        assert "direct/adjacent_us=[0.8889, 0.8889]" in text
+        assert "linear/direct_us=[0.9, 0.9]" in text
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["edge", "binding", "jit", "hash", "vector", "policy", "spill", "missing_evidence"],
+)
+def test_direct_faults_never_produce_performance_conclusions(fault):
+    r = report_fixture(direct=True)
+    if fault == "edge":
+        r["direct_edges"][0]["all_bytes"] = False
+    elif fault == "binding":
+        r["bindings"][0]["checks"]["direct_same_indices"] = False
+    elif fault == "jit":
+        r["jit_artifacts"].pop()
+    elif fault == "hash":
+        r["jit_artifacts"][-1]["sha256"] = "b" * 64
+    elif fault == "vector":
+        r["codegen_evidence"]["kernels"][-1]["functions"][0]["opcodes"] = {
+            "LDG.E.128.CONSTANT": 1,
+            "LDG.E.64.CONSTANT": 1,
+            "STG.E.64": 3,
+        }
+    elif fault == "policy":
+        r["codegen_evidence"]["kernels"][-1]["functions"][0]["opcodes"] = {
+            "LDG.E.64.STRONG.SM": 3,
+            "STG.E.64": 3,
+        }
+    elif fault == "spill":
+        r["codegen_evidence"]["kernels"][-1]["resource_lines"] = [
+            "REG:128 STACK:8 LOCAL:8"
+        ]
+    else:
+        r.pop("codegen_evidence")
+    assert not report_status(r)["ready"]
+    assert "RATIOS" not in compact_report(r)
+
+
+def test_direct_codegen_gate_retains_resources_and_checks_both_hashes():
+    r = report_fixture(direct=True)
+    assert all(codegen_shape(k) for k in r["codegen_evidence"]["kernels"])
+    assert evidence_valid(r["codegen_evidence"], r["jit_artifacts"])
+    r["jit_artifacts"][0]["sha256"] = "b" * 64
+    assert not evidence_valid(r["codegen_evidence"], r["jit_artifacts"])
+
+
+def test_direct_python_bounds_checked_before_ffi(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        direct_module,
+        "_module",
+        lambda: SimpleNamespace(hisparse_c4_direct=lambda *args: calls.append(args)),
+    )
+
+    def tensor(device):
+        return SimpleNamespace(
+            dtype=torch.uint8,
+            ndim=2,
+            shape=(53, PAGE_BYTES),
+            device=torch.device(device),
+            is_contiguous=lambda: True,
+            is_pinned=lambda: True,
+            data_ptr=lambda: 4096,
+        )
+
+    source, output = tensor("cpu"), tensor("cuda:0")
+    copy_direct(source, output, 63, 9, 3200)
+    assert calls[-1] == (source, output, 63, 9, 3200)
+    for args in ((-1, 0, 1), (0, 0, -1), (0, 0, True), (0, 0, 2**31), (63, 9, 3400)):
+        with pytest.raises(ValueError, match="indices"):
+            copy_direct(source, output, *args)
+    assert len(calls) == 1
+    source.is_pinned = lambda: False
+    with pytest.raises(ValueError, match="pinned"):
+        copy_direct(source, output, 0, 0, 1)
+    assert len(calls) == 1
+
+
+def test_direct_binding_checks_exact_addresses_and_every_bank():
+    source, output = SimpleNamespace(data_ptr=lambda: 4096), SimpleNamespace(
+        data_ptr=lambda: 8192
+    )
+    starts = [3200 * b for b in range(64)]
+    plan = dict(
+        active_src=torch.arange(64 * 3200).reshape(64, 32, 100),
+        dst=torch.arange(3200, dtype=torch.int32).reshape(32, 100),
+    )
+    adjacent = SimpleNamespace(source=source, rx_output=output)
+    direct = SimpleNamespace(
+        source=source,
+        rx_output=output,
+        starts=starts,
+        nbytes=PAYLOAD,
+        banks=64,
+        count=3200,
+        destination_start=0,
+        num_blocks=4,
+    )
+    assert all(binding_checks(torch, adjacent, direct, plan).values())
+    direct.starts[63] += 1
+    assert not binding_checks(torch, adjacent, direct, plan)["direct_same_indices"]
+    direct.starts[63] -= 1
+    direct.rx_output = SimpleNamespace(data_ptr=lambda: 16384)
+    assert not binding_checks(torch, adjacent, direct, plan)[
+        "direct_same_source_output"
+    ]
+
+
+@pytest.mark.parametrize("compatible", [True, False])
+def test_codegen_collector_preserves_dumps_and_rejects_changed_read_shape(
+    cli, monkeypatch, tmp_path, compatible
+):
+    from sglang.benchmark.hisparse_h2d_codegen import sha256
+
+    path = Path(cli.__file__).with_name("collect_h2d_direct_codegen.py")
+    spec = importlib.util.spec_from_file_location("direct_codegen_cli", path)
+    collector = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(collector)
+    acquired = report_fixture("check", direct=True)
+    for a in acquired["jit_artifacts"]:
+        if a["variant"] in ("legacy", "direct"):
+            library = tmp_path / a["name"]
+            library.write_bytes(a["variant"].encode())
+            a.update(path=str(library), sha256=sha256(library))
+    input_path = tmp_path / "bridge.json"
+    input_path.write_text(json.dumps(acquired))
+    output_dir = tmp_path / "codegen"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [str(path), "--bridge-json", str(input_path), "--output-dir", str(output_dir)],
+    )
+    monkeypatch.setattr(collector.shutil, "which", lambda _: "/existing/cuobjdump")
+
+    def run(command, **kwargs):
+        assert "--demangle" not in command
+        if command[1] == "--version":
+            return SimpleNamespace(
+                returncode=0, stdout="existing CUDA toolkit", stderr=""
+            )
+        if command[1] == "--dump-resource-usage":
+            kwargs["stdout"].write("REG:28 STACK:0 SHARED:0 LOCAL:0\n")
+        else:
+            assert command[1] == "--dump-sass"
+            direct = "c4_direct" in command[2]
+            name = (
+                "hisparse_c4_direct_kernel" if direct else "copy_cache_planned_kernel"
+            )
+            opcode = (
+                "LDG.E.128.CONSTANT"
+                if direct and not compatible
+                else "LDG.E.64.CONSTANT"
+            )
+            text = f"arch = sm_90a\nFunction : {name}\n"
+            text += "\n".join(
+                f"/*{i*16:04x}*/ {op} R0, [R2];"
+                for i, op in enumerate([opcode] * 3 + ["STG.E.64"] * 3)
+            )
+            kwargs["stdout"].write(text)
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(collector.subprocess, "run", run)
+    assert collector.main() == (0 if compatible else 1)
+    evidence = json.loads((output_dir / "codegen.json").read_text())
+    assert evidence["success"] is compatible
+    assert evidence_valid(evidence, acquired["jit_artifacts"]) is compatible
+    assert (output_dir / "direct.sass.txt").exists()
+    assert (
+        f"CODEGEN success={compatible}"
+        in (output_dir / "codegen-compact.txt").read_text()
+    )
 
 
 if __name__ == "__main__":
