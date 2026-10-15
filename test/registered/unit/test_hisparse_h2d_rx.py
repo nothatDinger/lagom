@@ -187,15 +187,18 @@ def test_invalid_submission_keeps_counter_evidence_without_passing_quality():
     assert m["rx_GBps_1024"] == pytest.approx(55)
 
 
-def synthetic_sampler_report():
+def synthetic_sampler_report(device=0):
     report = synthetic_report()
-    report["config"].update(sampler_check=True, sample_ms=50)
+    report["config"].update(sampler_check=True, sample_ms=50, check_device=device)
     report["correctness"] = [r for r in report["correctness"] if r["device"] == 0]
+    for row in report["correctness"]:
+        row["device"] = device
     report["chunk_graphs"] = [
         dict(
             method=m,
+            device=device,
             correctness=True,
-            capture_device=0,
+            capture_device=device,
             per_copy_timing_events=0,
             launches_per_chunk=1,
         )
@@ -205,7 +208,7 @@ def synthetic_sampler_report():
     for method in ("ce_bulk", "sm"):
         for trial, enabled in enumerate((False, True, True, False)):
             w = synthetic_window(55 if method == "ce_bulk" else 23)
-            w.update(device=0, trial=trial, method=method, sampler_enabled=enabled)
+            w.update(device=device, trial=trial, method=method, sampler_enabled=enabled)
             for row in w["samples"] + w["idle_samples"]:
                 row["tx_kbps"] = None
             w["metrics"] = (
@@ -219,11 +222,13 @@ def synthetic_sampler_report():
     return report
 
 
-def test_sampler_check_requires_both_brackets_and_both_sampled_runs():
-    report = synthetic_sampler_report()
+@pytest.mark.parametrize("device", [0, 1])
+def test_sampler_check_requires_both_brackets_and_both_sampled_runs(device):
+    report = synthetic_sampler_report(device)
     controls = sampler_controls(report)
     assert all(c["valid"] and c["on_over_off"] == [1, 1] for c in controls.values())
     text = rx_compact_report(report)
+    assert f"CUDA d{device} only" in text and f"STATE d{device} " in text
     assert (
         "chunk_graphs_valid=True windows=8/8 CE_calibration=2/2 results_valid=True"
         in text
@@ -243,13 +248,15 @@ def test_sampler_check_requires_both_brackets_and_both_sampled_runs():
         "invalid_on",
         "wrong_device",
         "bad_graph",
+        "wrong_capture_device",
         "bad_ce",
         "bad_bytes",
         "extra_window",
     ],
 )
-def test_sampler_check_exposes_perturbation_and_incomplete_evidence(fault):
-    report = synthetic_sampler_report()
+@pytest.mark.parametrize("device", [0, 1])
+def test_sampler_check_exposes_perturbation_and_incomplete_evidence(fault, device):
+    report = synthetic_sampler_report(device)
     rows = report["windows"]
     if fault == "one_slow_on":
         rows[5]["metrics"]["core_seconds"] *= 1.25
@@ -264,9 +271,11 @@ def test_sampler_check_exposes_perturbation_and_incomplete_evidence(fault):
         control = sampler_controls(report)["sm"]
         assert not control["valid"] and control["on_over_off"] == [1, 1]
     elif fault == "wrong_device":
-        rows[5]["device"] = 1
+        rows[5]["device"] = 1 - device
     elif fault == "bad_graph":
         report["chunk_graphs"][0]["per_copy_timing_events"] = 128
+    elif fault == "wrong_capture_device":
+        report["chunk_graphs"][0]["capture_device"] = 1 - device
     elif fault == "bad_ce":
         rows[1]["calibration"]["valid"] = False
     elif fault == "bad_bytes":

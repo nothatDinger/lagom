@@ -263,6 +263,7 @@ def ce_calibration(metrics):
 def sampler_controls(report):
     """Require both sampled runs and both unpolled brackets, never a lucky run."""
     controls = {}
+    device = report["config"].get("check_device", 0)
     for method in ("ce_bulk", "sm"):
         rows = [w for w in report.get("windows", []) if w["method"] == method]
         if (
@@ -270,7 +271,8 @@ def sampler_controls(report):
             or [w.get("sampler_enabled") for w in rows] != [False, True, True, False]
             or [w.get("trial") for w in rows] != list(range(4))
             or any(
-                w.get("device") != 0 or not w.get("metrics", {}).get("core_replays")
+                w.get("device") != device
+                or not w.get("metrics", {}).get("core_replays")
                 for w in rows
             )
         ):
@@ -301,10 +303,12 @@ def sampler_controls(report):
 
 def sampler_check_report(report):
     windows, checked = report.get("windows", []), report.get("correctness", [])
+    device = report["config"].get("check_device", 0)
     controls = sampler_controls(report)
     correct = (
         len(checked) == 2
-        and {(r["device"], r["method"]) for r in checked} == {(0, "sm"), (0, "ce_bulk")}
+        and {(r["device"], r["method"]) for r in checked}
+        == {(device, "sm"), (device, "ce_bulk")}
         and all(r["payload"] is True and r["graph"] is True for r in checked)
         and all(r["untouched"] is True for r in checked if r["method"] == "sm")
     )
@@ -314,7 +318,8 @@ def sampler_check_report(report):
         and {g.get("method") for g in graphs} == {"sm", "ce_bulk"}
         and all(
             g.get("correctness") is True
-            and g.get("capture_device") == 0
+            and g.get("device") == device
+            and g.get("capture_device") == device
             and g.get("per_copy_timing_events") == 0
             and g.get("launches_per_chunk") == 1
             for g in graphs
@@ -333,7 +338,7 @@ def sampler_check_report(report):
         and all(c["valid"] for c in controls.values())
     )
     lines = [
-        "NVML sampler self-check: physical GPU4 only; OFF/ON/ON/OFF; identical event-free chunk graph within each method.",
+        f"NVML sampler self-check: CUDA d{device} only; OFF/ON/ON/OFF; identical event-free chunk graph within each method.",
         f'success={report["success"]} counters_available={report.get("counters_available")} correctness={len(checked)}/2 '
         f"correctness_valid={correct} chunk_graphs_valid={graph_ok} windows={len(windows)}/8 CE_calibration={cal}/2 results_valid={ready}",
         f'CONFIG B32/miss100 SM=legacy_CTA4/1024 banks=64 CE=64MiB/7banks register_flags={report.get("register_flags")} '
@@ -376,7 +381,7 @@ def sampler_check_report(report):
         lines.append(f"CONTROL {method} {control}")
     states = [s for w in windows for s in w.get("states", [])]
     lines.append(
-        "STATE d0 "
+        f"STATE d{device} "
         + (clock_text([dict(before=s) for s in states]) if states else "not_collected")
     )
     lines.append(

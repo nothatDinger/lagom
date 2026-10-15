@@ -20,8 +20,9 @@
 
 ## 2. 具体改动与固定条件
 
-继续暴露物理GPU4/5，Portable注册context仍为CUDA1；本次**只有GPU4执行搬运**。
-GPU5只保留身份映射/注册context的既有用途，不构造其copy case或执行计算预热。
+继续暴露物理GPU4/5，Portable注册context仍为CUDA1；每次**只在一张选定卡执行搬运**。
+`--check-device 0`选择GPU4（默认），`--check-device 1`选择GPU5。
+另一张卡只保留身份映射/注册context的既有用途，不构造其copy case或执行计算预热。
 
 - 同一512MiB NUMA1 pinned pool；SM仍legacy CTA4/1024、B32/miss100、584B/KV、64个随机bank。
 - CE仍是同一host pool中的64MiB连续H2D、7个bank。CUDA kernel、load policy、plan、目的地址不变。
@@ -59,7 +60,16 @@ NVML是低频近似速率，保留原始KB/s，另按1024 B/KB给名义值；不
 两个ON的query异常也保存在原始采样中，不能按0或成功处理。
 端点状态不证明区间内恒频，采样开关对照也不证明SM与CE计数器覆盖完全相同。
 
-## 4. 只执行一次check
+## 4. GPU4已通过，下一步只补GPU5
+
+GPU4的v2结果：全部门槛通过，两个ON/OFF耗时比均接近1，OFF之间无明显漂移。
+SM有效吞吐约30.87 GB/s，CE约55.36 GB/s。
+原始Rx读数SM约38,682,593 KB/s，CE约59,890,533 KB/s；两者之比约0.6459，
+有效吞吐之比约0.5576。按1024 B/KB换算的名义Rx为SM约39.61 GB/s、CE约60.97–61.69 GB/s。
+这些是NVML近似读数及其比例，不能直接当作物理链路利用率或PCIe事务放大。
+查询耗时约20.5ms，不是采样周期；50ms的计划周期对应约20Hz，并非48Hz。
+
+当前不重跑GPU4。只给相同check选择CUDA1/物理GPU5，其他工作量、采样与注册context保持不变。
 
 从仓库正常属主账号同步，保留原始rx-smoke与JIT cache：
 
@@ -72,7 +82,7 @@ git merge --ff-only FETCH_HEAD
 
 ```bash
 export LAGOM_PY=/home/jovyan/td69032/lagom_h2d_latency_test/.venv/bin/python3
-bash scripts/pd_test/run_h2d_rx.sh check "$PWD/work/h2d-round16/rx-check-v2"
+bash scripts/pd_test/run_h2d_rx.sh check "$PWD/work/h2d-round16/rx-check-gpu5" 1
 ```
 
 wrapper设置`CUDA_VISIBLE_DEVICES=4,5`和NUMA1绑定，重定向日志，不覆盖旧目录。
@@ -86,11 +96,12 @@ chunk_graphs_valid=True windows=8/8 CE_calibration=2/2 results_valid=True
 ```
 
 两条CONTROL都应为`{'valid': True, ...}`。
+GRAPH的device/capture_device以及STATE应为d1，IDENTITY d1应为physical5/B8:00.0。
 即使全部通过，本次也到此结束，**不自动续跑旧main**。wrapper暂时拒绝旧smoke/main参数。
 
 ## 5. 只需要反馈一份紧凑文件
 
-反馈`work/h2d-round16/rx-check-v2/rx-compact.txt`全文（约20行）。
+反馈`work/h2d-round16/rx-check-gpu5/rx-compact.txt`全文（约20行）。
 它包含：两条GRAPH、8条WINDOW、两条CONTROL、身份/NUMA/JIT以及端点STATE。
 重点是两个ON/OFF耗时比、两个OFF的漂移、提交占比、段耗时CV、Rx查询耗时与CE校验。
 若紧凑文件未生成，给run.log最后30行。rx.json留在实机，不上传大日志。

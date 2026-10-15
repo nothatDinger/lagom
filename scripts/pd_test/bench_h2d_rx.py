@@ -124,18 +124,21 @@ class SustainedGraph:
 
 
 def run_sampler_check(torch, observer, cases, args, report):
-    """Physical GPU4 only. Observe ON twice between identical OFF brackets."""
-    reader = counter_reader(observer, 0, rx_only=True)
+    """One selected device. Observe ON twice between identical OFF brackets."""
+    device = args.check_device
+    reader = counter_reader(observer, device, rx_only=True)
     report["chunk_graphs"] = []
-    with torch.cuda.device(0):
+    with torch.cuda.device(device):
         for method in ("ce_bulk", "sm"):
-            report["active_case"] = dict(device=0, method=method, phase="capture_chunk")
-            case = cases[(0, method)]
+            report["active_case"] = dict(
+                device=device, method=method, phase="capture_chunk"
+            )
+            case = cases[(device, method)]
             graph = SustainedGraph(torch, case, args.chunk_ms)
             report["chunk_graphs"].append(graph.metadata)
             for trial, enabled in enumerate((False, True, True, False)):
                 report["active_case"] = dict(
-                    device=0, method=method, trial=trial, sampler=enabled
+                    device=device, method=method, trial=trial, sampler=enabled
                 )
                 idle = (
                     RxSampler(reader, args.sample_ms / 1000).start()
@@ -147,7 +150,7 @@ def run_sampler_check(torch, observer, cases, args, report):
                         threading.Event().wait(0.7)
                     finally:
                         idle.stop()
-                before = observer.sample(0)
+                before = observer.sample(device)
                 # Warm THIS copy workload, never matmul. Do this in both OFF
                 # and ON phases so an idle interval does not create a cold ON.
                 graph.run(2.0)
@@ -161,9 +164,9 @@ def run_sampler_check(torch, observer, cases, args, report):
                 finally:
                     if sampler is not None:
                         sampler.stop()
-                after = observer.sample(0)
+                after = observer.sample(device)
                 window = dict(
-                    device=0,
+                    device=device,
                     trial=trial,
                     method=method,
                     sampler_enabled=enabled,
@@ -260,8 +263,9 @@ def main():
     parser.add_argument(
         "--sampler-check",
         action="store_true",
-        help="GPU4-only OFF/ON/ON/OFF measurement self-check",
+        help="Selected-device OFF/ON/ON/OFF measurement self-check",
     )
+    parser.add_argument("--check-device", type=int, choices=[0, 1], default=0)
     parser.set_defaults(
         batch=32,
         misses=[100],
@@ -332,7 +336,7 @@ def main():
         report["driver_version"] = str(observer.nv.nvmlSystemGetDriverVersion())
         # Zero is valid in the idle probe. Exceptions are retained, not treated as zero.
         report["capabilities"] = []
-        case_devices = [0] if args.sampler_check else args.devices
+        case_devices = [args.check_device] if args.sampler_check else args.devices
         for device in case_devices:
             report["active_case"] = dict(device=device, phase="counter_probe")
             report["capabilities"].append(
