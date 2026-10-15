@@ -6,8 +6,10 @@ from sglang.benchmark.hisparse_h2d_pair import abba_order
 from sglang.benchmark.hisparse_h2d_rx import (
     RxSampler,
     ce_calibration,
+    chunk_metrics,
     rx_compact_report,
     sampled_rates,
+    sampler_controls,
     window_metrics,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -142,6 +144,136 @@ def test_sampler_stops_and_keeps_reader_failures():
     failed.thread.join(timeout=1)
     failed.stop()
     assert failed.rows and "not supported" in failed.rows[0]["error"]
+
+
+def test_rx_only_does_not_invent_zero_tx_traffic():
+    w = synthetic_window()
+    for row in w["samples"] + w["idle_samples"]:
+        row["tx_kbps"] = None
+    m = window_metrics(w, 0.05, 0.3, require_steady=True)
+    assert m["valid"] and m["rates"]["tx_kbps"] is None
+    assert m["tx_GBps_1024"] is None
+    assert ce_calibration(m)["valid"]
+
+
+def test_one_missing_tx_sample_is_not_mistaken_for_an_rx_only_run():
+    w = synthetic_window()
+    w["samples"][10]["tx_kbps"] = None
+    assert not window_metrics(w, 0.02, 0.3)["valid"]
+
+
+def test_two_timing_plateaus_fail_even_with_continuous_gpu_intervals():
+    w = synthetic_window()
+    cursor = 0
+    for i, c in enumerate(w["chunks"]):
+        duration = 100_000_000 if i < 15 else 60_000_000
+        c.update(
+            begin_ns=cursor, end_ns=cursor + duration, gpu_us=duration * 0.99 / 1000
+        )
+        cursor += duration
+    # Submission and event/wall checks alone would accept the two platforms.
+    assert chunk_metrics(w, 0.3)["valid"]
+    m = chunk_metrics(w, 0.3, require_steady=True)
+    assert not m["valid"] and m["late_over_early_gpu"] == pytest.approx(0.6)
+
+
+def test_invalid_submission_keeps_counter_evidence_without_passing_quality():
+    w = synthetic_window()
+    for c in w["chunks"]:
+        c["enqueue_ns"] = 65_000_000
+    m = window_metrics(w, 0.02, 0.3, require_steady=True)
+    assert not m["valid"] and m["rates"]["valid"]
+    assert m["max_enqueue_fraction"] > 0.6
+    assert m["rx_GBps_1024"] == pytest.approx(55)
+
+
+def synthetic_sampler_report():
+    report = synthetic_report()
+    report["config"].update(sampler_check=True, sample_ms=50)
+    report["correctness"] = [r for r in report["correctness"] if r["device"] == 0]
+    report["chunk_graphs"] = [
+        dict(
+            method=m,
+            correctness=True,
+            capture_device=0,
+            per_copy_timing_events=0,
+            launches_per_chunk=1,
+        )
+        for m in ("sm", "ce_bulk")
+    ]
+    report["windows"] = []
+    for method in ("ce_bulk", "sm"):
+        for trial, enabled in enumerate((False, True, True, False)):
+            w = synthetic_window(55 if method == "ce_bulk" else 23)
+            w.update(device=0, trial=trial, method=method, sampler_enabled=enabled)
+            for row in w["samples"] + w["idle_samples"]:
+                row["tx_kbps"] = None
+            w["metrics"] = (
+                window_metrics(w, 0.05, 0.3, require_steady=True)
+                if enabled
+                else chunk_metrics(w, 0.3, require_steady=True)
+            )
+            if method == "ce_bulk" and enabled:
+                w["calibration"] = ce_calibration(w["metrics"])
+            report["windows"].append(w)
+    return report
+
+
+def test_sampler_check_requires_both_brackets_and_both_sampled_runs():
+    report = synthetic_sampler_report()
+    controls = sampler_controls(report)
+    assert all(c["valid"] and c["on_over_off"] == [1, 1] for c in controls.values())
+    text = rx_compact_report(report)
+    assert (
+        "chunk_graphs_valid=True windows=8/8 CE_calibration=2/2 results_valid=True"
+        in text
+    )
+    assert (
+        "PAIRS " not in text
+    )  # This is measurement validation, not the full experiment.
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "one_slow_on",
+        "drift",
+        "reorder",
+        "missing",
+        "invalid_on",
+        "wrong_device",
+        "bad_graph",
+        "bad_ce",
+        "bad_bytes",
+        "extra_window",
+    ],
+)
+def test_sampler_check_exposes_perturbation_and_incomplete_evidence(fault):
+    report = synthetic_sampler_report()
+    rows = report["windows"]
+    if fault == "one_slow_on":
+        rows[5]["metrics"]["core_seconds"] *= 1.25
+    elif fault == "drift":
+        rows[7]["metrics"]["core_seconds"] *= 0.7
+    elif fault == "reorder":
+        rows[4], rows[5] = rows[5], rows[4]
+    elif fault == "missing":
+        rows.pop()
+    elif fault == "invalid_on":
+        rows[5]["metrics"]["valid"] = False
+        control = sampler_controls(report)["sm"]
+        assert not control["valid"] and control["on_over_off"] == [1, 1]
+    elif fault == "wrong_device":
+        rows[5]["device"] = 1
+    elif fault == "bad_graph":
+        report["chunk_graphs"][0]["per_copy_timing_events"] = 128
+    elif fault == "bad_ce":
+        rows[1]["calibration"]["valid"] = False
+    elif fault == "bad_bytes":
+        report["correctness"][0]["payload"] = False
+    else:
+        rows.append(dict(rows[0], method="unknown"))
+    assert "results_valid=False" in rx_compact_report(report)
 
 
 def synthetic_report():

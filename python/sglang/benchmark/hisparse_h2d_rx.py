@@ -69,13 +69,16 @@ def sampled_rates(rows, lo, hi, *, min_samples, max_gap_ns):
         return dict(
             valid=False, reason="Counter timestamps are not increasing", samples=count
         )
+    rate_keys = ["rx_kbps"]
+    if any(r.get("tx_kbps") is not None for r in points):
+        rate_keys.append("tx_kbps")
     if any(
         not isinstance(r.get(k), (int, float)) or not math.isfinite(r[k]) or r[k] < 0
         for r in points
-        for k in ("rx_kbps", "tx_kbps")
+        for k in rate_keys
     ):
         return dict(valid=False, reason="Invalid counter rate", samples=count)
-    integrals, rx_square, covered, gaps = dict(rx_kbps=0.0, tx_kbps=0.0), 0.0, 0, []
+    integrals, rx_square, covered, gaps = dict.fromkeys(rate_keys, 0.0), 0.0, 0, []
     for a, b in zip(points, points[1:]):
         left, right = max(lo, a["t_ns"]), min(hi, b["t_ns"])
         if right <= left:
@@ -100,6 +103,7 @@ def sampled_rates(rows, lo, hi, *, min_samples, max_gap_ns):
             valid=False, reason="No covered interval", samples=count, coverage=coverage
         )
     means = {k: v / covered for k, v in integrals.items()}
+    means.setdefault("tx_kbps", None)
     rx = means["rx_kbps"]
     cv = math.sqrt(max(0, rx_square / covered - rx * rx)) / rx if rx > 0 else None
     valid = count >= min_samples and coverage >= 0.95
@@ -114,7 +118,8 @@ def sampled_rates(rows, lo, hi, *, min_samples, max_gap_ns):
     )
 
 
-def window_metrics(window, period_s, trim_s):
+def chunk_metrics(window, trim_s, *, require_steady=False):
+    """Timing-only quality check, also used with all NVML polling disabled."""
     chunks = window["chunks"]
     if len(chunks) < 3:
         return dict(valid=False, reason="Too few transfer chunks")
@@ -123,15 +128,6 @@ def window_metrics(window, period_s, trim_s):
     if len(core) < 3:
         return dict(valid=False, reason="Too little steady work after trimming")
     lo, hi = core[0]["begin_ns"], core[-1]["end_ns"]
-    rates = sampled_rates(
-        window["samples"],
-        lo,
-        hi,
-        min_samples=20,
-        max_gap_ns=max(0.08, period_s * 4) * 1e9,
-    )
-    if not rates["valid"]:
-        return dict(valid=False, reason=rates["reason"], rates=rates)
     wall_s, gpu_s = (hi - lo) / 1e9, sum(c["gpu_us"] for c in core) / 1e6
     replays = sum(c["replays"] for c in core)
     payload = window["bytes_per_graph"] * replays
@@ -154,8 +150,54 @@ def window_metrics(window, period_s, trim_s):
     # Device event intervals can include host starvation. Also bound the
     # submission interval; event/wall agreement alone is not a busy metric.
     enqueue_fraction = max(c["enqueue_ns"] / (c["gpu_us"] * 1000) for c in core)
+    normalized = [c["gpu_us"] / c["replays"] for c in core]
+    timing_cv = statistics.pstdev(normalized) / statistics.fmean(normalized)
+    third = max(1, len(core) // 3)
+    late_early = statistics.fmean(normalized[-third:]) / statistics.fmean(
+        normalized[:third]
+    )
+    steady = timing_cv <= 0.10 and 0.90 <= late_early <= 1.10
+    valid = (
+        0.90 <= gpu_wall_ratio <= 1.02
+        and 0 <= enqueue_fraction <= 0.10
+        and (steady or not require_steady)
+    )
+    return dict(
+        valid=valid,
+        reason=(
+            None
+            if valid
+            else "Submission, GPU/wall timing, or steady-state check failed"
+        ),
+        core_begin_ns=lo,
+        core_end_ns=hi,
+        core_seconds=wall_s,
+        core_replays=replays,
+        core_chunks=len(core),
+        logical_bytes=payload,
+        logical_wall_GBps=payload / wall_s / 1e9,
+        logical_gpu_GBps=payload / gpu_s / 1e9,
+        gpu_wall_ratio=gpu_wall_ratio,
+        max_enqueue_fraction=enqueue_fraction,
+        chunk_gpu_cv=timing_cv,
+        late_over_early_gpu=late_early,
+    )
+
+
+def window_metrics(window, period_s, trim_s, *, require_steady=False):
+    timing = chunk_metrics(window, trim_s, require_steady=require_steady)
+    if "core_begin_ns" not in timing:
+        return timing
+    rates = sampled_rates(
+        window["samples"],
+        timing["core_begin_ns"],
+        timing["core_end_ns"],
+        min_samples=20,
+        max_gap_ns=max(0.08, period_s * 4) * 1e9,
+    )
+    if not rates["valid"]:
+        return dict(timing, valid=False, reason=rates["reason"], rates=rates)
     stable = rates["rx_cv"] is not None and rates["rx_cv"] <= 0.15
-    valid = 0.90 <= gpu_wall_ratio <= 1.02 and 0 <= enqueue_fraction <= 0.10 and stable
     idle_rows = window["idle_samples"]
     idle = (
         sampled_rates(
@@ -175,24 +217,23 @@ def window_metrics(window, period_s, trim_s):
     )
     background_ok = idle_ratio is not None and idle_ratio <= 0.05
     return dict(
-        valid=valid and idle["valid"] and background_ok,
+        timing,
+        valid=timing["valid"] and stable and idle["valid"] and background_ok,
         rates=rates,
         idle=idle,
-        core_seconds=wall_s,
-        core_replays=replays,
-        core_chunks=len(core),
-        logical_bytes=payload,
-        logical_wall_GBps=payload / wall_s / 1e9,
-        logical_gpu_GBps=payload / gpu_s / 1e9,
-        gpu_wall_ratio=gpu_wall_ratio,
-        max_enqueue_fraction=enqueue_fraction,
         rx_GBps_1024=rates["rx_kbps"] * 1024 / 1e9,
-        tx_GBps_1024=rates["tx_kbps"] * 1024 / 1e9,
+        tx_GBps_1024=(
+            rates["tx_kbps"] * 1024 / 1e9 if rates["tx_kbps"] is not None else None
+        ),
         idle_over_active=idle_ratio if idle["valid"] else None,
         reason=(
-            None
-            if valid and idle["valid"] and background_ok
-            else "Unstable Rx, host gaps, invalid idle samples, or high background"
+            timing["reason"]
+            if not timing["valid"]
+            else (
+                None
+                if stable and idle["valid"] and background_ok
+                else "Unstable Rx, invalid idle samples, or high background"
+            )
         ),
     )
 
@@ -219,7 +260,134 @@ def ce_calibration(metrics):
     )
 
 
+def sampler_controls(report):
+    """Require both sampled runs and both unpolled brackets, never a lucky run."""
+    controls = {}
+    for method in ("ce_bulk", "sm"):
+        rows = [w for w in report.get("windows", []) if w["method"] == method]
+        if (
+            len(rows) != 4
+            or [w.get("sampler_enabled") for w in rows] != [False, True, True, False]
+            or [w.get("trial") for w in rows] != list(range(4))
+            or any(
+                w.get("device") != 0 or not w.get("metrics", {}).get("core_replays")
+                for w in rows
+            )
+        ):
+            controls[method] = dict(
+                valid=False,
+                reason="Missing, invalid or reordered OFF/ON/ON/OFF windows",
+            )
+            continue
+        us = [
+            w["metrics"]["core_seconds"] * 1e6 / w["metrics"]["core_replays"]
+            for w in rows
+        ]
+        baseline = statistics.fmean([us[0], us[3]])
+        ratios = [us[1] / baseline, us[2] / baseline]
+        drift = us[3] / us[0]
+        quality = all(w["metrics"]["valid"] for w in rows)
+        controls[method] = dict(
+            valid=quality
+            and 0.90 <= drift <= 1.10
+            and all(0.90 <= r <= 1.10 for r in ratios),
+            windows_quality=quality,
+            bank_sequence_wall_us=us,
+            on_over_off=ratios,
+            off_late_over_early=drift,
+        )
+    return controls
+
+
+def sampler_check_report(report):
+    windows, checked = report.get("windows", []), report.get("correctness", [])
+    controls = sampler_controls(report)
+    correct = (
+        len(checked) == 2
+        and {(r["device"], r["method"]) for r in checked} == {(0, "sm"), (0, "ce_bulk")}
+        and all(r["payload"] is True and r["graph"] is True for r in checked)
+        and all(r["untouched"] is True for r in checked if r["method"] == "sm")
+    )
+    graphs = report.get("chunk_graphs", [])
+    graph_ok = (
+        len(graphs) == 2
+        and {g.get("method") for g in graphs} == {"sm", "ce_bulk"}
+        and all(
+            g.get("correctness") is True
+            and g.get("capture_device") == 0
+            and g.get("per_copy_timing_events") == 0
+            and g.get("launches_per_chunk") == 1
+            for g in graphs
+        )
+    )
+    ce = [w for w in windows if w["method"] == "ce_bulk" and w.get("sampler_enabled")]
+    cal = sum(w.get("calibration", {}).get("valid") is True for w in ce)
+    ready = (
+        report.get("success") is True
+        and report.get("counters_available") is True
+        and correct
+        and graph_ok
+        and cal == 2
+        and len(ce) == 2
+        and len(windows) == 8
+        and all(c["valid"] for c in controls.values())
+    )
+    lines = [
+        "NVML sampler self-check: physical GPU4 only; OFF/ON/ON/OFF; identical event-free chunk graph within each method.",
+        f'success={report["success"]} counters_available={report.get("counters_available")} correctness={len(checked)}/2 '
+        f"correctness_valid={correct} chunk_graphs_valid={graph_ok} windows={len(windows)}/8 CE_calibration={cal}/2 results_valid={ready}",
+        f'CONFIG B32/miss100 SM=legacy_CTA4/1024 banks=64 CE=64MiB/7banks register_flags={report.get("register_flags")} '
+        f'duration_s={report["config"]["duration_s"]} trim_s={report["config"]["trim_s"]} sample_ms={report["config"]["sample_ms"]} RX_only=True',
+        f'CODE git={report.get("code",{}).get("git")} JIT={report.get("jit_artifacts")}',
+    ]
+    if report.get("error"):
+        lines.append(f'ERROR active={report.get("active_case")} {report["error"]}')
+    for d, meta in sorted(report.get("devices", {}).items()):
+        lines.append(
+            f'IDENTITY d{d} physical={meta["physical_index"]} BDF={meta["pci_bus"]} UUID={meta["uuid"]}'
+        )
+    for buf in report.get("host_snapshot", {}).get("buffers", []):
+        lines.append(
+            f'HOST bytes={buf["nbytes"]} NUMA={[r.get("numa") for r in buf["regions"]]}'
+        )
+    for graph in graphs:
+        lines.append(f"GRAPH {graph}")
+    for w in windows:
+        m = w["metrics"]
+        text = f'WINDOW {w["method"]} trial={w["trial"]} sampler={"ON" if w["sampler_enabled"] else "OFF"} valid={m["valid"]}'
+        for key in (
+            "logical_wall_GBps",
+            "max_enqueue_fraction",
+            "chunk_gpu_cv",
+            "late_over_early_gpu",
+        ):
+            if key in m:
+                text += f" {key}={m[key]:.4f}"
+        rates = m.get("rates", {})
+        if rates.get("rx_kbps") is not None:
+            text += f' raw_rx_KBps={rates["rx_kbps"]:.1f} n={rates["samples"]} coverage={rates["coverage"]:.3f} CV={rates["rx_cv"]}'
+        calls = [r["call_ns"] / 1e6 for r in w.get("samples", []) if "call_ns" in r]
+        if calls:
+            text += f" query_ms_min/med/max={[round(v,3) for v in (min(calls),statistics.median(calls),max(calls))]}"
+        if not m["valid"]:
+            text += f' reason={m.get("reason")} '
+        lines.append(text)
+    for method, control in controls.items():
+        lines.append(f"CONTROL {method} {control}")
+    states = [s for w in windows for s in w.get("states", [])]
+    lines.append(
+        "STATE d0 "
+        + (clock_text([dict(before=s) for s in states]) if states else "not_collected")
+    )
+    lines.append(
+        "This checks the measurement process. Do not infer production H2D root cause or run the old main from this result."
+    )
+    return "\n".join(lines) + "\n"
+
+
 def rx_compact_report(report):
+    if report["config"].get("sampler_check"):
+        return sampler_check_report(report)
     config, windows = report["config"], report.get("windows", [])
     expected_keys = {
         (d, t, m) for t, d in enumerate(config["order"]) for m in ("sm", "ce_bulk")

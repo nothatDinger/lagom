@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import math
+import statistics
 import threading
 import time
 from pathlib import Path
@@ -22,12 +23,13 @@ from sglang.benchmark.hisparse_h2d_pair import abba_order
 from sglang.benchmark.hisparse_h2d_rx import (
     RxSampler,
     ce_calibration,
+    chunk_metrics,
     rx_compact_report,
     window_metrics,
 )
 
 
-def counter_reader(observer, device):
+def counter_reader(observer, device, *, rx_only=False):
     nv, handle = observer.nv, observer.handles[device]
 
     def read():
@@ -35,12 +37,158 @@ def counter_reader(observer, device):
             rx_kbps=int(
                 nv.nvmlDeviceGetPcieThroughput(handle, nv.NVML_PCIE_UTIL_RX_BYTES)
             ),
-            tx_kbps=int(
-                nv.nvmlDeviceGetPcieThroughput(handle, nv.NVML_PCIE_UTIL_TX_BYTES)
+            tx_kbps=(
+                int(nv.nvmlDeviceGetPcieThroughput(handle, nv.NVML_PCIE_UTIL_TX_BYTES))
+                if not rx_only
+                else None
             ),
         )
 
     return read
+
+
+class SustainedGraph:
+    """One launch per chunk, with no internal Event nodes or CPU refill loop."""
+
+    def __init__(self, torch, case, chunk_ms):
+        self.torch, self.case = torch, case
+        with torch.cuda.device(case.device):
+            self.stream = torch.cuda.Stream(device=case.device)
+            bank_graph = self.capture(1)
+            for _ in range(3):
+                bank_graph.replay()
+                torch.cuda.synchronize()
+            pilots = [self.measure(bank_graph, 1)["gpu_us"] for _ in range(5)]
+            self.waves = max(1, math.ceil(chunk_ms * 1000 / statistics.median(pilots)))
+            # Bound capture size, rather than accidentally capturing an enormous
+            # graph if a pilot is corrupt or returns an implausibly small time.
+            if self.waves * case.banks > 16384:
+                raise RuntimeError("Implausibly large sustained graph")
+            self.graph = self.capture(self.waves)
+            self.case.rx_output.zero_()
+            self.graph.replay()
+            torch.cuda.synchronize()
+            self.case.rx_validate(case.banks - 1)
+            self.metadata = dict(
+                device=case.device,
+                method="sm" if case.method == "sm" else "ce_bulk",
+                capture_device=case.device,
+                per_copy_timing_events=0,
+                launches_per_chunk=1,
+                banks=case.banks,
+                waves=self.waves,
+                copy_nodes=self.waves * case.banks,
+                bank_pilot_us=pilots,
+                correctness=True,
+            )
+
+    def capture(self, waves):
+        torch = self.torch
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=self.stream):
+            if (
+                torch.cuda.current_device() != self.case.device
+                or torch.cuda.current_stream().device.index != self.case.device
+            ):
+                raise RuntimeError("Capture stream/device mismatch")
+            for _ in range(waves):
+                for fn in self.case.functions:
+                    fn()
+        return graph
+
+    def measure(self, graph=None, waves=None):
+        torch = self.torch
+        graph = self.graph if graph is None else graph
+        waves = self.waves if waves is None else waves
+        start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+        before = time.monotonic_ns()
+        start.record()
+        graph.replay()
+        submitted = time.monotonic_ns()
+        end.record()
+        end.synchronize()
+        after = time.monotonic_ns()
+        return dict(
+            begin_ns=before,
+            end_ns=after,
+            enqueue_ns=submitted - before,
+            replays=waves,
+            gpu_us=start.elapsed_time(end) * 1000,
+        )
+
+    def run(self, seconds):
+        chunks, began = [], time.monotonic()
+        while time.monotonic() - began < seconds:
+            chunks.append(self.measure())
+        return chunks
+
+
+def run_sampler_check(torch, observer, cases, args, report):
+    """Physical GPU4 only. Observe ON twice between identical OFF brackets."""
+    reader = counter_reader(observer, 0, rx_only=True)
+    report["chunk_graphs"] = []
+    with torch.cuda.device(0):
+        for method in ("ce_bulk", "sm"):
+            report["active_case"] = dict(device=0, method=method, phase="capture_chunk")
+            case = cases[(0, method)]
+            graph = SustainedGraph(torch, case, args.chunk_ms)
+            report["chunk_graphs"].append(graph.metadata)
+            for trial, enabled in enumerate((False, True, True, False)):
+                report["active_case"] = dict(
+                    device=0, method=method, trial=trial, sampler=enabled
+                )
+                idle = (
+                    RxSampler(reader, args.sample_ms / 1000).start()
+                    if enabled
+                    else None
+                )
+                if idle is not None:
+                    try:
+                        threading.Event().wait(0.7)
+                    finally:
+                        idle.stop()
+                before = observer.sample(0)
+                # Warm THIS copy workload, never matmul. Do this in both OFF
+                # and ON phases so an idle interval does not create a cold ON.
+                graph.run(2.0)
+                sampler = (
+                    RxSampler(reader, args.sample_ms / 1000).start()
+                    if enabled
+                    else None
+                )
+                try:
+                    chunks = graph.run(args.duration_s)
+                finally:
+                    if sampler is not None:
+                        sampler.stop()
+                after = observer.sample(0)
+                window = dict(
+                    device=0,
+                    trial=trial,
+                    method=method,
+                    sampler_enabled=enabled,
+                    bytes_per_graph=case.nbytes * case.banks,
+                    chunks=chunks,
+                    samples=sampler.rows if sampler else [],
+                    idle_samples=idle.rows if idle else [],
+                    states=[before, after],
+                )
+                window["metrics"] = (
+                    window_metrics(
+                        window, args.sample_ms / 1000, args.trim_s, require_steady=True
+                    )
+                    if enabled
+                    else chunk_metrics(window, args.trim_s, require_steady=True)
+                )
+                if method == "ce_bulk" and enabled:
+                    window["calibration"] = ce_calibration(window["metrics"])
+                report["windows"].append(window)
+                # Keep both brackets even if an ON phase is invalid, so the
+                # compact report can expose drift instead of stopping mid-pair.
+                print(
+                    f"CHECK {method} trial={trial} sampler={enabled}: {window['metrics']}",
+                    flush=True,
+                )
 
 
 def sustained_window(torch, observer, warmer, case, method, trial, args):
@@ -109,6 +257,11 @@ def main():
     parser.add_argument("--trim-s", type=float, default=0.3)
     parser.add_argument("--sample-ms", type=float, default=20)
     parser.add_argument("--chunk-ms", type=float, default=100)
+    parser.add_argument(
+        "--sampler-check",
+        action="store_true",
+        help="GPU4-only OFF/ON/ON/OFF measurement self-check",
+    )
     parser.set_defaults(
         batch=32,
         misses=[100],
@@ -133,8 +286,13 @@ def main():
         parser.error(
             "Require duration >=1.5s with >=0.7s after 0.2..0.5s edge trimming"
         )
-    if not (10 <= args.sample_ms <= 25 and 50 <= args.chunk_ms <= 150):
-        parser.error("Require sample-ms=10..25 and chunk-ms=50..150")
+    if not (
+        10 <= args.sample_ms <= (100 if args.sampler_check else 25)
+        and 50 <= args.chunk_ms <= 150
+    ):
+        parser.error(
+            "Require sample-ms=10..25 (10..100 for sampler-check), chunk-ms=50..150"
+        )
     order = abba_order(args.devices, args.epochs)
     if args.devices != [0, 1]:
         parser.error("Expose physical GPU4/5 as CUDA logical 0/1")
@@ -154,10 +312,6 @@ def main():
     host, registered, observer = None, False, None
     try:
         import torch
-        from sglang.srt.mem_cache.pool_host.common import (
-            HostTensorAllocator,
-            _cuda_host_unregister,
-        )
 
         if (
             not torch.cuda.is_available()
@@ -165,6 +319,11 @@ def main():
             or torch.cuda.device_count() < 2
         ):
             raise RuntimeError("Expose two NVIDIA GPUs")
+        from sglang.srt.mem_cache.pool_host.common import (
+            HostTensorAllocator,
+            _cuda_host_unregister,
+        )
+
         torch.set_num_threads(1)
         observer = Observer(torch, args.devices)
         report["devices"] = observer.metadata
@@ -173,10 +332,14 @@ def main():
         report["driver_version"] = str(observer.nv.nvmlSystemGetDriverVersion())
         # Zero is valid in the idle probe. Exceptions are retained, not treated as zero.
         report["capabilities"] = []
-        for device in args.devices:
+        case_devices = [0] if args.sampler_check else args.devices
+        for device in case_devices:
             report["active_case"] = dict(device=device, phase="counter_probe")
             report["capabilities"].append(
-                dict(device=device, **counter_reader(observer, device)())
+                dict(
+                    device=device,
+                    **counter_reader(observer, device, rx_only=args.sampler_check)(),
+                )
             )
         report["counters_available"] = True
         report["code"] = vector_provenance()
@@ -215,7 +378,7 @@ def main():
         )
         plan = make_plan(torch, args, geometry, 0, 100)
         cases = {}
-        for device in args.devices:
+        for device in case_devices:
             cases[(device, "sm")] = CopyCase(
                 torch,
                 host,
@@ -256,6 +419,11 @@ def main():
                 )
             )
         report["jit_artifacts"] = [loaded_grid_artifact()]
+        if args.sampler_check:
+            run_sampler_check(torch, observer, cases, args, report)
+            report["success"] = True
+            # Avoid constructing matmul warmers in this diagnostic path.
+            return 0 if "results_valid=True" in rx_compact_report(report) else 1
         warmers = {d: Warmer(torch, d) for d in args.devices}
         local_trials = {d: 0 for d in args.devices}
         for trial, device in enumerate(order):

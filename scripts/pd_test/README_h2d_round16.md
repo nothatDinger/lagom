@@ -1,116 +1,99 @@
 # 第十六轮：持续 host gather / bulk CE 的 NVML PCIe Rx 对照
 
 沿用基于 `hash_verify` 的 `perf/hisparse-h2d-diagnosis`。
-本轮只回答：**SM有效KV吞吐低时，GPU的PCIe接收流量是否也低？**
-使用现有venv、PyTorch和已安装的pynvml。无需新版NCU、Docker、root或新的CUDA内核。
+原目标：区分“SM有效KV吞吐低且PCIe接收速率也低”和“接收了更多字节但有效KV比例低”。
+**当前只执行下面的采集自检，不续跑旧smoke/main。** 使用现有venv和pynvml，无需NCU、Docker或root。
 
-## 1. 为什么测这一项
+## 1. 首次smoke实际发现了什么
 
-此前SM带宽是 `有效KV字节数 / copy时间`，不是PCIe物理流量计数。
-第十四/十五轮已经发现：D2与CTA8改善HBM执行，却没有host净收益。
-继续改变暂存/CTA之前，需要区分“接收通路没有充分利用”与“接收了更多字节，但有效KV占比低”。
+- 身份/NUMA/字节正确性通过。GPU4 CE稳态有效吞吐55.06 GB/s、NVML名义Rx 60.53 GB/s，通过既定粗校验。
+  两者相差约9.9%，不能把名义Rx当精确的有效PCIe载荷。
+- SM pilot在持续采样线程启动前，单copy已经约115.46us；该pilot的host跨度包含同步等待，
+  host跨度与GPU区间接近**不证明graph.replay调用本身没有阻塞**。
+- SM持续段固定14次bank graph/段，前10段约105.6ms，后段下降到60.5ms；未达到稳态。
+- 每次Rx+Tx查询耗时约41ms，所以设定20ms实际得到约41ms间隔。
+- 旧SM窗口Rx CV=0.15082略超0.15，CPU提交/GPU区间最高0.685又超0.10，两个门槛分别失败。
+  0.685不等于GPU空闲68.5%；提交时间可与GPU执行重叠，异步API也可能阻塞。
 
-NVML `nvmlDeviceGetPcieThroughput(..., NVML_PCIE_UTIL_RX_BYTES)` 提供低频的接收速率近似。
-它不是累计字节计数，不提供TLP形状、每笔请求或TLB miss。
-脚本原样保留其KB/s读数；另给按1024 B/KB换算的名义GB/s。
-CE核验其量级和一致性，不精确鉴定KB的底数，也不把计数器重新缩放成55GB/s。
-主要比较使用同卡的 **SM/CE原始Rx比值**，避免单位底数影响这个比值。
+因此旧SM窗口不能支持H2D根因结论，也不能仅凭这些信息把问题归咎NVML。
+下面先消除反复提交带Event graph的干扰机会，再用相同graph检验采样开关的影响。
 
-## 2. 固定工作与时间口径
+## 2. 具体改动与固定条件
 
-同一512MiB（向下取整到完整C4页）NUMA1 pinned allocation，Portable注册flags=1，context=CUDA1。
-GPU4/5顺序测量，按ABBA交替。每卡交替CE→SM和SM→CE，正式组各两次。
+继续暴露物理GPU4/5，Portable注册context仍为CUDA1；本次**只有GPU4执行搬运**。
+GPU5只保留身份映射/注册context的既有用途，不构造其copy case或执行计算预热。
 
-- SM：原legacy CTA4/1024，B32/miss100，584B/KV，每copy **1,868,800B**。
-  随机源、原GPU plan/目的布局、64个bank轮换，逻辑工作集119,603,200B。
-- CE：同一host pool中的64MiB连续H2D，通常7个bank轮换。
-- 复用现有CopyCase的eager、graph和完整字节校验，SM检查未写区域与页padding。
-  actual legacy `.so`摘要照录，不修改kernel、API或服务配置。
+- 同一512MiB NUMA1 pinned pool；SM仍legacy CTA4/1024、B32/miss100、584B/KV、64个随机bank。
+- CE仍是同一host pool中的64MiB连续H2D、7个bank。CUDA kernel、load policy、plan、目的地址不变。
+- 每个方法先capture一个bank序列，取5次外围Event时间的中位数估算约100ms的工作量。
+  再capture包含若干完整bank序列的chunk graph，**每段只调用一次graph.replay**；段结束同步。
+  graph内部没有逐copy计时Event；仅在graph外记录一对Event。图大小在四个开关阶段保持一致。
+- 新graph另做reset→replay→同步→全字节校验；SM同时检查未写区域和padding。
+  `per_copy_timing_events=0`和`launches_per_chunk=1`是脚本构造约束，不冒充profiler节点统计。
+- 每阶段先运行**同一copy负载**2秒，再测量2.5秒。不使用matmul预热。
+- 每方法执行**OFF→ON→ON→OFF**四阶段：OFF不创建采样线程；ON仅每50ms查询Rx，不查Tx。
+  两种阶段都只在测量前后查询状态，持续区间内不插入状态查询。
+- ON前采0.7秒idle背景。查询耗时与实际时间戳照录，Tx未采集记None，不伪造为0。
 
-每项先采0.5秒idle背景，忽略idle最初150ms和最后50ms；再做原有计算预热和graph预热。
-矩阵计算、分配、校验、setup H2D均在测量之外，持续传输期间不执行矩阵计算。
+CE的四阶段完成后再做SM四阶段，总计8个窗口；准备/预热之外的测量约20秒，copy预热约16秒。
+这是采集方式自检，既不归因旧smoke故障的唯一来源，也不是新CUDA优化或生产吞吐结果。
 
-持续传输按约100ms一段执行，每段重放完整的bank graph多次；段结束同步并记录完成字节数。
-这是有界提交，不在固定时间内无限向CUDA队列堆积。
-外围CUDA Event记录每段GPU时间；原graph内的Event节点保留，因此绝对速率不能直接替代旧copy-only指标。
+## 3. 预先固定的质量检查
 
-独立host线程每20ms读NVML Rx/Tx，每200ms读状态；它不调用CUDA、不捕获graph。
-正式窗口至少3秒，去掉首尾0.3秒，再选择完全落入区间的完整段。
-**逻辑字节数/墙钟时长与NVML平均速率使用同一个稳态区间。**
-NVML按实际采样时间加权积分，边界只在相邻样本间插值，不外推缺失区间、不跨越长缺口。
-驱动本身的速率平均窗口仍存在，因此结果是近似平均流量；首尾裁剪和稳态检查降低切换污染。
+所有窗口去掉首尾0.3秒，只保留完整传输段，逻辑字节数与Rx积分使用同一个墙钟区间。
 
-## 3. 自动门禁与失败处理
+- GPU Event区间/墙钟区间0.90–1.02；每段单次提交耗时/GPU区间≤0.10。
+- 段耗时按bank序列数归一化，CV≤0.10；最后三分之一/最初三分之一耗时比0.90–1.10。
+  原smoke那种两个明显平台不能仅凭GPU/wall≈1过关。
+- ON的Rx至少20个样本、覆盖≥95%，不跨越超过80ms或4个采样周期的缺口；Rx CV≤0.15。
+- idle Rx≤active的5%。CE名义Rx/逻辑墙钟吞吐0.85–1.15，CE有效吞吐≥45 GB/s。
+- 同方法两个OFF的耗时比0.90–1.10；两个ON分别相对OFF平均耗时的比值都在0.90–1.10。
+  每个方法必须四阶段齐全且顺序正确，不用某一次较好的ON替代全部结果。
 
-脚本首先探测两卡的Rx/Tx接口；不支持、权限/绑定错误等异常原样保存，不把错误当零。
-CE首先运行以核验计数器。通过条件预先固定：
+上述10%是排除大幅扰动/漂移的筛选条件，不是零干扰证明或统计显著性检验。
+两个ON的实际比值都输出，即使合格仍需审查方向与量级。
+NVML是低频近似速率，保留原始KB/s，另按1024 B/KB给名义值；不重缩放、不把它变成TLP/TLB计数。
 
-- 每个传输窗口稳态至少20个样本，时间覆盖≥95%；不跨越超过80ms或4个采样周期的缺口。
-- Rx变异系数≤15%；GPU Event区间/同区间墙钟时间在0.90–1.02；每段完整graph提交耗时≤该段GPU Event区间的10%。
-  Event区间本身可含等待，所以不能只用Event/墙钟比值断言GPU始终忙；提交耗时界限用于额外限制供给不足。
-- idle Rx≤该窗口active Rx的5%。背景不自动扣除。
-- CE名义Rx/有效墙钟吞吐在0.85–1.15；CE有效墙钟吞吐≥45GB/s，作为此前约55GB/s参照的质量筛选。
+某个窗口质量不合格，仍完成本方法余下开关阶段，以暴露前后漂移；正确性、CUDA或API异常立即退出。
+`success=True`只代表8个阶段执行完成，最终质量取决于`results_valid`；失败时保留全部已获得数据。
+两个ON的query异常也保存在原始采样中，不能按0或成功处理。
+端点状态不证明区间内恒频，采样开关对照也不证明SM与CE计数器覆盖完全相同。
 
-这些是诊断质量门槛，不是统计显著性或物理定律。
-零Rx、采样不稳定、CE过慢或量级不匹配都停止本次运行，保留已完成窗口和原始样本。
-CE通过不自动证明SM路径的counter覆盖：如果SM接收流量异常接近零、低于合理范围，
-仍需区分缓存、流量路径与计数器可见性，不能直接认定PCIe闲置。
+## 4. 只执行一次check
 
-CPU单测覆盖非均匀采样、共同时间区间、缺口/错误、错误校准及失败后不输出对照结论。
-开发环境没有GPU，NVML与持续graph的实际执行由下面smoke验证。
-
-## 4. 实机执行：先smoke，通过后main
-
-在仓库正常属主账号同步分支，保留已有结果和JIT cache：
+从仓库正常属主账号同步，保留原始rx-smoke与JIT cache：
 
 ```bash
 git fetch origin perf/hisparse-h2d-diagnosis
 git merge --ff-only FETCH_HEAD
+```
+
+在现有gpuq分配物理GPU4/5的作业内，从仓库根目录执行：
+
+```bash
 export LAGOM_PY=/home/jovyan/td69032/lagom_h2d_latency_test/.venv/bin/python3
+bash scripts/pd_test/run_h2d_rx.sh check "$PWD/work/h2d-round16/rx-check-v2"
 ```
 
-以下命令放在**现有gpuq分配物理GPU4/5的作业内**，从仓库根目录运行。
-wrapper设置 `CUDA_VISIBLE_DEVICES=4,5`、NUMA1绑定和日志重定向，不使用GPU0–3或启动服务。
+wrapper设置`CUDA_VISIBLE_DEVICES=4,5`和NUMA1绑定，重定向日志，不覆盖旧目录。
+本地CPU检查不替代实机CUDA capture/字节校验，本次check包含这些验证。
 
-```bash
-bash scripts/pd_test/run_h2d_rx.sh smoke "$PWD/work/h2d-round16/rx-smoke"
+期望：
+
+```text
+success=True counters_available=True correctness=2/2 correctness_valid=True
+chunk_graphs_valid=True windows=8/8 CE_calibration=2/2 results_valid=True
 ```
 
-smoke保持正式源/工作量，仅缩短为每项1.5秒、首尾裁0.25秒、一个ABBA epoch。
-通过：`success=True counters_available=True correctness=4/4 correctness_valid=True`，
-`windows=8/8 quality=True CE_calibration=4/4 results_valid=True`，身份仍为physical4/5，host页在node1。
-纯传输段约12秒，另有分配、校验、预热和idle开销；smoke不用于性能/根因定论。
+两条CONTROL都应为`{'valid': True, ...}`。
+即使全部通过，本次也到此结束，**不自动续跑旧main**。wrapper暂时拒绝旧smoke/main参数。
 
-全部通过后直接继续：
+## 5. 只需要反馈一份紧凑文件
 
-```bash
-bash scripts/pd_test/run_h2d_rx.sh main "$PWD/work/h2d-round16/rx-main"
-```
+反馈`work/h2d-round16/rx-check-v2/rx-compact.txt`全文（约20行）。
+它包含：两条GRAPH、8条WINDOW、两条CONTROL、身份/NUMA/JIT以及端点STATE。
+重点是两个ON/OFF耗时比、两个OFF的漂移、提交占比、段耗时CV、Rx查询耗时与CE校验。
+若紧凑文件未生成，给run.log最后30行。rx.json留在实机，不上传大日志。
 
-正式组每项3秒，两个ABBA epoch：每卡4个SM/CE配对，纯传输段约48秒。
-通过：correctness仍4/4，`windows=16/16 quality=True CE_calibration=8/8 results_valid=True`。
-任何步骤失败就停，不安装工具、不绕过门槛；反馈错误即可。
-
-## 5. 只需要这些反馈
-
-1. smoke的通过状态一行，或失败时的 **rx-compact.txt**。
-2. main的 **rx-compact.txt** 全文（约30行，含16个WINDOW、两条PAIRS及STATE）。
-3. 如紧凑文件未生成，给run.log最后30行。
-
-`rx.json`含原始采样和每段计数，留在实机，不上传大日志。
-git属主失败只记metadata，代码与已加载JIT摘要仍照录，不修改safe.directory。
-
-主要反馈字段：每窗口的有效墙钟/GPU吞吐、原始Rx、名义Rx/Tx、idle背景、样本数/覆盖、Rx变异系数；
-每卡四组 `SM/CE_rx` 与 `SM/CE_logical` 比值；以及CE校验和GPU状态。
-
-## 6. 如何用结果决定方向
-
-| 在有效校验下的观察 | 支持的方向 |
-|---|---|
-| SM Rx接近本卡CE参照，但SM逻辑吞吐明显低 | 额外接收流量/有效字节比例值得优先分析；下一步针对源布局及value/scale访问组织，不继续盲加并发 |
-| SM Rx与逻辑吞吐量级接近，且两者均明显低于CE | 本条件下接收速率未到CE参照；继续分析稀疏读取请求的发起、等待及处理效率，不宣布物理带宽上限已到 |
-| 介于两者之间、跨波不一致、SM异常零流量或校验失败 | 保留原样，先核对计数器与流量路径，不依据该结果选择CUDA优化 |
-
-即使Rx/逻辑字节比值较大，也不能直接把它解释成某种固定PCIe放大倍数或TLB miss。
-NVML是GPU端聚合速率近似，不是总线协议分析器；阶段流量还可能有缓存和控制开销。
-本轮是独立copy诊断，不能当作真实decode的链路利用率或服务收益。
+若ON稳定慢于OFF，就先解决探针扰动；若OFF自身漂移，先解决预热/执行状态；
+只有相同graph的开关对照、稳态与CE校验都合格后，才恢复原本的有效字节/Rx对照目标。

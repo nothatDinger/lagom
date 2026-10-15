@@ -350,6 +350,10 @@ class CopyCase:
             torch.cuda.synchronize()
             validate(banks - 1)
             self.graph_verified = True
+            if getattr(args, "pcie_rx_probe", False):
+                # The sustained Rx diagnostic captures a separate graph without
+                # per-copy timing nodes, and must validate that graph as well.
+                self.rx_output, self.rx_validate = output, validate
 
     def warm(self, torch, phase, warmer, args):
         if phase == "compute":
