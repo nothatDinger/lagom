@@ -152,3 +152,6 @@ PYTHONPATH=python "$LAGOM_PY" scripts/pd_test/reanalyze_h2d_linear.py \
 不表示完整实验通过。预期`results_valid=False`且
 `COMPARISONS SM_valid=True CEsame_valid=False bulk_reference_valid=True`。
 只需反馈该行、两条`RATIOS_SM`及一条`CROSS_SM`，不需要原始日志或额外GPU实验。
+
+实机离线重解析已确认：SM_valid=True、CEsame_valid=False、bulk_reference_valid=True，
+以及上述两卡两波的比值。第17轮闭合；后续相邻KV中间对照见 [第十八轮](README_h2d_round18.md)。
