@@ -11,6 +11,9 @@ from sglang.benchmark.hisparse_h2d_bulk_compare import (
     CONFIG,
     COPY_BYTES,
     ORDER,
+    RX_CONFIG,
+    RX_ENABLED,
+    RX_ORDER,
     compact_report,
     report_status,
 )
@@ -21,13 +24,18 @@ from sglang.benchmark.hisparse_h2d_linear import loaded_linear_artifact
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--rx-sampler",
+        action="store_true",
+        help="Add OFF/ON/ON/OFF NVML Rx checks per method",
+    )
     cli = parser.parse_args()
     cli.output_dir.mkdir(parents=True, exist_ok=True)
     if any((cli.output_dir / n).exists() for n in ("bulk.json", "bulk-compact.txt")):
         parser.error("Use a fresh output directory")
     report = dict(
         success=False,
-        config=CONFIG,
+        config=RX_CONFIG if cli.rx_sampler else CONFIG,
         visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
         correctness=[],
         chunk_graphs=[],
@@ -47,6 +55,7 @@ def main():
         torch.cuda.set_device(0)
         from bench_h2d_device_order import acquire
         from bench_h2d_linear import ContiguousCase
+        from bench_h2d_linear import acquire as sampled_acquire
         from bench_h2d_pair import Observer, vector_provenance
         from bench_h2d_rx import SustainedGraph
         from sglang.benchmark.hisparse_h2d_diagnostics import process_snapshot
@@ -149,12 +158,28 @@ def main():
             for k in ("identity", "correctness", "graphs", "host", "bindings", "jit")
         ):
             raise RuntimeError(f"Pre-measurement checks failed: {preflight}")
-        for trial, method in enumerate(ORDER):
+        order = RX_ORDER if cli.rx_sampler else ORDER
+        enabled = RX_ENABLED if cli.rx_sampler else (False,) * len(ORDER)
+        for trial, (method, sampled) in enumerate(zip(order, enabled)):
             report["active_case"] = dict(
-                phase="measurement", method=method, trial=trial
+                phase="measurement", method=method, trial=trial, sampler_enabled=sampled
             )
             with torch.cuda.device(0):
-                row = acquire(observer, graphs[method], trial, 0, method, 0)
+                row = (
+                    sampled_acquire(
+                        torch,
+                        observer,
+                        graphs[method],
+                        method,
+                        0,
+                        trial,
+                        0,
+                        sampled,
+                        None,
+                    )
+                    if cli.rx_sampler
+                    else acquire(observer, graphs[method], trial, 0, method, 0)
+                )
             report["windows"].append(row)
             print(f"WINDOW {method} trial={trial} {row['metrics']}", flush=True)
         report["success"] = True

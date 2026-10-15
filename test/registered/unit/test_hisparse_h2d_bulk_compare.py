@@ -15,6 +15,9 @@ from sglang.benchmark.hisparse_h2d_bulk_compare import (
     METHODS,
     ORDER,
     REFERENCE_SHA256,
+    RX_CONFIG,
+    RX_ENABLED,
+    RX_ORDER,
     compact_report,
     report_status,
 )
@@ -233,7 +236,8 @@ def test_parameterized_case_preserves_defaults_guards_and_shared_output(
         script.ContiguousCase(fake, 0, "linear4", [inputs[0][:-1]], **kwargs)
 
 
-def test_cli_preserves_report_on_unavailable_cuda(tmp_path):
+@pytest.mark.parametrize("rx", [False, True])
+def test_cli_preserves_report_on_unavailable_cuda(tmp_path, rx):
     root = Path(__file__).resolve().parents[3]
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=str(root / "python"))
     proc = subprocess.run(
@@ -242,6 +246,7 @@ def test_cli_preserves_report_on_unavailable_cuda(tmp_path):
             str(root / "scripts/pd_test/bench_h2d_bulk_compare.py"),
             "--output-dir",
             str(tmp_path / "run"),
+            *(["--rx-sampler"] if rx else []),
         ],
         env=env,
         capture_output=True,
@@ -251,6 +256,118 @@ def test_cli_preserves_report_on_unavailable_cuda(tmp_path):
     report = json.loads((tmp_path / "run/bulk.json").read_text())
     assert report["error"] == "RuntimeError: Expose only physical GPU4 as CUDA0"
     assert "results_valid=False" in (tmp_path / "run/bulk-compact.txt").read_text()
+
+
+def rx_fixture():
+    r = fixture()
+    templates = {w["method"]: w for w in r["windows"]}
+    r["config"] = copy.deepcopy(RX_CONFIG)
+    r["windows"] = []
+    for trial, (method, enabled) in enumerate(zip(RX_ORDER, RX_ENABLED)):
+        w = copy.deepcopy(templates[method])
+        w.update(trial=trial, sampler_enabled=enabled, samples=[])
+        if enabled:
+            logical = w["metrics"]["logical_wall_GBps"]
+            nominal = logical * 1.1
+            w["metrics"].update(
+                rx_GBps_1024=nominal,
+                idle_over_active=0.0,
+                idle=dict(valid=True, rx_kbps=0.0),
+                rates=dict(
+                    valid=True,
+                    rx_kbps=nominal * 1e9 / 1024,
+                    samples=38,
+                    coverage=1.0,
+                    rx_cv=0.005,
+                ),
+            )
+            w["samples"] = [
+                dict(t_ns=i * 50_000_000, call_ns=20_000_000) for i in range(40)
+            ]
+        r["windows"].append(w)
+    return r
+
+
+def test_rx_same_interval_ratios_and_sampler_controls():
+    r = json.loads(json.dumps(rx_fixture()))
+    s = report_status(r)
+    assert s["ready"] and s["rx_samples"] and s["ce_calibration"]
+    assert s["controls"]["sm64"]["on_over_off"] == [1.0, 1.0]
+    text = compact_report(r)
+    assert "windows=8/8" in text
+    assert "SM/CE_nominal_Rx=[0.909091, 0.909091]" in text
+    assert "relative_Rx_per_logical=[1.0, 1.0]" in text
+    assert "query_ms_min_med_max=[20.0, 20.0, 20.0] period_ms_median=50.0" in text
+    # Keep throughput unchanged while increasing received traffic per payload.
+    # SM Rx/logical is not forced through the CE calibration bounds.
+    for w in r["windows"]:
+        if w["method"] == "sm64" and w["sampler_enabled"]:
+            w["metrics"]["rx_GBps_1024"] *= 1.1
+            w["metrics"]["rates"]["rx_kbps"] *= 1.1
+    assert report_status(r)["ready"]
+    assert "SM/CE_nominal_Rx=[1.0, 1.0]" in compact_report(r)
+    assert "relative_Rx_per_logical=[1.1, 1.1]" in compact_report(r)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing",
+        "order",
+        "off_label",
+        "sampler_effect",
+        "drift",
+        "ce_mismatch",
+        "sm_no_rx",
+        "sm_zero_rx",
+        "units",
+        "rx_quality",
+        "coverage",
+        "few_samples",
+        "background",
+        "window_quality",
+        "config",
+    ],
+)
+def test_rx_invalid_controls_suppress_ratios(fault):
+    r = rx_fixture()
+    sm = r["windows"][3]
+    if fault == "missing":
+        r["windows"].pop()
+    elif fault == "order":
+        r["windows"][2], r["windows"][3] = r["windows"][3], r["windows"][2]
+    elif fault == "off_label":
+        r["windows"][0]["sampler_enabled"] = True
+    elif fault == "sampler_effect":
+        sm["metrics"]["logical_wall_GBps"] *= 0.95
+    elif fault == "drift":
+        r["windows"][-1]["metrics"]["logical_wall_GBps"] *= 0.95
+    elif fault == "ce_mismatch":
+        for w in r["windows"]:
+            if w["method"] == "ce64" and w["sampler_enabled"]:
+                w["metrics"]["rx_GBps_1024"] *= 1.1
+                w["metrics"]["rates"]["rx_kbps"] *= 1.1
+    elif fault == "sm_no_rx":
+        sm["metrics"].pop("rates")
+    elif fault == "sm_zero_rx":
+        sm["metrics"]["rx_GBps_1024"] = 0
+        sm["metrics"]["rates"]["rx_kbps"] = 0
+    elif fault == "units":
+        sm["metrics"]["rx_GBps_1024"] *= 1000 / 1024
+    elif fault == "rx_quality":
+        sm["metrics"]["rates"]["rx_cv"] = 0.2
+    elif fault == "coverage":
+        sm["metrics"]["rates"]["coverage"] = 0.5
+    elif fault == "few_samples":
+        sm["metrics"]["rates"]["samples"] = 4
+    elif fault == "background":
+        sm["metrics"]["idle"]["rx_kbps"] = sm["metrics"]["rates"]["rx_kbps"] * 0.2
+    elif fault == "window_quality":
+        sm["metrics"]["valid"] = False
+    else:
+        r["config"]["sample_ms"] = 20
+    assert not report_status(r)["ready"]
+    assert "RATIOS" not in compact_report(r)
 
 
 if __name__ == "__main__":
