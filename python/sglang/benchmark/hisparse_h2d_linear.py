@@ -1,6 +1,7 @@
 """Opt-in linear SM baseline and CPU reporting. Never selected by serving."""
 
 import functools
+import math
 from pathlib import Path
 
 from sglang.benchmark.hisparse_h2d_codegen import sha256
@@ -189,15 +190,17 @@ def report_status(report):
             for a in artifacts
         )
     )
-    ready = report.get("success") is True and edges_ok and graph_ok and bound and jit_ok
+    common = (
+        report.get("success") is True and edges_ok and graph_ok and bound and jit_ok
+    )
     windows = report.get("windows", [])
     expected = {(t, d, m) for t, d in enumerate(config["order"]) for m in METHODS}
-    timing = config["mode"] == "main" and (
-        len(windows) == len(expected)
+    structure = config["mode"] == "main" and (
+        config["order"] == [0, 1, 1, 0]
+        and len(windows) == len(expected)
         and {(w["trial"], w["device"], w["method"]) for w in windows} == expected
         and all(
-            w["metrics"].get("valid") is True
-            and w["sampler_enabled"]
+            w["sampler_enabled"]
             is (config["order"][: w["trial"]].count(w["device"]) % 2 == 1)
             and w["position"]
             == method_order(config["order"][: w["trial"]].count(w["device"])).index(
@@ -211,17 +214,40 @@ def report_status(report):
         w.get("calibration", {}).get("valid") is True for w in ce
     )
     on_off = {}
-    if timing:
+    method_timing = {(d, m): False for d in (0, 1) for m in METHODS}
+    if structure:
         for d in (0, 1):
             for m in METHODS:
                 pair = [w for w in windows if w["device"] == d and w["method"] == m]
                 off, on = sorted(pair, key=lambda w: w["sampler_enabled"])
+                if not all(
+                    w["metrics"].get("valid") is True
+                    and isinstance(w["metrics"].get("logical_wall_GBps"), (int, float))
+                    and math.isfinite(w["metrics"]["logical_wall_GBps"])
+                    and w["metrics"]["logical_wall_GBps"] > 0
+                    for w in pair
+                ):
+                    continue
                 ratio = (
                     off["metrics"]["logical_wall_GBps"]
                     / on["metrics"]["logical_wall_GBps"]
                 )
                 on_off[(d, m)] = ratio
-        timing &= all(0.9 <= r <= 1.1 for r in on_off.values())
+                method_timing[(d, m)] = 0.9 <= ratio <= 1.1
+    timing = structure and all(method_timing.values())
+    # Keep every window and every original quality threshold. An invalid CE
+    # window blocks comparisons involving CE, not independently valid SM pairs.
+    # Correctness, bindings, JIT and the complete balanced sequence remain shared
+    # prerequisites. Logical-byte/time SM comparisons do not need NVML calibration.
+    sm = common and all(
+        method_timing[d, m] for d in (0, 1) for m in ("gather4", "linear4", "linear8")
+    )
+    comparisons = dict(
+        sm=sm,
+        ce_same=sm and all(method_timing[d, "ce_same"] for d in (0, 1)),
+        bulk_reference=sm and cal and all(method_timing[d, "ce_bulk"] for d in (0, 1)),
+    )
+    ready = common
     if config["mode"] == "main":
         ready &= timing and cal
     else:
@@ -235,6 +261,7 @@ def report_status(report):
         timing=timing,
         calibration=cal,
         on_off=on_off,
+        comparisons=comparisons,
     )
 
 
@@ -264,6 +291,11 @@ def compact_report(report):
     if report["config"]["mode"] == "main":
         lines.append(
             f'TIMING valid={status["timing"]} windows={len(report.get("windows",[]))}/20 CE_calibration={status["calibration"]}'
+        )
+        lines.append(
+            f'COMPARISONS SM_valid={status["comparisons"]["sm"]} '
+            f'CEsame_valid={status["comparisons"]["ce_same"]} '
+            f'bulk_reference_valid={status["comparisons"]["bulk_reference"]}'
         )
     for d in (0, 1):
         for m in METHODS:
@@ -302,30 +334,40 @@ def compact_report(report):
                 else "not_collected"
             )
         )
-    if status["ready"] and report["config"]["mode"] == "main":
+    if status["comparisons"]["sm"]:
         index = {
-            (w["device"], w["method"], w["sampler_enabled"]): w["metrics"][
+            (w["device"], w["method"], w["sampler_enabled"]): w["metrics"].get(
                 "logical_wall_GBps"
-            ]
+            )
             for w in report["windows"]
         }
         for d in (0, 1):
             lines.append(
-                f'RATIOS d{d} OFF/ON CTA8/4_us={[round(index[d,"linear4",p]/index[d,"linear8",p],4) for p in (False,True)]} '
-                f'linear4/gather_us={[round(index[d,"gather4",p]/index[d,"linear4",p],4) for p in (False,True)]} '
-                f'linear4/CEsame_GBps={[round(index[d,"linear4",p]/index[d,"ce_same",p],4) for p in (False,True)]}'
+                f'RATIOS_SM d{d} OFF/ON CTA8/4_us={[round(index[d,"linear4",p]/index[d,"linear8",p],4) for p in (False,True)]} '
+                f'linear4/gather_us={[round(index[d,"gather4",p]/index[d,"linear4",p],4) for p in (False,True)]}'
             )
         lines.append(
-            "CROSS GPU5/GPU4_us OFF/ON "
+            "CROSS_SM GPU5/GPU4_us OFF/ON "
             + str(
                 {
                     m: [
                         round(index[0, m, p] / index[1, m, p], 4) for p in (False, True)
                     ]
-                    for m in METHODS
+                    for m in ("gather4", "linear4", "linear8")
                 }
             )
         )
+        for d in (0, 1):
+            if status["comparisons"]["ce_same"]:
+                lines.append(
+                    f"RATIOS_CEsame d{d} OFF/ON linear4/CEsame_GBps="
+                    f'{[round(index[d,"linear4",p]/index[d,"ce_same",p],4) for p in (False,True)]}'
+                )
+            if status["comparisons"]["bulk_reference"]:
+                lines.append(
+                    f"BULK_REFERENCE d{d} OFF/ON linear4/CEbulk_GBps="
+                    f'{[round(index[d,"linear4",p]/index[d,"ce_bulk",p],4) for p in (False,True)]}'
+                )
     lines.append(
         "Dense vs gather changes plans, source footprint, C4 splitting and destination layout together; this is a baseline, not source-only causality or a production optimization. NVML rates are approximate."
     )

@@ -1,4 +1,8 @@
 import copy
+import json
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from sglang.benchmark.hisparse_h2d_grid_perf import LEGACY_LIBRARY
@@ -124,7 +128,6 @@ def test_complete_report_separates_correctness_from_performance(mode):
         "duplicate",
         "order",
         "sampling",
-        "calibration",
         "quality",
         "on_off",
     ],
@@ -153,14 +156,91 @@ def test_incomplete_or_confounded_data_never_produces_performance_conclusions(fa
         r["windows"][0]["position"] = 4
     elif fault == "sampling":
         r["windows"][0]["sampler_enabled"] = True
-    elif fault == "calibration":
-        r["windows"][-5]["calibration"]["valid"] = False
     elif fault == "quality":
         r["windows"][0]["metrics"]["valid"] = False
     else:
         r["windows"][-2]["metrics"]["logical_wall_GBps"] *= 0.7
     assert not report_status(r)["ready"]
     assert "RATIOS" not in compact_report(r)
+
+
+@pytest.mark.parametrize("fault", ["quality", "on_off", "zero", "nan"])
+def test_invalid_same_size_ce_never_blocks_independent_sm_comparisons(fault):
+    r = report_fixture()
+    for w in r["windows"]:
+        if w["method"] != "ce_same":
+            continue
+        if fault == "quality":
+            # The observed round-17 failure: all CE-same enqueue ratios exceed
+            # the unchanged 0.10 threshold, with every SM/bulk window valid.
+            w["metrics"].update(valid=False, max_enqueue_fraction=0.4)
+        elif fault == "on_off" and w["sampler_enabled"]:
+            w["metrics"]["logical_wall_GBps"] *= 0.7
+        elif fault in ("zero", "nan"):
+            w["metrics"]["logical_wall_GBps"] = 0 if fault == "zero" else float("nan")
+    before = copy.deepcopy(r)
+    status = report_status(r)
+    assert not status["ready"] and not status["timing"]
+    assert status["comparisons"] == dict(sm=True, ce_same=False, bulk_reference=True)
+    text = compact_report(r)
+    assert "results_valid=False" in text
+    assert "RATIOS_SM d0" in text and "RATIOS_SM d1" in text
+    assert "CROSS_SM" in text and "BULK_REFERENCE" in text
+    assert "RATIOS_CEsame" not in text
+    # Analysis must not turn failed acquisition-window flags into passes.
+    assert r == before
+
+
+@pytest.mark.parametrize("fault", ["quality", "calibration"])
+def test_invalid_bulk_reference_does_not_invalidate_logical_sm_timing(fault):
+    r = report_fixture()
+    row = next(
+        w for w in r["windows"] if w["method"] == "ce_bulk" and w["sampler_enabled"]
+    )
+    if fault == "quality":
+        row["metrics"]["valid"] = False
+    else:
+        row["calibration"]["valid"] = False
+    status = report_status(r)
+    assert not status["ready"]
+    assert status["comparisons"] == dict(sm=True, ce_same=True, bulk_reference=False)
+    text = compact_report(r)
+    assert "RATIOS_SM" in text and "RATIOS_CEsame" in text
+    assert "BULK_REFERENCE" not in text
+
+
+@pytest.mark.parametrize("sm_valid", [True, False])
+def test_offline_reanalysis_preserves_input_and_reports_scoped_exit_code(
+    tmp_path, sm_valid
+):
+    r = report_fixture()
+    for w in r["windows"]:
+        if w["method"] == "ce_same" or (not sm_valid and w["method"] == "linear8"):
+            w["metrics"]["valid"] = False
+    source = json.dumps(r).encode()
+    report = tmp_path / "linear.json"
+    report.write_bytes(source)
+    output = tmp_path / "reanalysis"
+    root = Path(__file__).resolve().parents[3]
+    command = [
+        sys.executable,
+        str(root / "scripts/pd_test/reanalyze_h2d_linear.py"),
+        "--report",
+        str(report),
+        "--output-dir",
+        str(output),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    assert result.returncode == (0 if sm_valid else 1), result.stderr
+    assert report.read_bytes() == source
+    meta = json.loads((output / "reanalysis.json").read_text())
+    assert meta["comparisons"]["sm"] is sm_valid
+    assert meta["full_results_valid"] is False
+    assert len(meta["input_report_sha256"]) == 64
+    assert "results_valid=False" in (output / "linear-compact.txt").read_text()
+    # Reject an existing destination instead of overwriting acquisition/results.
+    refused = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    assert refused.returncode != 0 and "not replaced" in refused.stderr
 
 
 def test_early_failure_still_has_a_readable_compact_report():

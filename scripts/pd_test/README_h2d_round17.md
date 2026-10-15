@@ -60,7 +60,12 @@ OFF/ON与方法反序同时变化；这不是再次严格隔离采样效应的�
 随后五组各自capture最终chunk graph，再reset/replay/同步/检查，10/10。
 
 同源/目标/grid/chunk约束不满足或CUDA/字节检查异常立即停止。
-main的窗口质量失败仍保留余下平衡顺序数据，但`results_valid=False`，不输出结论性RATIOS。
+main的窗口质量失败仍保留余下平衡顺序数据，完整实验仍标为`results_valid=False`。
+报告按比较独立检查：`SM_valid`要求共享正确性/约束/JIT、完整20窗平衡顺序、
+两卡gather4/linear4/linear8全部窗口有效且各自ON/OFF在门内。
+满足时可输出`RATIOS_SM`和`CROSS_SM`；失效的ce_same窗口不参与这些SM比较。
+`CEsame_valid`还要求ce_same有效；`bulk_reference_valid`还要求bulk窗口和NVML校验有效。
+所有原始窗口质量标记及≤0.10提交门均保留，不给ce_same豁免。
 
 ## 4. 实机只做check，然后main
 
@@ -91,7 +96,8 @@ bash scripts/pd_test/run_h2d_linear.sh main "$PWD/work/h2d-round17/linear-main"
 ```
 
 main自动重复正确性和约束检查，避免工作区/JIT变化后沿用旧check。
-期待相同正确性通过行，以及`TIMING valid=True windows=20/20 CE_calibration=True`。
+完整通过期待相同正确性通过行，以及`TIMING valid=True windows=20/20 CE_calibration=True`。
+若只有参考方法窗口失效，可检查`COMPARISONS`行使用独立通过的比较；不要将完整实验改判为通过。
 任何阶段失败，保留输出，不安装工具、不调整门槛继续刷结果。
 本地只验证了CPU逻辑/入口；没有GPU或nvcc，CUDA编译和执行由上述check验证。
 
@@ -107,3 +113,42 @@ main自动重复正确性和约束检查，避免工作区/JIT变化后沿用旧
 - gather基线差距不复现、OFF/ON不一致或质量不合格：先解释当次条件，停止作机制归因。
 
 先看≥10%且两波同向的变化；小变化不立即扩大扫描。此轮没有生产packing、真实decode重叠或吞吐收益结论。
+
+## 6. 首次正式结果与离线重解析（无需GPU）
+
+实机check全部通过，main记录完整20窗；仅ce_same的四窗提交占比0.20–0.40越界，
+因此完整`results_valid=False`保留。该占比是replay API耗时/GPU区间，不能当作GPU空闲占比。
+其他四种方法在两卡OFF/ON全部窗口有效。旧报告将一个参考方法失败扩大到所有比较，
+新版只修正报告范围，不重算或放宽窗口质量门。
+
+以下取无采样OFF列，ON列检验方向：
+
+| GPU | gather4 GB/s | linear4 GB/s | linear8 GB/s | linear4/gather耗时比 | CTA8/4耗时比 |
+|---|---:|---:|---:|---:|---:|
+| 4 | 30.8725 | 45.8514 | 45.8341 | 0.6733 | 1.0004 |
+| 5 | 22.8927 | 33.1339 | 33.2250 | 0.6909 | 0.9973 |
+
+ON对应linear4/gather耗时比0.6716/0.6997、CTA8/4耗时比1.0063/0.9941。
+GPU5的ON相对OFF存在约2–3.4%耗时变化，仍在门内；不要写成完全无漂移。
+
+- 当前连续SM实现的吞吐高于gather约43–49%，说明23/31 GB/s不是这些卡上SM host读取的普遍上限。
+  但该实验同时改变plan遍历、源/目标布局、C4分离和footprint，不能将全部约30–33%耗时下降算作源连续的因果效应。
+- 连续路径CTA4→8变化不足1%，当前实现单纯增加grid也没有明显收益。
+  与gather的结果一致，只否定这两个具体实现下的4→8扩容，不能证明所有并行组织无效。
+- 连续SM卡间GPU5/GPU4耗时比为OFF 1.3838、ON 1.4335；gather为1.3486/1.3759。
+  卡间差距并非稀疏gather独有；不能再只用稀疏地址解释两卡差距。
+- bulk CE约55 GB/s参照仍有效，但不是同尺寸对照。ce_same失效，暂不判断连续SM距同尺寸CE的差值。
+  本轮没有证明硬件绝对上限、PCIe事务形状或某个硬件队列瓶颈。
+
+同步分支后，只在原venv中对已有JSON运行；无需gpuq、CUDA_VISIBLE_DEVICES、numactl或GPU重测：
+
+```bash
+PYTHONPATH=python "$LAGOM_PY" scripts/pd_test/reanalyze_h2d_linear.py \
+  --report work/h2d-round17/linear-main/linear.json \
+  --output-dir work/h2d-round17/linear-reanalyzed
+```
+
+使用新目录。输出保留输入和分析器SHA256，不改原JSON；退出0仅表示SM比较有效，
+不表示完整实验通过。预期`results_valid=False`且
+`COMPARISONS SM_valid=True CEsame_valid=False bulk_reference_valid=True`。
+只需反馈该行、两条`RATIOS_SM`及一条`CROSS_SM`，不需要原始日志或额外GPU实验。
