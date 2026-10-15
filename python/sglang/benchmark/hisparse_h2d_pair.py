@@ -68,6 +68,7 @@ def check_untouched(config):
         or config.get("source_layout_control")
         or config.get("copy_iterator_control")
         or config.get("copy_grid_control")
+        or config.get("pcie_rx_probe")
     )
 
 

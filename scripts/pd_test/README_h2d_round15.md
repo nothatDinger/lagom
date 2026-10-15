@@ -4,6 +4,9 @@
 本轮只检验：**默认四个CTA的配置是否限制当前B32/miss100的host搬运吞吐。**
 使用已验证的legacy kernel、现有venv/PyTorch profiler和gpuq；无需安装工具或Docker。
 
+正式反馈：host CTA8/4为1.0296/1.0126，无净收益；HBM为0.7336/0.7047，六波均快。
+该结果不排除全部并行度问题。后续先测有效载荷与接收流量的区别，见[第十六轮](README_h2d_round16.md)。
+
 ## 1. CTA分工的源码核对
 
 当前服务路径是 `hisparse_coordinator.py::_run_swap_in_verify_window`：
