@@ -1,8 +1,8 @@
 # Round 23：CTA4／CTA8 的 warp 区段延迟诊断计划
 
-状态：**测试设计，尚未实现本轮插桩 kernel 和执行脚本。**
-本文给出实现、实机执行与反馈规范。不能把旧 `run_h2d_grid.sh` 的整体计时
-当成本轮区段数据，也不能把下文约定的产物名误认为已有命令。
+状态：**独立探针、check/codegen/main 和启动脚本已实现；本地仅完成 CPU 检查，
+CUDA 编译、字节正确性和计时语义仍待实机验证。**
+生产默认路径未修改。不能把旧 `run_h2d_grid.sh` 的整体计时当成本轮区段数据。
 
 ## 1. 唯一要回答的问题
 
@@ -213,14 +213,76 @@ copy_sum 而忽略项数，也不要把分位数相减计算另一个区段的�
 
 ## 7. 实机操作顺序与最小反馈
 
-1. 正常仓库属主同步分支，读取本文。实现端先新增独立探针和包装，不改服务默认路径。
+1. 正常仓库属主同步分支，读取本文。独立探针和包装均已提供，不改服务默认路径。
 2. CPU检查统计解析、任务覆盖、失败报告，以及禁止错误输出结论的门禁。
 3. 在一个仅物理GPU4的gpuq作业内完成第4节正确性和产物记录，离线提取SASS。
 4. 回传下面的第一份紧凑反馈，完成计时边界核对后再进入第5节；不要求提前跑性能。
 5. 第二阶段一次作业完成全部平衡波次和扰动检查，回传第二份紧凑反馈。
 
-**当前文档不提供尚未实现的启动命令。** 新脚本准备完成后，必须补上实际存在、
-经过CLI/错误路径检查的命令；不要让执行端猜参数或直接复用旧grid入口。
+### 第一阶段实际命令
+
+仓库属主先同步（在 gpuq 作业外执行）：
+
+```bash
+cd /home/jovyan/td69032/lagom_h2d_latency_test
+git fetch origin perf/hisparse-h2d-diagnosis
+git merge --ff-only origin/perf/hisparse-h2d-diagnosis
+```
+
+在现有 gpuq **物理 GPU4** allocation 内执行以下命令；不需要 GPU5。
+不要修改服务、驱动、时钟或安装 NCU。输出目录必须不存在：
+
+```bash
+cd /home/jovyan/td69032/lagom_h2d_latency_test
+LAGOM_PY="$PWD/.venv/bin/python3" bash scripts/pd_test/run_h2d_latency.sh \
+  check "$PWD/work/h2d-round23/check-v1"
+```
+
+脚本设置 `CUDA_VISIBLE_DEVICES=4` 和 NUMA1 绑定；UUID 再次核对 CUDA0。
+此命令只执行12组 eager+6种动态graph状态、提取3份实际加载的产物；不计性能。
+check 也使用显式 Portable 注册。NUMA 检查针对完整4KiB对齐 allocation，
+C4 tensor 为其前缀；main allocation 为完整512MiB，末尾不足一个C4页不参与搬运。
+如需选择已有工具，用 `H2D_CUOBJDUMP=/已有路径/cuobjdump`，不要安装新版。
+
+返回：
+
+- `check-v1/check/check-compact.txt`
+- `check-v1/codegen/codegen-compact.txt`
+
+失败也返回已有紧凑文件；没有文件才返回 `run.log` / `codegen.log` 最后30行。
+**先停在这里**。`codegen.json` 保存完整指令及控制字段；`.sass.txt` 保留原始输出。
+提取成功不等于计时语义正确，`performance_ready=False` 是有意设置。
+
+### 第二阶段入口（完成 SASS 人工核对后才执行）
+
+`codegen/review-template.json` 默认 `timing_semantics_reviewed=false`。
+人工核对本节全部边界后，复制为 `review.json`，写明核对结论 `notes` 并设为 true。
+不要为越过门禁直接改标志。该文件绑定 codegen JSON 的 SHA256；main 还检查
+check报告、源码哈希和实际加载产物是否一致。任一变化需重新 check/codegen。
+
+```bash
+LAGOM_PY="$PWD/.venv/bin/python3" bash scripts/pd_test/run_h2d_latency.sh \
+  main "$PWD/work/h2d-round23/main-v1" \
+  "$PWD/work/h2d-round23/check-v1/codegen/review.json"
+```
+
+main 先检查6种配置的 eager/graph 字节、guard与全部bank记录，再跑36波（每配置6波）。
+返回 `main-v1/main/latency-compact.txt`；原始trace每波独立JSON及其哈希留本地。
+紧凑报告的区段统计先逐invocation计算warp分位数，再取64个invocation的中位数，
+最后展示6个波次值；不会把24576个warp当作独立重复样本。
+CTA/SM映射、每个bank的尾warp和原始计时都保存在JSON中。
+状态采样在计时外，逐波前后数据留JSON；端点状态不能证明波内状态恒定，
+即使自动门禁通过，明显状态分化或区段变化仅几百分点也不应作机制归因。
+
+### 文件实现位置
+
+- `python/sglang/kernels/jit/csrc/hisparse_copy_latency.cuh`：独立control/trace，复用生产copy helper。
+- `python/sglang/benchmark/hisparse_h2d_latency.py`：JIT包装、记录校验、波次扰动门禁。
+- `scripts/pd_test/bench_h2d_latency.py`：check/main，逐bank记录和失败报告。
+- `scripts/pd_test/collect_h2d_latency_codegen.py`：离线提取与人工review模板。
+- `scripts/pd_test/run_h2d_latency.sh`：实际启动入口。
+- `test/registered/unit/test_hisparse_h2d_latency.py`：CPU门禁和异常输入测试。
+
 
 第一份反馈，约10行：
 
