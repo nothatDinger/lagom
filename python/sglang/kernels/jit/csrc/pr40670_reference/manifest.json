@@ -1,0 +1,29 @@
+{
+  "pr": "https://github.com/sgl-project/sglang/pull/40670",
+  "repository": "ilovecoding84/sglang",
+  "commit": "70bc9e9a643faa998ce529a38260feee83d3c0c6",
+  "normalization": "rstrip trailing whitespace at EOF, then one LF; file bodies otherwise unchanged",
+  "files": [
+    {
+      "source": "python/sglang/kernels/jit/csrc/kvcacheio/hisparse_spec.cuh",
+      "vendored": "python/sglang/kernels/jit/csrc/pr40670_reference/hisparse_spec.cuh",
+      "source_sha256": "1ebcfc6e5896c06651358a53bbc1c092834d3dd770bfc2fba07991851b796f87",
+      "vendored_sha256": "1ebcfc6e5896c06651358a53bbc1c092834d3dd770bfc2fba07991851b796f87",
+      "adaptation": "none"
+    },
+    {
+      "source": "python/sglang/kernels/jit/csrc/kvcacheio/hisparse_transfer.cuh",
+      "vendored": "python/sglang/kernels/jit/csrc/pr40670_reference/hisparse_transfer.cuh",
+      "source_sha256": "6a24e27bf5434267da0344ae3057441b7261c5ff806abf2a1d33b06e9ca21b4f",
+      "vendored_sha256": "ab59daee6c70c2b4bc9251567e59bb3e458f2c29446edf6486bb77374f9fdf16",
+      "adaptation": "redirect include to pinned kvcacheio.cuh"
+    },
+    {
+      "source": "python/sglang/kernels/jit/include/sgl_kernel/deepseek_v4/kvcacheio.cuh",
+      "vendored": "python/sglang/kernels/jit/csrc/pr40670_reference/kvcacheio.cuh",
+      "source_sha256": "be8387ed456d64f9fe707a02708d541ac7793723619af63d36d2206f0ebc16bc",
+      "vendored_sha256": "be8387ed456d64f9fe707a02708d541ac7793723619af63d36d2206f0ebc16bc",
+      "adaptation": "none"
+    }
+  ]
+}
