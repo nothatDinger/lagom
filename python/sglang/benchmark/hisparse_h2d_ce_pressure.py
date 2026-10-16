@@ -57,7 +57,9 @@ class SMWindow:
             self.origin.record()
             for a, b in self.pairs:
                 a.record()
-                sm.graph.replay()
+                # Capture kernel launches directly, not a nested graph replay.
+                for bank in range(sm.banks):
+                    sm.launch_bank(bank)
                 b.record()
         with torch.cuda.stream(sm.stream):
             self.graph.replay()
@@ -149,6 +151,8 @@ def execute_pressure(torch, args, report, readers, warmer, observer):
     timeline = SMWindow(torch, readers["A"], repeats)
     profile_timeline = timeline if repeats == 32 else SMWindow(torch, readers["A"], 32)
     report["pressure_config"]["single_submission"] = True
+    report["pressure_config"]["capture_kind"] = "flat_kernel_launches"
+    report["pressure_config"]["sm_kernel_nodes"] = repeats * readers["A"].banks
     # Each pressure window has its own before/after zero-CE baseline.
     for trial in range(trials):
         rates = RATES if trial % 2 == 0 else tuple(reversed(RATES))

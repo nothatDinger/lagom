@@ -67,6 +67,9 @@ class Reader:
                 check_untouched=True,
             )
 
+        # Reuse the exact production launch for flat captures of long windows.
+        # Calling an existing CUDAGraph.replay() inside capture is unsupported.
+        self.launch_bank = run
         self.check = check
         for bank in (0, banks - 1):
             self.output.zero_()
