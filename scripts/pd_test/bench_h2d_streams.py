@@ -1,4 +1,4 @@
-"""Independent A/B legacy CTA4 readers: single, serial and two-stream execution."""
+"""Independent legacy CTA4 readers or SM/CE: single, serial and concurrent execution."""
 
 import argparse
 import json
@@ -20,6 +20,7 @@ from sglang.benchmark.hisparse_h2d_diagnostics import (
 )
 from sglang.benchmark.hisparse_h2d_grid_perf import loaded_grid_artifact
 from sglang.benchmark.hisparse_h2d_streams import activity_overlap
+from sglang.benchmark.hisparse_h2d_sm_ce import CEReader, mixed_overlap
 
 METHODS = ("A", "B", "serial_AB", "serial_BA", "parallel_AB", "parallel_BA")
 
@@ -38,6 +39,7 @@ class Reader:
         self.start = torch.cuda.Event(enable_timing=True, external=True)
         self.end = torch.cuda.Event(enable_timing=True, external=True)
         self.banks = banks
+        self.payload_bytes = banks * 1868800
 
         def run(bank):
             copy_cache_planned_mla(
@@ -126,7 +128,10 @@ def run(torch, readers, coordinator, method):
         )
     ):
         raise ValueError(f"Invalid event intervals: {total}, {spans}")
-    payload = len(names) * readers[names[0]].banks * 1868800
+    payload = sum(readers[n].payload_bytes for n in names)
+    for n in names:
+        spans[n]["payload_bytes"] = readers[n].payload_bytes
+        spans[n]["GBps"] = readers[n].payload_bytes / spans[n]["duration_us"] / 1000
     return dict(
         method=method,
         total_us=total,
@@ -204,12 +209,50 @@ def execute(torch, args, report):
         ):
             raise ValueError("HBM source binding/content mismatch")
         readers = {}
+        coordinator = torch.cuda.Stream(device=0)
+        warmer = Warmer(torch, 0)
+        ce_bytes = 16 * 2**20
         for name in ("A", "B"):
-            readers[name] = Reader(torch, host, source, plans[name], banks)
+            if args.partner == "ce" and name == "B":
+                # A uses the first half of the registered allocation. CE uses
+                # an entirely disjoint contiguous range in the second half.
+                ce_start = (pages // 2) * PAGE_BYTES
+                ce_source = allocation[ce_start : ce_start + ce_bytes]
+                if (
+                    int(plans["A"]["active_src"].max()) >= (pages // 2) * 64
+                    or ce_source.numel() != ce_bytes
+                ):
+                    raise ValueError("SM/CE source range binding failed")
+                pilot = CEReader(torch, ce_source, 1)
+                warmer.run(250)
+                pilot_readers = {"A": readers["A"], "B": pilot}
+                for method in ("A", "B"):
+                    for _ in range(3):
+                        run(torch, pilot_readers, coordinator, method)
+                pilot_us = {
+                    n: statistics.median(
+                        run(torch, pilot_readers, coordinator, n)["readers"][n][
+                            "duration_us"
+                        ]
+                        for _ in range(5)
+                    )
+                    for n in ("A", "B")
+                }
+                ce_copies = max(1, round(pilot_us["A"] / pilot_us["B"]))
+                if ce_copies > 256:
+                    raise ValueError("Unexpected pilot duration ratio")
+                readers[name] = CEReader(torch, ce_source, ce_copies)
+                report["pilot"] = dict(single_us=pilot_us, ce_copies=ce_copies)
+                del pilot_readers, pilot
+            else:
+                readers[name] = Reader(torch, host, source, plans[name], banks)
             report["checks"].append(
                 dict(
                     reader=name,
-                    eager_banks=[0, banks - 1],
+                    kind="CE" if args.partner == "ce" and name == "B" else "SM",
+                    eager_banks=[0]
+                    if args.partner == "ce" and name == "B"
+                    else [0, banks - 1],
                     graph=True,
                     bytes_padding=True,
                     capture_device=readers[name].stream.device.index,
@@ -224,12 +267,14 @@ def execute(torch, args, report):
             source_bytes=source.numel(),
             source_matches_host=True,
             source_disjoint=True,
-            independent_plans=True,
+            independent_plans=True if args.partner == "sm" else "CE has no plan",
             independent_outputs=True,
             readers={
                 n: dict(
-                    src=r.src.data_ptr(),
-                    dst=r.dst.data_ptr(),
+                    kind="CE" if args.partner == "ce" and n == "B" else "SM",
+                    src=r.src.data_ptr() if hasattr(r, "src") else r.source.data_ptr(),
+                    dst=r.dst.data_ptr() if hasattr(r, "dst") else None,
+                    payload_bytes=r.payload_bytes,
                     output=r.output.data_ptr(),
                     stream=int(r.stream.cuda_stream),
                 )
@@ -239,6 +284,10 @@ def execute(torch, args, report):
         report["jit"] = loaded_grid_artifact()
         report["config"] = dict(
             source=args.source,
+            partner=args.partner,
+            labels={"A": "SM", "B": "CE" if args.partner == "ce" else "SM"},
+            ce_copy_bytes=ce_bytes if args.partner == "ce" else None,
+            ce_copies=readers["B"].banks if args.partner == "ce" else None,
             h2d_bytes_per_copy=1868800 if args.source == "host" else 0,
             throughput_kind="logical payload GB/s",
             banks=banks,
@@ -250,8 +299,6 @@ def execute(torch, args, report):
             source_bytes_per_reader=geometry["host_bytes"],
             runtime=dict(torch=torch.__version__, cuda=torch.version.cuda),
         )
-        coordinator = torch.cuda.Stream(device=0)
-        warmer = Warmer(torch, 0)
         # Validate concurrent and serial graphs with fresh zeroed targets.
         for method in METHODS:
             for r in readers.values():
@@ -290,8 +337,17 @@ def execute(torch, args, report):
                 torch.cuda.synchronize()
             path = args.output_dir / f"{method}.trace.json"
             prof.export_chrome_trace(str(path))
-            metrics = activity_overlap(
-                json.loads(path.read_text()), banks, method.startswith("parallel")
+            trace = json.loads(path.read_text())
+            metrics = (
+                mixed_overlap(
+                    trace,
+                    banks,
+                    readers["B"].banks,
+                    ce_bytes,
+                    method.startswith("parallel"),
+                )
+                if args.partner == "ce"
+                else activity_overlap(trace, banks, method.startswith("parallel"))
             )
             report["profiles"].append(
                 dict(
@@ -312,6 +368,26 @@ def execute(torch, args, report):
             for k in ("state_before", "state_after")
         )
         report["results_valid"] = report["telemetry_valid"]
+        if args.partner == "ce":
+            solo = {
+                n: statistics.median(
+                    w["readers"][n]["duration_us"]
+                    for w in report["waves"]
+                    if w["method"] == n
+                )
+                for n in ("A", "B")
+            }
+            report["duration_match"] = solo["B"] / solo["A"]
+            report["ce_calibration"] = all(
+                w["readers"]["B"]["GBps"] >= 45
+                for w in report["waves"]
+                if w["method"] == "B"
+            )
+            # Main must compare workloads of similar solo durations. Smoke is
+            # allowed a short SM graph relative to one 16 MiB CE copy.
+            report["results_valid"] &= report["ce_calibration"] and (
+                args.mode == "smoke" or 0.8 <= report["duration_match"] <= 1.25
+            )
     finally:
         if registered:
             torch.cuda.synchronize()
@@ -321,23 +397,36 @@ def execute(torch, args, report):
 
 def compact(r):
     lines = [
-        f'source={r["source"]} mode={r["mode"]} success={r["success"]} results_valid={r["results_valid"]} checks={len(r["checks"])}/8 profiles={len(r["profiles"])}/3',
-        f'IDENTITY {r.get("identity")} HOST node1={r.get("host_node1")} flags=1',
-        f'BINDINGS {r.get("bindings")}',
-        f'JIT {r.get("jit")}',
-        f'CONFIG {r.get("config")}',
+        f"source={r['source']} mode={r['mode']} success={r['success']} results_valid={r['results_valid']} checks={len(r['checks'])}/8 profiles={len(r['profiles'])}/3",
+        f"IDENTITY {r.get('identity')} HOST node1={r.get('host_node1')} flags=1",
+        f"BINDINGS {r.get('bindings')}",
+        f"JIT {r.get('jit')}",
+        f"CONFIG {r.get('config')}",
     ]
+    if r.get("partner") == "ce":
+        lines.append(
+            f"MIXED A=SM B=CE pilot={r.get('pilot')} duration_match={r.get('duration_match')} CE_calibration={r.get('ce_calibration')}"
+        )
     for method in METHODS:
         rows = [w for w in r["waves"] if w["method"] == method]
         if rows:
             lines.append(
-                f'TOTAL {method} us={[round(w["total_us"],3) for w in rows]} GBps={[round(w["GBps"],3) for w in rows]} start_skew_us={[round(w["start_skew_us"],3) for w in rows]}'
+                f"TOTAL {method} us={[round(w['total_us'], 3) for w in rows]} GBps={[round(w['GBps'], 3) for w in rows]} start_skew_us={[round(w['start_skew_us'], 3) for w in rows]}"
             )
             lines.append(
                 f"READERS {method} duration_us="
                 + str(
                     {
                         n: [round(w["readers"][n]["duration_us"], 3) for w in rows]
+                        for n in rows[0]["readers"]
+                    }
+                )
+            )
+            lines.append(
+                f"READER_GBPS {method} "
+                + str(
+                    {
+                        n: [round(w["readers"][n]["GBps"], 3) for w in rows]
                         for n in rows[0]["readers"]
                     }
                 )
@@ -363,7 +452,7 @@ def compact(r):
                 )
             )
     for p in r["profiles"]:
-        lines.append(f'ACTIVITY {p["method"]} {p["activity"]}')
+        lines.append(f"ACTIVITY {p['method']} {p['activity']}")
     if r["results_valid"] and r["mode"] == "main":
         for order in ("AB", "BA"):
             rows = {
@@ -378,6 +467,18 @@ def compact(r):
             lines.append(
                 f"RATIO serial/parallel_{order}={speedup} median={statistics.median(speedup)}"
             )
+    if r["results_valid"] and r.get("partner") == "ce":
+        for order in ("AB", "BA"):
+            concurrent = [w for w in r["waves"] if w["method"] == f"parallel_{order}"]
+            for n in ("A", "B"):
+                solo = {w["trial"]: w for w in r["waves"] if w["method"] == n}
+                ratios = [
+                    w["readers"][n]["GBps"] / solo[w["trial"]]["readers"][n]["GBps"]
+                    for w in concurrent
+                ]
+                lines.append(
+                    f"RETENTION parallel_{order} {n} full_lifetime_GBps_ratio={ratios} median={statistics.median(ratios)}"
+                )
     if "error" in r:
         lines.append("ERROR " + r["error"])
     return "\n".join(lines) + "\n"
@@ -386,15 +487,19 @@ def compact(r):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mode", choices=["smoke", "main"], required=True)
+    p.add_argument("--partner", choices=["sm", "ce"], default="sm")
     p.add_argument("--source", choices=["host", "hbm"], default="host")
     p.add_argument("--output-dir", type=Path, required=True)
     args = p.parse_args()
+    if args.partner == "ce" and args.source != "host":
+        p.error("Mixed SM/CE requires host source")
     if args.output_dir.exists():
         p.error("Use new output directory")
     args.output_dir.mkdir(parents=True)
     report = dict(
         mode=args.mode,
         source=args.source,
+        partner=args.partner,
         success=False,
         results_valid=False,
         checks=[],
@@ -414,6 +519,7 @@ def main():
             for s in (
                 "scripts/pd_test/bench_h2d_streams.py",
                 "python/sglang/benchmark/hisparse_h2d_streams.py",
+                "python/sglang/benchmark/hisparse_h2d_sm_ce.py",
                 "python/sglang/kernels/jit/csrc/hisparse.cuh",
             )
         }

@@ -58,5 +58,41 @@ def test_union_and_invalid_duration():
         merge([(1, 1)])
 
 
+def memcpy(stream, start, duration=20):
+    return dict(
+        cat="gpu_memcpy",
+        ph="X",
+        name="Memcpy HtoD (Pinned -> Device)",
+        ts=start,
+        dur=duration,
+        args=dict(device=0, stream=stream, bytes=16 * 2**20),
+    )
+
+
+def test_mixed_overlap_reports_both_denominators():
+    from sglang.benchmark.hisparse_h2d_sm_ce import mixed_overlap
+
+    r = mixed_overlap(
+        dict(traceEvents=[kernel(1, 0), memcpy(2, 5)]), 1, 1, 16 * 2**20, True
+    )
+    assert r["intersection_us"] == 5
+    assert r["overlap_fraction"] == {"SM": 0.5, "CE": 0.25}
+
+
+def test_mixed_serial_and_bad_coverage():
+    from sglang.benchmark.hisparse_h2d_sm_ce import mixed_overlap
+
+    trace = dict(traceEvents=[kernel(1, 0), memcpy(1, 10)])
+    assert mixed_overlap(trace, 1, 1, 16 * 2**20, False)["intersection_us"] == 0
+    for banks, copies, size, parallel in [
+        (2, 1, 16 * 2**20, False),
+        (1, 2, 16 * 2**20, False),
+        (1, 1, 32, False),
+        (1, 1, 16 * 2**20, True),
+    ]:
+        with pytest.raises(ValueError):
+            mixed_overlap(trace, banks, copies, size, parallel)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
