@@ -25,7 +25,7 @@ METHODS = ("A", "B", "serial_AB", "serial_BA", "parallel_AB", "parallel_BA")
 
 
 class Reader:
-    def __init__(self, torch, host, plan, banks):
+    def __init__(self, torch, host, source, plan, banks):
         from sglang.kernels.ops.kvcache.hisparse import copy_cache_planned_mla
 
         self.stream = torch.cuda.Stream(device=0)
@@ -45,7 +45,7 @@ class Reader:
                 miss_dst=self.dst,
                 miss_count=self.counts,
                 num_real_reqs=self.real,
-                host_cache=host,
+                host_cache=source,
                 device_buffer=self.output,
                 item_size_bytes=584,
                 num_blocks=4,
@@ -193,9 +193,19 @@ def execute(torch, args, report):
             plans[name] = make_plan(torch, config, g, i, 100)
         if int(plans["A"]["active_src"].max()) >= int(plans["B"]["active_src"].min()):
             raise ValueError("Source ranges overlap")
+        # Prepare device source outside every capture and timing interval.
+        source = host if args.source == "host" else host.to("cuda:0")
+        torch.cuda.synchronize()
+        if args.source == "hbm" and (
+            source.device != torch.device("cuda:0")
+            or source.shape != host.shape
+            or source.stride() != host.stride()
+            or not torch.equal(source.cpu(), host)
+        ):
+            raise ValueError("HBM source binding/content mismatch")
         readers = {}
         for name in ("A", "B"):
-            readers[name] = Reader(torch, host, plans[name], banks)
+            readers[name] = Reader(torch, host, source, plans[name], banks)
             report["checks"].append(
                 dict(
                     reader=name,
@@ -208,6 +218,11 @@ def execute(torch, args, report):
         if readers["A"].output.data_ptr() == readers["B"].output.data_ptr():
             raise ValueError("Outputs alias")
         report["bindings"] = dict(
+            source_kind=args.source,
+            source_device=str(source.device),
+            source_ptr=source.data_ptr(),
+            source_bytes=source.numel(),
+            source_matches_host=True,
             source_disjoint=True,
             independent_plans=True,
             independent_outputs=True,
@@ -223,6 +238,9 @@ def execute(torch, args, report):
         )
         report["jit"] = loaded_grid_artifact()
         report["config"] = dict(
+            source=args.source,
+            h2d_bytes_per_copy=1868800 if args.source == "host" else 0,
+            throughput_kind="logical payload GB/s",
             banks=banks,
             copy_bytes=1868800,
             CTA_per_reader=4,
@@ -303,7 +321,7 @@ def execute(torch, args, report):
 
 def compact(r):
     lines = [
-        f'mode={r["mode"]} success={r["success"]} results_valid={r["results_valid"]} checks={len(r["checks"])}/8 profiles={len(r["profiles"])}/3',
+        f'source={r["source"]} mode={r["mode"]} success={r["success"]} results_valid={r["results_valid"]} checks={len(r["checks"])}/8 profiles={len(r["profiles"])}/3',
         f'IDENTITY {r.get("identity")} HOST node1={r.get("host_node1")} flags=1',
         f'BINDINGS {r.get("bindings")}',
         f'JIT {r.get("jit")}',
@@ -368,6 +386,7 @@ def compact(r):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mode", choices=["smoke", "main"], required=True)
+    p.add_argument("--source", choices=["host", "hbm"], default="host")
     p.add_argument("--output-dir", type=Path, required=True)
     args = p.parse_args()
     if args.output_dir.exists():
@@ -375,6 +394,7 @@ def main():
     args.output_dir.mkdir(parents=True)
     report = dict(
         mode=args.mode,
+        source=args.source,
         success=False,
         results_valid=False,
         checks=[],

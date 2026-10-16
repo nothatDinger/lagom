@@ -63,3 +63,36 @@ LAGOM_PY="$PWD/.venv/bin/python3" bash scripts/pd_test/run_h2d_streams.sh \
 只运行本轮，不追加CTA8×2、同地址、其他GPU或服务测试。
 
 本地仅CPU解析测试与CLI失败报告检查；真实CUDA stream/graph行为待实机smoke验证。
+
+## 后续：匹配的 HBM 双 reader 对照
+
+仅将源改为本卡显存，继续使用相同 legacy JIT、源内容/索引、独立 A/B 地址范围、
+目的 buffer、CTA4、banks、预热和六种调度。512MiB 源的设备复制及全内容核对在
+所有 capture/计时之前完成，CPU 原数据仍用于输出校验。报告标注 source=hbm、
+source_device=cuda:0、h2d_bytes_per_copy=0；GBps 仅为逻辑处理率。
+默认不带第三参数仍执行原 host 路径。
+
+在 gpuq 的物理 GPU4 allocation 内依次运行（新输出目录）：
+
+```bash
+LAGOM_PY="$PWD/.venv/bin/python3" bash scripts/pd_test/run_h2d_streams.sh \
+  smoke "$PWD/work/h2d-two-readers/hbm-smoke-v1" hbm
+```
+
+smoke 必须 results_valid=True、checks=8/8、profiles=3/3，绑定 source=hbm、
+source_device=cuda:0，H2D字节为0；三份profile活动完整、grid4/block1024正确。
+不以吞吐或重叠率高低作为门禁（它们正是待测结果）。满足后直接续跑：
+
+```bash
+LAGOM_PY="$PWD/.venv/bin/python3" bash scripts/pd_test/run_h2d_streams.sh \
+  main "$PWD/work/h2d-two-readers/hbm-main-v1" hbm
+```
+
+反馈 smoke 门禁一行及 main/result/streams-compact.txt 全文；streams.json/trace留本地。
+任一步失败停止，回 compact 及 run.log 最后30行，不追加实验。
+
+先在 HBM 本轮内比较单路、串行、并行和每路耗时，结合活动重叠及启动偏斜；
+再比较已有 host 的并发伸缩情况。不用 host-HBM 时间差当 PCIe 耗时。
+HBM 明显伸缩而 host 不伸缩支持 host 特有路径限制；HBM 同样不伸缩只会提高
+共同执行/访存因素的优先级，不证明两者同一瓶颈。短 HBM kernel 下启动偏斜、
+graph 开销及 cache 行为可能更显著，不能只看一个总吞吐比就归因。
