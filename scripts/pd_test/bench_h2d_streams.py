@@ -233,26 +233,61 @@ def execute(torch, args, report):
                 for method in ("A", "B"):
                     for _ in range(3):
                         run(torch, pilot_readers, coordinator, method)
+                # Persist samples before any calibration gate can raise.
+                report["pilot"] = dict(samples_us={"A": [], "B": []})
+                for n in ("A", "B"):
+                    for _ in range(5):
+                        report["pilot"]["samples_us"][n].append(
+                            run(torch, pilot_readers, coordinator, n)["readers"][n][
+                                "duration_us"
+                            ]
+                        )
                 pilot_us = {
-                    n: statistics.median(
-                        run(torch, pilot_readers, coordinator, n)["readers"][n][
-                            "duration_us"
-                        ]
-                        for _ in range(5)
-                    )
-                    for n in ("A", "B")
+                    n: statistics.median(v)
+                    for n, v in report["pilot"]["samples_us"].items()
                 }
                 ce_copies = (
                     1 if args.pressure else max(1, round(pilot_us["A"] / pilot_us["B"]))
                 )
+                report["pilot"].update(
+                    single_us=pilot_us,
+                    ce_copies=ce_copies,
+                    ce_single_GBps=ce_bytes / pilot_us["B"] / 1000,
+                )
                 if args.pressure:
-                    report["ce_calibration"] = ce_bytes / pilot_us["B"] / 1000 >= 45
+                    # Fixed continuous CE calibration, not a single short pulse.
+                    # No retry-until-pass and no threshold relaxation.
+                    calibration = dict(
+                        copies=16,
+                        copy_bytes=ce_bytes,
+                        warmups=3,
+                        samples=[],
+                        threshold_GBps=45,
+                    )
+                    report["ce_calibration_detail"] = calibration
+                    bulk = CEReader(torch, ce_source, 16)
+                    bulk_readers = {"B": bulk}
+                    for _ in range(3):
+                        run(torch, bulk_readers, coordinator, "B")
+                    calibration["state_before"] = observer.sample(0)
+                    for _ in range(5):
+                        row = run(torch, bulk_readers, coordinator, "B")
+                        calibration["samples"].append(row["readers"]["B"])
+                    calibration["state_after"] = observer.sample(0)
+                    calibration["median_GBps"] = statistics.median(
+                        v["GBps"] for v in calibration["samples"]
+                    )
+                    report["ce_calibration"] = calibration["median_GBps"] >= 45
+                    bulk.check(0)
+                    del bulk_readers, bulk
                     if not report["ce_calibration"]:
-                        raise ValueError("CE pilot below 45 GB/s")
+                        raise ValueError(
+                            f"Continuous CE calibration below 45 GB/s: median={calibration['median_GBps']:.3f}; "
+                            f"samples={[v['GBps'] for v in calibration['samples']]}"
+                        )
                 if ce_copies > 256:
                     raise ValueError("Unexpected pilot duration ratio")
                 readers[name] = CEReader(torch, ce_source, ce_copies)
-                report["pilot"] = dict(single_us=pilot_us, ce_copies=ce_copies)
                 del pilot_readers, pilot
             else:
                 readers[name] = Reader(torch, host, source, plans[name], banks)

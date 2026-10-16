@@ -29,7 +29,7 @@ profile可能扰动CPU节拍，不将其速率冒充无profile压力。
 
 - 身份GPU4、host NUMA1、source_disjoint/independent_outputs为True；legacy JIT一致。
 - 前置字节检查checks=8/8；每个压力窗口correct=True。
-- CE pilot≥45GB/s；结果中CE_calibration=True。
+- 连续CE校验≥45GB/s；结果中CE_calibration=True。
 - 无profile每窗valid=True：SM提交占比≤10%，SM计时块事件覆盖≥98%。
 - ON中心至少4个完整CE脉冲；实际CE速率上下界均在目标±20%内。
 - 每档前后OFF的SM吞吐比0.9–1.1；各窗状态无错误、P0、Gen5x16。
@@ -75,3 +75,17 @@ smoke 32×64=2048、main 128×64=8192条kernel节点，每64条两端记录时�
 报告capture_kind=flat_kernel_launches及sm_kernel_nodes；profile仍核对实际kernel数量。
 
 重新使用新目录smoke-v2；全部门禁通过后使用main-v2，不覆盖失败的smoke-v1。
+
+## smoke-v2 校验报告修复
+
+smoke-v2在单次16MiB CE pilot的45GB/s门禁处停止，未保存触发门禁的原始读数，
+也尚未执行flat capture。不能据此判断冷启动、链路或kernel问题。
+
+现在先保存A/B五个pilot原始时长和单次CE速率。压力模式的CE校验独立使用
+16次×16MiB的连续graph，固定预热3次、测5次，五次吞吐中位数须≥45GB/s。
+不重试取最好结果；阈值不变，但从短脉冲校验调整为连续窗口校验，应与旧门禁区分。
+校验数据在判定前写入报告，compact含PILOT、CE_CALIBRATION及前后状态。
+连续CE校验只说明该参考路径可用，不代替5/15/30各档实际速率门禁。
+
+下一次用smoke-v3新目录。为避免继续投入无效main，先仅回smoke完整compact；
+待确认flat capture与压力窗口质量后再运行main，不自动续跑。

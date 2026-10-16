@@ -240,6 +240,8 @@ def compact_pressure(r):
         f"JIT {r.get('jit')}",
         f"CONFIG {r.get('config')} PRESSURE_CONFIG {r.get('pressure_config')} CE_calibration={r.get('ce_calibration')}",
     ]
+    lines.append(f"PILOT {r.get('pilot')}")
+    lines.append(f"CE_CALIBRATION {r.get('ce_calibration_detail')}")
     for w in r.get("pressure_waves", []):
         lines.append(
             f"WINDOW trial={w['trial']} rate={w['rate']} phase={w['phase']} metrics={w['metrics']} retention={w.get('retention')} drift={w.get('baseline_after_before')} correct={w['correctness']}"
