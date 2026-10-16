@@ -13,6 +13,7 @@ from bench_h2d_copy import validate_sm
 from bench_h2d_latency import host_local
 from bench_h2d_pair import Observer, Warmer, make_plan
 from sglang.benchmark.hisparse_h2d_codegen import sha256
+from sglang.benchmark.hisparse_h2d_ce_pressure import compact_pressure, execute_pressure
 from sglang.benchmark.hisparse_h2d_diagnostics import (
     PAGE_BYTES,
     copy_geometry,
@@ -187,7 +188,7 @@ def execute(torch, args, report):
         report["host_node1"] = host_local(snapshot, allocation.numel())
         if not report["host_node1"]:
             raise ValueError("Full allocation must be bound to node1")
-        banks = 4 if args.mode == "smoke" else 64
+        banks = 4 if args.mode == "smoke" and not args.pressure else 64
         geometry = copy_geometry(32, 100, (pages // 2) * PAGE_BYTES, banks)
         config = SimpleNamespace(
             batch=32, plan_stride=3072, buffer_slots=3072, seed=24001
@@ -238,7 +239,13 @@ def execute(torch, args, report):
                     )
                     for n in ("A", "B")
                 }
-                ce_copies = max(1, round(pilot_us["A"] / pilot_us["B"]))
+                ce_copies = (
+                    1 if args.pressure else max(1, round(pilot_us["A"] / pilot_us["B"]))
+                )
+                if args.pressure:
+                    report["ce_calibration"] = ce_bytes / pilot_us["B"] / 1000 >= 45
+                    if not report["ce_calibration"]:
+                        raise ValueError("CE pilot below 45 GB/s")
                 if ce_copies > 256:
                     raise ValueError("Unexpected pilot duration ratio")
                 readers[name] = CEReader(torch, ce_source, ce_copies)
@@ -309,6 +316,9 @@ def execute(torch, args, report):
             for name in names:
                 readers[name].check(banks - 1)
             report["checks"].append(dict(method=method, bytes_padding=True))
+        if args.pressure:
+            execute_pressure(torch, args, report, readers, warmer, observer)
+            return
         for trial in range(2 if args.mode == "smoke" else 6):
             order = METHODS if trial % 2 == 0 else tuple(reversed(METHODS))
             for method in order:
@@ -396,6 +406,8 @@ def execute(torch, args, report):
 
 
 def compact(r):
+    if r.get("pressure"):
+        return compact_pressure(r)
     lines = [
         f"source={r['source']} mode={r['mode']} success={r['success']} results_valid={r['results_valid']} checks={len(r['checks'])}/8 profiles={len(r['profiles'])}/3",
         f"IDENTITY {r.get('identity')} HOST node1={r.get('host_node1')} flags=1",
@@ -487,10 +499,13 @@ def compact(r):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mode", choices=["smoke", "main"], required=True)
+    p.add_argument("--pressure", action="store_true")
     p.add_argument("--partner", choices=["sm", "ce"], default="sm")
     p.add_argument("--source", choices=["host", "hbm"], default="host")
     p.add_argument("--output-dir", type=Path, required=True)
     args = p.parse_args()
+    if args.pressure and (args.partner != "ce" or args.source != "host"):
+        p.error("Pressure mode requires host SM/CE")
     if args.partner == "ce" and args.source != "host":
         p.error("Mixed SM/CE requires host source")
     if args.output_dir.exists():
@@ -500,6 +515,7 @@ def main():
         mode=args.mode,
         source=args.source,
         partner=args.partner,
+        pressure=args.pressure,
         success=False,
         results_valid=False,
         checks=[],
@@ -520,6 +536,7 @@ def main():
                 "scripts/pd_test/bench_h2d_streams.py",
                 "python/sglang/benchmark/hisparse_h2d_streams.py",
                 "python/sglang/benchmark/hisparse_h2d_sm_ce.py",
+                "python/sglang/benchmark/hisparse_h2d_ce_pressure.py",
                 "python/sglang/kernels/jit/csrc/hisparse.cuh",
             )
         }
