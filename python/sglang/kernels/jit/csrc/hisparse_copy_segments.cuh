@@ -95,9 +95,13 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_segments_kernel(
           asm volatile("{ .reg .pred p; setp.ne.u64 p, %1, 0; "
                        "mov.u64 %0, 0; @p mov.u64 %0, %%globaltimer; }"
                        : "=l"(t1) : "l"(addresses) : "memory");
-          const auto a = load_item_word<0>(src0);
-          const auto b = load_item_word<0>(src1);
-          const auto c = load_item_word<0>(tail_src);
+          // Under instrumentation the first probe lost automatic read-only
+          // codegen (plain LDG.E.64). Explicit __ldg
+          // restores the legacy read-only intent. Final SASS must still match
+          // LDG.E.64.CONSTANT; this source spelling is not proof of codegen.
+          const auto a = __ldg(reinterpret_cast<const long long*>(src0));
+          const auto b = __ldg(reinterpret_cast<const long long*>(src1));
+          const auto c = __ldg(reinterpret_cast<const long long*>(tail_src));
           const auto t2 = segment_now();
           const auto t3 = segment_consumed(a, b, c, sink);
           *dst0 = a;

@@ -68,3 +68,29 @@ legacy.sass.txt与check.json/codegen.json留本地，需要时再补。
 失败回已有compact及相应run.log或codegen.log最后30行，不继续GPU作业。
 
 本地无GPU/nvcc，CPU校验与语法通过不能代替实机CUDA编译、正确性或SASS审查。
+
+## 第一版实机审查：暂不具备原kernel性能解释资格
+
+check 12/12（全部eager、graph6/6、padding/guard）通过；legacy/control/trace寄存器
+34/34/53，STACK/LOCAL/SHARED均0。三个JIT SHA：
+- legacy 1bb816c524eb665041b323c5826dcc849ea15495d3a45aa207c9cf40154ffa6c
+- control d2ee0815c3de057c2ef3289e913bce9827fa95fa344a6178b34f96bb28a10fff
+- trace 29fa663f9617f602567ca5100bc9239f0a08c59bca85997a5db446377f52fa6c
+
+第一版trace的关键边界（仅适用于此SHA）：
+- T0=0590；plan LDG=0630/0650，在T0后。
+- T1=0ab0；host LDG=0ac0/0ad0/0ae0，全为W5、M0；前后至T2无M0x20等待。
+- T2=0b10；0b20 LOP3 XOR消费三个load低半结果，M0x20等待barrier5；
+  0b30消费三个高半结果；T3=0b40位于其后，M0x02是读取地址寄存器的barrier1。
+- STG=0b50/0b80/0b90；T4=0ba0，M0x02可能包含store源寄存器读取依赖等待，
+  不是写入HBM排空证明。期间还包含checksum累计指令，不是纯store机器指令耗时。
+- T2分隔的是可见发射区段和残余依赖等待，不代表请求已经进入PCIe或精确队列入队。
+
+阻断项：control仍为三条LDG.E.64.CONSTANT，而trace三条变成LDG.E.64；
+即使边界有效，访存语义已变化，不能解释原legacy的CTA4/8增长。
+trace中load顺序也变为tail、prefix0、prefix1，说明源码顺序不能当机器码证据。
+
+修复候选仅把trace三个C++读取换成显式__ldg，要求新SASS恢复.CONSTANT；
+不改生产kernel、不改cache到.ca、不追加性能。__ldg只是候选，必须重新核对
+三条load修饰符、完整wait mask、T0..T4顺序和资源。新codegen compact增加MEMORY行。
+用check-v2新目录执行同一检查脚本，回全部四份文件；旧check-v1保留。

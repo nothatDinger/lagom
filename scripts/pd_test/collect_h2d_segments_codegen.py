@@ -1,6 +1,7 @@
 """Offline extraction only. Human review of timer boundaries remains mandatory."""
 
 import argparse
+from collections import Counter
 import json
 import shutil
 import subprocess
@@ -87,6 +88,14 @@ def main():
                 resources=resources,
                 kernels=instructions,
                 timers=timers,
+                memory_opcodes=dict(
+                    Counter(
+                        i["opcode"]
+                        for k in instructions
+                        for i in k["instructions"]
+                        if i["opcode"].startswith(("LDG", "STG"))
+                    )
+                ),
                 controls_complete=all(k["controls_complete"] for k in instructions),
                 timer_presence_valid=(
                     bool(timers) if a["variant"] == "trace" else not timers
@@ -126,6 +135,7 @@ def main():
         lines.append(
             f"TIMER {a['variant']} {a['timers']} controls_complete={a['controls_complete']}"
         )
+        lines.append(f"MEMORY {a['variant']} {a['memory_opcodes']}")
     if "error" in report:
         lines.append("ERROR " + report["error"])
     text = "\n".join(lines) + "\n"
