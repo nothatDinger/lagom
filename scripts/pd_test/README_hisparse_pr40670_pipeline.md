@@ -40,7 +40,7 @@ one gpuq allocation for GPU4:
 ```bash
 LAGOM_PY=/absolute/path/to/existing/venv/bin/python \
   bash scripts/pd_test/run_hisparse_pr40670_pipeline.sh \
-  "$PWD/work/hisparse-pr40670/pipeline-v2"
+  "$PWD/work/hisparse-pr40670/pipeline-v3"
 ```
 
 Use a new absolute output directory. No NCU, cuobjdump, root changes, NVML Rx
@@ -52,7 +52,8 @@ replays, and one profiled replay. Verify all 584 KV bytes, consistent duplicate
 resolution, unique output counts, unreferenced bytes/guards, PR physical-slot
 permutation, local fixed slots and miss counts. Profiling requires exactly two
 PR kernels or three local kernels with the expected order, grid, block and GPU.
-Main also checks its timed reset graph before sampling. A new correctness failure
+Both check and main also check the timed reset graph and read a positive finite
+event interval before sampling. A new correctness failure
 is recorded and stops the job; don't relax its oracle to get timing.
 
 ## Timing definition
@@ -117,3 +118,22 @@ and missing-token sets. Details are post-commit observations, not a timeline of
 the race. These appear as FAILURE in compact and failure_diagnostic in JSON.
 A CUDA regression adds the full 96-slot cold-union case in eager and six Graph
 replays; CPU tests do not substitute for executing that regression on a GPU.
+
+
+## v3: external event nodes and check/main parity
+
+V2 main passed the first case's eager/Graph/profile checks for both methods,
+then failed at `end.synchronize()` with CUDA invalid argument. The harness had
+used default captured events, which are graph dependencies instead of externally
+observable event-record nodes. This is a timing-harness defect, not evidence of
+a new KV failure. No valid performance result was produced.
+
+V3 uses `torch.cuda.Event(enable_timing=True, external=True)`, matching the
+already-used capture_wave helper. Both check and main now replay the exact timed
+cold-reset graph, synchronize its end event, read a finite positive duration,
+and validate final KV contents. CHECK includes timing_probe_us; it is an API
+smoke check, not a performance result. Six-wave main timing uses the same reader
+and rejects zero/nonfinite durations. Reset remains outside the event interval.
+A CUDA regression captures two separate toy pipelines, then alternates repeated
+replays and validates host-readable timestamps and reset contents. CUDA checks
+still require real hardware; CPU success alone does not validate this API.

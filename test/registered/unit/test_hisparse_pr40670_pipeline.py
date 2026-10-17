@@ -192,3 +192,26 @@ def test_missing_union_token_diagnostic_uses_epoch_and_local_miss_count(monkeypa
     assert result["miss_count"] == [95]
     assert result["final_tables"][0]["table_unique"] == 95
     assert result["final_tables"][0]["requested_missing_from_table"] == [196]
+
+
+@pytest.mark.parametrize(
+    "milliseconds", [0.0125, 0.0, -1.0, float("nan"), float("inf")]
+)
+def test_graph_timing_synchronizes_and_rejects_invalid_intervals(milliseconds):
+    from types import SimpleNamespace
+
+    from sglang.benchmark.hisparse_pr40670_pipeline import graph_sample_us
+
+    calls = []
+    end = SimpleNamespace(synchronize=lambda: calls.append("sync"))
+
+    def elapsed(event):
+        assert event is end and calls == ["sync"]
+        return milliseconds
+
+    start = SimpleNamespace(elapsed_time=elapsed)
+    if milliseconds == 0.0125:
+        assert graph_sample_us(start, end) == 12.5
+    else:
+        with pytest.raises(ValueError, match="Invalid captured event"):
+            graph_sample_us(start, end)

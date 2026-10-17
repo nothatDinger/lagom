@@ -14,6 +14,7 @@ from sglang.benchmark.hisparse_h2d_diagnostics import process_snapshot
 from sglang.benchmark.hisparse_pr40670_pipeline import (
     METHODS,
     ORDERS,
+    graph_sample_us,
     summarize,
     validate_pipeline_profile,
 )
@@ -254,9 +255,11 @@ def oracle(torch, pr, before, reader, unique, method):
 
 
 def capture(torch, reader, timed=False):
+    # Captured default events are graph dependencies, not host-readable record
+    # nodes. External events support synchronize/query/elapsed_time after replay.
     start, end = (
-        torch.cuda.Event(enable_timing=True),
-        torch.cuda.Event(enable_timing=True),
+        torch.cuda.Event(enable_timing=True, external=True),
+        torch.cuda.Event(enable_timing=True, external=True),
     )
     graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream(device=0)
@@ -338,16 +341,19 @@ def execute(torch, args, report, observer):
                     row["checks"][method] = dict(
                         valid=True, checks=checks, profile=profile
                     )
-                    if args.mode == "main":
-                        report["active"]["stage"] = "timed-graph-check"
-                        timed[method] = capture(torch, reader, timed=True)
-                        tg, _, _ = timed[method]
-                        for _ in range(8):
-                            tg.replay()
-                        torch.cuda.synchronize()
-                        row["checks"][method]["timed_graph_check"] = oracle(
-                            torch, pr, before, reader, unique, method
-                        )
+                    # Both check and main must exercise the exact timed-graph
+                    # event API before the benchmark gate can pass.
+                    report["active"]["stage"] = "timed-graph-check"
+                    timed[method] = capture(torch, reader, timed=True)
+                    tg, start, end = timed[method]
+                    for _ in range(8):
+                        tg.replay()
+                    row["checks"][method]["timing_probe_us"] = graph_sample_us(
+                        start, end
+                    )
+                    row["checks"][method]["timed_graph_check"] = oracle(
+                        torch, pr, before, reader, unique, method
+                    )
                 if args.mode == "main":
                     for trial, order in enumerate(ORDERS):
                         for method in order:
@@ -364,8 +370,7 @@ def execute(torch, args, report, observer):
                             # Synchronize outside event interval before reading event values.
                             for _ in range(args.samples):
                                 graph.replay()
-                                end.synchronize()
-                                values.append(start.elapsed_time(end) * 1000)
+                                values.append(graph_sample_us(start, end))
                             row["waves"].append(
                                 dict(
                                     trial=trial,
@@ -465,7 +470,7 @@ def main():
             )
             for method, check in c["checks"].items():
                 lines.append(
-                    f"CHECK {method} eager+graph+profile={len(check['checks'])}/8 profile={check['profile']}"
+                    f"CHECK {method} eager+graph+profile={len(check['checks'])}/8 external_events=True timing_probe_us={check.get('timing_probe_us')} profile={check['profile']}"
                 )
             if "summary" in c:
                 lines.append(

@@ -69,3 +69,12 @@ def summarize(waves, samples):
         / statistics.mean(means[METHODS[0]]),
         samples_per_method=6 * samples,
     )
+
+
+def graph_sample_us(start, end):
+    """Read actual external event timestamps, rejecting unusable measurements."""
+    end.synchronize()
+    value = start.elapsed_time(end) * 1000
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"Invalid captured event duration: {value}")
+    return value

@@ -384,3 +384,31 @@ def test_full_union_table_cold_replays_do_not_drop_valid_kv():
         assert args["miss_count"].tolist() == [96, 96, 0]
         for b in (0, 1):
             assert args["top_k_device_locs"][b].unique().numel() == 96
+
+
+def test_pipeline_timing_events_survive_multiple_captures_and_cold_replays(monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from sglang.benchmark.hisparse_pr40670_pipeline import graph_sample_us
+
+    monkeypatch.syspath_prepend(
+        str(Path(__file__).resolve().parents[5] / "scripts/pd_test")
+    )
+    from bench_hisparse_pr40670_pipeline import capture
+
+    buffers, graphs = [], []
+    for value in (1.0, 3.0):
+        data = torch.empty(1 << 18, device="cuda")
+        reader = SimpleNamespace(
+            reset=lambda data=data: data.zero_(),
+            call=lambda data=data, value=value: data.add_(value),
+        )
+        buffers.append((data, value))
+        graphs.append(capture(torch, reader, timed=True))
+    for _ in range(6):
+        for (data, value), (graph, start, end) in zip(buffers, graphs):
+            graph.replay()
+            assert graph_sample_us(start, end) > 0
+            assert end.query()
+            assert data[0].item() == value and data[-1].item() == value
