@@ -99,3 +99,24 @@ service's prepare/finalize/memory-sizing together, then measure acceptance,
 output correctness, full decode TPOT and service throughput under DSPARK plus
 high concurrency. Pause hardware queue localization and further CTA tuning in
 the meantime. No new performance or service claim is made in this commit.
+
+## Padded request output contract (harness correction)
+
+The pinned gather kernel writes exactly **0** to all output locations of rows
+`bid >= num_real_reqs` before returning, without dereferencing their request IDs.
+Inside active request rows, invalid token/sequence occurrences still return -1.
+The original oracle incorrectly required -1 in both cases; this was a harness
+mismatch. The corrected oracle requires exact zero for padded rows, not either
+zero or -1. Padding values never enter the content lookup or permitted-write
+mask. A zero-real-request replay requires all output locations zero and all
+KV bytes, guards, padding and physical mappings unchanged. All previous byte
+and state checks remain enabled. The pinned CUDA bodies/manifest are untouched.
+
+This is an observed baseline behavior, not proof of downstream safety. In the
+pinned PR coordinator `swap_in_speculative_pages` returns the full captured
+`device_locs.view(-1, top_k)` and the C4 indexer places it in attention metadata;
+there is no real-row slicing at that boundary. Whether specific attention
+backends process dummy rows, use reserved slot 0, or discard their outputs must
+be verified at serving integration. Report `consumer_safety_verified=False`
+until then. Do not label a standalone reference pass as a complete service
+correctness pass or patch the pinned kernel to make the old oracle pass.

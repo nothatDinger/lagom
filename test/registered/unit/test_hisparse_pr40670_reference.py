@@ -131,6 +131,7 @@ def test_c4_oracle_checks_scale_and_untouched_bytes(monkeypatch):
     top[0, 0, 0] = 65
     loc = torch.full_like(top, -1)
     loc[0, 0, 0] = 7
+    loc[1:] = 0  # Pinned PR sentinel for request padding, not an active KV.
     args = dict(
         top_k_tokens=top,
         top_k_device_locs=loc,
@@ -152,6 +153,26 @@ def test_c4_oracle_checks_scale_and_untouched_bytes(monkeypatch):
     output.view(-1)[dst] = host.view(-1)[src]
     assert driver.oracle(torch, case, before)["valid_occurrences"] == 1
     good = output.clone()
+    for bad_padding in (-1, 7):
+        loc[1, 0, 0] = bad_padding
+        with pytest.raises(ValueError, match="Padded row"):
+            driver.oracle(torch, case, before)
+    loc[1, 0, 0] = 0
+    loc[0, 0, 1] = 0
+    with pytest.raises(ValueError, match="Invalid occurrence"):
+        driver.oracle(torch, case, before)
+    loc[0, 0, 1] = -1
+    # No real requests: every row must be zero, and no cache bytes may change.
+    args["num_real_reqs"].zero_()
+    loc.zero_()
+    assert driver.oracle(torch, case, good)["valid_occurrences"] == 0
+    output.view(-1)[0] ^= 1
+    with pytest.raises(ValueError, match="Unreferenced"):
+        driver.oracle(torch, case, good)
+    output.copy_(good)
+    args["num_real_reqs"].fill_(1)
+    loc[0].fill_(-1)
+    loc[0, 0, 0] = 7
     for idx in [dst[0, 0], dst[0, -1], torch.tensor(0)]:
         output.copy_(good)
         output.view(-1)[idx] ^= 1

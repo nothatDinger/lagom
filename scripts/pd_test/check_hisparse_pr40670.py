@@ -208,7 +208,16 @@ def oracle(torch, case, before):
             for j in range(case.layout.top_k):
                 token = int(top[b, w, j])
                 dst = int(loc[b, w, j])
-                expected_valid = b < real and 0 <= token < int(lengths[b, w])
+                # Pinned PR gather returns before reading rid for padded rows
+                # and explicitly writes 0. This is a reference contract, not a
+                # claim that every downstream attention consumer masks it.
+                if b >= real:
+                    if dst != 0:
+                        raise ValueError(
+                            f"Padded row must match pinned PR zero: {b, w, j, dst}"
+                        )
+                    continue
+                expected_valid = 0 <= token < int(lengths[b, w])
                 if not expected_valid:
                     if dst != -1:
                         raise ValueError(
@@ -235,6 +244,10 @@ def oracle(torch, case, before):
         raise ValueError("Physical slot mapping lost/duplicated")
     return dict(
         valid_occurrences=valid,
+        padded_row_value=0,
+        padded_rows_zero=True,
+        active_invalid_value=-1,
+        consumer_safety_verified=False,
         all_value_scale_bytes=True,
         untouched_guards_padding=True,
         physical_slot_permutation=True,
@@ -418,6 +431,7 @@ def main():
             f"REFERENCE success={report['success']} cases={len(report['cases'])}/3 performance_ready=False service_integrated=False",
             f"PR commit={COMMIT} IDENTITY {report.get('identity')}",
             "CONFIG gather_threads=64 commit_threads=512 RecordMissPlan=False PDL=architecture_default; no independent copy launch",
+            "ORACLE padded_rows=exact_zero active_invalid=minus_one consumer_safety_verified=False; byte/state/guard checks retained",
         ]
         for c in report["cases"]:
             lines.append(
