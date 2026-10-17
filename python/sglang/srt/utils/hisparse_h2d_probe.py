@@ -25,6 +25,8 @@ class HiSparseH2DProbe:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.capacity = capacity
         self.max_batch = max_batch
+        self.verify_backend = "split"
+        self.verify_config = {}
         self.host_buffers = {}
         self.control = torch.zeros(2, dtype=torch.int64, device=self.device)
         self.records = torch.empty(
@@ -100,7 +102,7 @@ class HiSparseH2DProbe:
                     captured_batch=batch,
                     item_bytes=size,
                     copy_blocks=blocks,
-                    copy_threads=1024,
+                    copy_threads=1024 if blocks else 0,
                     skip_io=bool(skip),
                     gpu_stamp_ns=stamp,
                     misses_per_request=row[10 : 10 + real],
@@ -110,6 +112,8 @@ class HiSparseH2DProbe:
             )
         return dict(
             schema_version=1,
+            verify_backend=self.verify_backend,
+            verify_config=self.verify_config,
             pid=os.getpid(),
             device=self.device.index,
             gpu=torch.cuda.get_device_name(self.device),

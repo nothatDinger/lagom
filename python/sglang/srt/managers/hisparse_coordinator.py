@@ -1,6 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, NamedTuple, Optional, Tuple, Union
 
@@ -37,6 +38,11 @@ from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import get_device_module, is_hip
 from sglang.srt.utils.hisparse_h2d_probe import create_h2d_probe
+from sglang.srt.utils.hisparse_verify_backend import (
+    initialize_verify_hash_state,
+    run_pr_fused_verify,
+    validate_verify_backend,
+)
 
 device_module = get_device_module()
 
@@ -314,11 +320,43 @@ class HiSparseCoordinator:
             )
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
+        self._verify_impl = os.environ.get("SGLANG_HISPARSE_VERIFY_IMPL", "split")
+        self._pr_verify_layout = validate_verify_backend(
+            self._verify_impl,
+            cuda=not _is_hip and str(device).startswith("cuda"),
+            dsv4=self.is_dsv4_hisparse,
+            speculative=is_speculative,
+            width=speculative_verify_width,
+            top_k=top_k,
+            hot=device_buffer_size,
+            page_size=self.page_size,
+            force_h2d=force_h2d_each_step,
+            skip_io=self.skip_io,
+            prefetcher=prefetcher_name,
+        )
+        logger.info("HiSparse verify backend=%s effective_top_k=%d hot_slots=%d verify_width=%d force_h2d=%s",
+                    self._verify_impl, top_k, device_buffer_size, speculative_verify_width, force_h2d_each_step)
+        if self._verify_impl == "pr_fused":
+            from sglang.benchmark.hisparse_pr40670_retry import validate_candidate
+
+            logger.warning(
+                "Experimental HiSparse pr_fused verify: %s; %s",
+                self._pr_verify_layout,
+                validate_candidate(),
+            )
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         # Startup/warmup can exercise all request slots, independently of the
         # maximum decode CUDA-graph batch. Reserve before any graph capture.
         self._h2d_probe = create_h2d_probe(device, max_batch=max_num_req_slots)
+        if self._h2d_probe is not None:
+            self._h2d_probe.verify_backend = self._verify_impl
+            self._h2d_probe.verify_config = dict(
+                top_k=self.top_k,
+                hot_slots=self.device_buffer_size,
+                force_h2d_each_step=self.force_h2d_each_step,
+                pr_layout=self._pr_verify_layout,
+            )
         max_context_len = req_to_token_pool.max_context_len
         max_compressed_context_len = (
             max_context_len + self.compress_ratio - 1
@@ -470,6 +508,22 @@ class HiSparseCoordinator:
                     num_req_slots=max_num_req_slots,
                     device=device,
                 )
+            if self._verify_impl == "pr_fused":
+                from sglang.benchmark.hisparse_pr40670_reference import (
+                    HiSparseSpecState,
+                )
+
+                self._window_hash_states = [
+                    HiSparseSpecState(
+                        state.cache_index,
+                        state.cache_policy,
+                        self.req_device_buffer_token_locs[
+                            layer, :, self._pr_verify_layout["scratch_offset"] :
+                        ],
+                        state.scratch_state,
+                    )
+                    for layer, state in enumerate(self._window_hash_states)
+                ]
             max_verify_misses = speculative_verify_width * self.top_k
             self._spec_miss_src = torch.empty(
                 (max_num_req_slots, max_verify_misses),
@@ -904,6 +958,13 @@ class HiSparseCoordinator:
             )
         )
         compressed_len = len(compressed_logical_indices)
+        if (
+            getattr(self, "_verify_impl", "split") == "pr_fused"
+            and compressed_len <= self.device_buffer_size
+        ):
+            raise ValueError(
+                "pr_fused experiment requires long-context requests (compressed prefix > hot slots)"
+            )
 
         buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
             compressed_logical_indices, alloc_size
@@ -939,11 +1000,17 @@ class HiSparseCoordinator:
             [req_pool_idx], dtype=torch.int64, device=self.device
         )
         for layer_id, state in enumerate(states):
-            initialize_window_hash_state(
+            self._initialize_verify_state(
                 device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
                 req_pool_indices=req_pool_indices,
                 state=state,
             )
+
+    def _initialize_verify_state(self, **kwargs):
+        if getattr(self, "_verify_impl", "split") == "pr_fused":
+            initialize_verify_hash_state("pr_fused", **kwargs)
+        else:
+            initialize_window_hash_state(**kwargs)
 
     def _grow_device_buffers(
         self,
@@ -1537,7 +1604,7 @@ class HiSparseCoordinator:
         # Clearing it would make the swap-in kernel copy to device location -1.
         self.lru_slots[layer_id, req_pool_indices] = self._lru_init
         if getattr(self, "_window_hash_states", None) is not None:
-            initialize_window_hash_state(
+            self._initialize_verify_state(
                 device_buffer_tokens=tokens,
                 req_pool_indices=req_pool_indices,
                 state=self._window_hash_states[layer_id],
@@ -2088,6 +2155,19 @@ class HiSparseCoordinator:
             miss_dst=miss_dst,
             miss_count=miss_count,
         )
+        if getattr(self, "_verify_impl", "split") == "pr_fused":
+            return run_pr_fused_verify(
+                self,
+                common=common,
+                req_pool_indices=req_pool_indices,
+                compressed_seq_lens=compressed_seq_lens,
+                top_k_result=top_k_result,
+                layer_id=layer_id,
+                verify_width=verify_width,
+                output_buffer=output_buffer,
+                skip_io=skip_io,
+                miss_count=miss_count,
+            )
         if self._window_hash_states is None:
             # Retain main's ROCm planner. PR #40670's hash path targets CUDA.
             load_cache_to_device_buffer_dsv4_mla(

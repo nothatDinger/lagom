@@ -412,3 +412,55 @@ def test_pipeline_timing_events_survive_multiple_captures_and_cold_replays(monke
             assert graph_sample_us(start, end) > 0
             assert end.query()
             assert data[0].item() == value and data[-1].item() == value
+
+
+def test_pr_service_owned_tail_survives_forced_cold_rotations(monkeypatch):
+    from pathlib import Path
+
+    from sglang.benchmark.hisparse_pr40670_reference import (
+        initialize_hisparse_spec_state,
+    )
+    from sglang.benchmark.hisparse_pr40670_retry_candidate import (
+        load_cache_to_device_buffer_spec_mla,
+    )
+    from sglang.srt.mem_cache.pool_host.common import _cuda_host_unregister
+
+    monkeypatch.syspath_prepend(
+        str(Path(__file__).resolve().parents[5] / "scripts/pd_test")
+    )
+    import check_hisparse_pr40670 as base
+
+    case = base.make_case(torch, 6, 16, 128, 64)
+    try:
+        base.reset(torch, case)
+        initial = case.locs.clone()
+        for trial in range(8):
+            # Mirrors force_h2d_each_step: retain rotated physical mappings,
+            # clear identities and reinitialize persistent hash/CLOCK state.
+            case.tokens.fill_(-1)
+            initialize_hisparse_spec_state(
+                device_buffer_tokens=case.args["device_buffer_tokens"],
+                req_pool_indices=case.args["req_pool_indices"][:3],
+                state=case.args["state"],
+            )
+            selected = torch.arange(
+                128 + (trial % 2) * 96,
+                224 + (trial % 2) * 96,
+                dtype=torch.int32,
+                device="cuda",
+            )
+            case.args["top_k_tokens"].copy_(selected.view(1, 6, 16).expand(4, -1, -1))
+            before = case.output.cpu()
+            load_cache_to_device_buffer_spec_mla(**case.args)
+            torch.cuda.synchronize()
+            assert base.oracle(torch, case, before)["valid_occurrences"] == 288
+            for rid in range(3):
+                assert sorted(case.locs[rid].cpu().tolist()) == sorted(
+                    initial[rid].cpu().tolist()
+                )
+            # Canonical and E placeholders never rotate; freeing the original
+            # allocation remains valid after hot/scratch exchanges.
+            torch.testing.assert_close(case.locs[:, 128:131], initial[:, 128:131])
+    finally:
+        torch.cuda.synchronize()
+        _cuda_host_unregister(case.allocation)
