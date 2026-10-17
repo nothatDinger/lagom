@@ -111,3 +111,16 @@ def test_original_not_reproduced_is_inconclusive():
     result = compare_results(rows)
     assert result["original_reference_all_pass"]
     assert not result["candidate_validated"]
+
+
+def test_local_planner_has_the_same_single_retry_correction():
+    from sglang.benchmark.hisparse_pr40670_check import ROOT
+    from sglang.benchmark.hisparse_pr40670_retry import PATCH_NEW, PATCH_OLD
+
+    # Keep the production adaptation from accidentally retaining the original
+    # lost-CAS budget bug after the pinned PR candidate has been corrected.
+    text = (
+        ROOT / "python/sglang/kernels/jit/csrc/hisparse_window_hash.cuh"
+    ).read_text()
+    assert text.count(PATCH_NEW) == 1
+    assert PATCH_OLD not in text

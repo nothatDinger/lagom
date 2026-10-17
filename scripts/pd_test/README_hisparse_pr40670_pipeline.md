@@ -14,7 +14,9 @@ comparison, not a TPOT result or proof of a hardware bandwidth limit.
   and commit launch dimensions plus `[4,1,1] x 1024` copy.
 
 Do not label the candidate as unmodified PR. No original-PR failure is accepted
-as a performance baseline. No serving dispatch or existing kernel is modified.
+as a performance baseline. Serving dispatch is unchanged. Both paths now carry
+that same lost-CAS retry-accounting correction; no copy-kernel configuration or
+KV transfer instruction is changed.
 
 Use physical GPU4 only, NUMA1, W6/K16, hot128, PR tail16/scratch13, real batch4
 and batch32, unique cold misses8 and96 per request. The two implementations share
@@ -38,7 +40,7 @@ one gpuq allocation for GPU4:
 ```bash
 LAGOM_PY=/absolute/path/to/existing/venv/bin/python \
   bash scripts/pd_test/run_hisparse_pr40670_pipeline.sh \
-  "$PWD/work/hisparse-pr40670/pipeline-v1"
+  "$PWD/work/hisparse-pr40670/pipeline-v2"
 ```
 
 Use a new absolute output directory. No NCU, cuobjdump, root changes, NVML Rx
@@ -92,3 +94,26 @@ moving copy between these implementations is not yet a promising optimization.
 A consistent material difference motivates a subsequent service integration and
 TPOT test, with correctness and writer/scratch safety checked there. Neither
 outcome alone predicts DSPARK high-concurrency TPOT.
+
+
+## v1 failure and v2 correction
+
+The first GPU check passed B4/8 for both paths and B4/96 for the PR candidate,
+then stopped at the local B4/96 eager check with unresolved valid KV. No main
+performance result was produced. Inspection found the local adaptation still
+had the original CAS-loser `continue` consuming a probe allowance. The PR-only
+correction had not been propagated into this inherited local code.
+
+V2 adds the same `--attempt` immediately before that retry, retaining every other
+local planner/copy setting. The local source hash and content-addressed JIT
+artifact change; there is no reason to delete shared caches. Keep the v1 report
+as the uncorrected-local observation. V2 must pass the strict check before its
+main timing runs; this GPU rerun, not source inspection alone, will determine
+whether the correction resolves this failure.
+
+A named failure now records active batch/miss/method/stage, unresolved token and
+location details, local miss counts, and final union-table capacity/epoch/count
+and missing-token sets. Details are post-commit observations, not a timeline of
+the race. These appear as FAILURE in compact and failure_diagnostic in JSON.
+A CUDA regression adds the full 96-slot cold-union case in eager and six Graph
+replays; CPU tests do not substitute for executing that regression on a GPU.

@@ -446,6 +446,8 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
               atomicExch(req_scratch_indices + hash_pos, epoch_bits | static_cast<uint32_t>(unique_idx));
               break;
             }
+            // A lost CAS retries this same slot; it did not probe a new slot.
+            --attempt;
             continue;
           }
           if (static_cast<uint32_t>(old) == token_bits) {

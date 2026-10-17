@@ -108,7 +108,7 @@ def test_content_oracle_checks_payload_scale_and_guards(monkeypatch, fault):
     monkeypatch.syspath_prepend(
         str(Path(__file__).resolve().parents[3] / "scripts/pd_test")
     )
-    from bench_hisparse_pr40670_pipeline import oracle
+    from bench_hisparse_pr40670_pipeline import PipelineKVError, oracle
     from check_hisparse_pr40670 import c4_indices
     from sglang.benchmark.hisparse_pr40670_w6 import input_tokens
 
@@ -145,6 +145,50 @@ def test_content_oracle_checks_payload_scale_and_guards(monkeypatch, fault):
     )
     if fault is None:
         assert oracle(torch, pr, before, reader, 8, METHODS[1])["valid"]
+    elif fault == "unresolved":
+        with pytest.raises(PipelineKVError) as caught:
+            oracle(torch, pr, before, reader, 8, METHODS[1])
+        assert caught.value.diagnostic["unresolved_count"] == 1
+        assert caught.value.diagnostic["unresolved"] == [
+            dict(b=0, rid=0, w=0, j=0, token=128, dst=-1)
+        ]
+        assert caught.value.diagnostic["miss_count"] == [8]
     else:
         with pytest.raises(ValueError):
             oracle(torch, pr, before, reader, 8, METHODS[1])
+
+
+def test_missing_union_token_diagnostic_uses_epoch_and_local_miss_count(monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import torch
+
+    monkeypatch.syspath_prepend(
+        str(Path(__file__).resolve().parents[3] / "scripts/pd_test")
+    )
+    from bench_hisparse_pr40670_pipeline import unresolved_diagnostic
+
+    top = torch.arange(128, 224, dtype=torch.int32).view(1, 6, 16)
+    loc = torch.arange(96, dtype=torch.int32).view(1, 6, 16)
+    loc[top == 196] = -1
+    rows = torch.zeros((2, 480), dtype=torch.int32)
+    rows[0, 3] = 1
+    for slot, token in enumerate(t for t in range(128, 224) if t != 196):
+        rows[1, 2 * slot] = token
+        rows[1, 2 * slot + 1] = 1
+    state = SimpleNamespace(scratch_state=rows, cache_index=torch.zeros(1, 2, 256))
+    args = dict(
+        top_k_tokens=top,
+        top_k_device_locs=loc,
+        req_pool_indices=torch.tensor([0]),
+        device_buffer=torch.zeros(3, 37440),
+        miss_count=torch.tensor([95]),
+        state=state,
+    )
+    result = unresolved_diagnostic(torch, args)
+    assert result["unresolved_count"] == 1
+    assert result["unresolved"][0]["token"] == 196
+    assert result["miss_count"] == [95]
+    assert result["final_tables"][0]["table_unique"] == 95
+    assert result["final_tables"][0]["requested_missing_from_table"] == [196]

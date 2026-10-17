@@ -348,3 +348,39 @@ def test_dsv4_value_and_scale_copy_across_padded_pages():
             torch.testing.assert_close(read(actual, dst), read(host, src))
     torch.testing.assert_close(args["device_buffer_locs"], physical)
     assert args["miss_count"].tolist() == [3, 3, 0]
+
+
+def test_full_union_table_cold_replays_do_not_drop_valid_kv():
+    # W6/K16 fills all 96 union slots across two gather CTAs. CAS losses must
+    # not consume the allowance for probing distinct hash slots.
+    args = _inputs(128, 6, 16)
+    args["top_k_tokens"][:2] = torch.arange(
+        128, 224, dtype=torch.int32, device="cuda"
+    ).view(6, 16)
+    initial_tokens = args["device_buffer_tokens"].clone()
+    initial_data = args["device_buffer"].clone()
+
+    def reset():
+        args["device_buffer_tokens"].copy_(initial_tokens)
+        args["device_buffer"].copy_(initial_data)
+        args["top_k_device_locs"].fill_(-1)
+        _initialize(args)
+
+    def run():
+        plan_cache_window_hash_mla(**args)
+        _copy(args)
+
+    run()  # Compile outside capture.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for trial in range(7):
+        reset()
+        if trial == 0:
+            run()
+        else:
+            graph.replay()
+        _check_contents(args)
+        assert args["miss_count"].tolist() == [96, 96, 0]
+        for b in (0, 1):
+            assert args["top_k_device_locs"][b].unique().numel() == 96

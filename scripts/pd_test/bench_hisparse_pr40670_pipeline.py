@@ -146,13 +146,66 @@ def make_pair(torch, batch, unique):
         raise
 
 
+class PipelineKVError(ValueError):
+    def __init__(self, diagnostic):
+        super().__init__("Unresolved/out-of-range valid KV")
+        self.diagnostic = diagnostic
+
+
+def unresolved_diagnostic(torch, args):
+    loc = args["top_k_device_locs"].cpu()
+    top = args["top_k_tokens"].cpu()
+    rids = args["req_pool_indices"].cpu().tolist()
+    bad = ((loc < 0) | (loc >= args["device_buffer"].shape[0] * 64)).nonzero()
+    details = [
+        dict(b=b, rid=rids[b], w=w, j=j, token=int(top[b, w, j]), dst=int(loc[b, w, j]))
+        for b, w, j in bad.tolist()
+    ]
+    result = dict(
+        unresolved_count=len(details),
+        unresolved=details[:64],
+        details_truncated=len(details) > 64,
+    )
+    if "miss_count" in args:
+        result["miss_count"] = args["miss_count"].cpu().tolist()
+    state = args.get("state")
+    if state is not None:
+        rows = state.scratch_state.cpu().tolist()
+        slots = state.cache_index.shape[0]
+        capacity = state.scratch_state.shape[1] // 5
+        counters = rows[0]
+        tables = []
+        for b, rid in enumerate(rids):
+            epoch = counters[3 * slots + rid] & 0x7FFFFFFF
+            row = rows[rid + 1]
+            tokens = {
+                row[2 * i] & 0xFFFFFFFF
+                for i in range(capacity)
+                if (row[2 * i + 1] & 0xFFFFFFFF) == epoch
+            }
+            tables.append(
+                dict(
+                    b=b,
+                    rid=rid,
+                    table_capacity=capacity,
+                    epoch=epoch,
+                    table_unique=len(tokens),
+                    requested_missing_from_table=sorted(
+                        set(top[b].reshape(-1).tolist()) - tokens
+                    ),
+                )
+            )
+        result["final_tables"] = tables
+    return result
+
+
 def oracle(torch, pr, before, reader, unique, method):
     a = reader.args
     loc = a["top_k_device_locs"].cpu()
     batch = loc.shape[0]
     output = a["device_buffer"].cpu()
     if not bool(((loc >= 0) & (loc < output.shape[0] * 64)).all()):
-        raise ValueError("Unresolved/out-of-range valid KV")
+        raise PipelineKVError(unresolved_diagnostic(torch, a))
     src = (
         a["req_pool_indices"].cpu()[:, None, None] * pr.host_stride
         + a["top_k_tokens"].cpu()
@@ -249,6 +302,9 @@ def execute(torch, args, report, observer):
                     raise ValueError("Bad bindings")
                 timed = {}
                 for method, reader in readers.items():
+                    report["active"] = dict(
+                        batch=batch, unique=unique, method=method, stage="eager"
+                    )
                     reader.reset()
                     reader.call()  # JIT and eager check.
                     torch.cuda.synchronize()
@@ -256,13 +312,15 @@ def execute(torch, args, report, observer):
                     reader.reset()
                     torch.cuda.synchronize()
                     graph, _, _ = capture(torch, reader)
-                    for _ in range(6):
+                    for trial in range(6):
+                        report["active"]["stage"] = f"graph-{trial}"
                         reader.reset()
                         graph.replay()
                         torch.cuda.synchronize()
                         checks.append(oracle(torch, pr, before, reader, unique, method))
                     reader.reset()
                     torch.cuda.synchronize()
+                    report["active"]["stage"] = "profile"
                     with torch.profiler.profile(
                         activities=[
                             torch.profiler.ProfilerActivity.CPU,
@@ -281,6 +339,7 @@ def execute(torch, args, report, observer):
                         valid=True, checks=checks, profile=profile
                     )
                     if args.mode == "main":
+                        report["active"]["stage"] = "timed-graph-check"
                         timed[method] = capture(torch, reader, timed=True)
                         tg, _, _ = timed[method]
                         for _ in range(8):
@@ -292,6 +351,12 @@ def execute(torch, args, report, observer):
                 if args.mode == "main":
                     for trial, order in enumerate(ORDERS):
                         for method in order:
+                            report["active"] = dict(
+                                batch=batch,
+                                unique=unique,
+                                method=method,
+                                stage=f"wave-{trial}",
+                            )
                             graph, start, end = timed[method]
                             state_before = observer.sample(0)
                             values = []
@@ -334,6 +399,7 @@ def execute(torch, args, report, observer):
     ]
     if len(report["jit"]) != 3:
         raise ValueError("Expected exactly three pipeline JIT modules")
+    report.pop("active", None)
     report["results_valid"] = len(report["cases"]) == 4 and all(
         c.get("valid") for c in report["cases"]
     )
@@ -375,6 +441,9 @@ def main():
         if report["identity"]["uuid"] != "GPU-dd86c4db-6f83-d828-ccd4-cc2e9a407702":
             raise ValueError("Require physical GPU4")
         execute(torch, args, report, observer)
+    except PipelineKVError as exc:
+        report["failure_diagnostic"] = exc.diagnostic
+        report["error"] = traceback.format_exc()
     except Exception:
         report["error"] = traceback.format_exc()
     finally:
@@ -406,6 +475,10 @@ def main():
                 lines.append(
                     f"STATE B{c['batch']} unique={c['unique']} trial={wave['trial']} {wave['method']} before={wave['before']} after={wave['after']}"
                 )
+        if "failure_diagnostic" in report:
+            lines.append(
+                f"FAILURE active={report.get('active')} diagnostic={report['failure_diagnostic']}"
+            )
         if "error" in report:
             lines.append("ERROR " + report["error"])
         text = "\n".join(lines) + "\n"
