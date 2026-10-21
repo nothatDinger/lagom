@@ -12,6 +12,11 @@ from sglang.kernels.ops.kvcache.hisparse import (
     load_cache_to_device_buffer_mla,
     transfer_cache_dsv4_mla,
 )
+from sglang.kernels.ops.kvcache.hisparse_spec import (
+    allocate_hisparse_spec_states,
+    initialize_hisparse_spec_state,
+    load_cache_to_device_buffer_spec_mla,
+)
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.hisparse_prefetcher import (
@@ -25,6 +30,10 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
+)
+from sglang.srt.mem_cache.hisparse_spec import (
+    HiSparseSpecLayout,
+    validate_pr_fused_config,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
@@ -253,11 +262,13 @@ class HiSparseCoordinator:
         pp_size: int = 1,
         is_speculative: bool = False,
         speculative_verify_width: int = 0,
+        force_h2d_each_step: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.top_k = top_k
         self.device_buffer_size = device_buffer_size
+        self.force_h2d_each_step = force_h2d_each_step
         self.device = device
         self.swap_in_block_size = swap_in_block_size
         # Timing probe: skip the host->device KV bytes to measure the "IO is
@@ -305,6 +316,23 @@ class HiSparseCoordinator:
             )
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
+        self._pr_verify_layout = None
+        if self.is_dsv4_hisparse and is_speculative and speculative_verify_width > 0:
+            self._pr_verify_layout = validate_pr_fused_config(
+                cuda=not _is_hip and str(device).startswith("cuda"),
+                dsv4=self.is_dsv4_hisparse,
+                speculative=is_speculative,
+                width=speculative_verify_width,
+                top_k=top_k,
+                hot=device_buffer_size,
+                page_size=self.page_size,
+                force_h2d=force_h2d_each_step,
+                skip_io=self.skip_io,
+                prefetcher=prefetcher_name,
+            )
+            logger.info(
+                "HiSparse speculative swap-in uses pr_fused: %s", self._pr_verify_layout
+            )
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
@@ -426,6 +454,14 @@ class HiSparseCoordinator:
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
+        self._speculative_verify_width = speculative_verify_width
+        self._spec_states = None
+        if self._pr_verify_layout is not None:
+            self._spec_states = allocate_hisparse_spec_states(
+                HiSparseSpecLayout(device_buffer_size, speculative_verify_width, top_k),
+                device_buffer_locs=self.req_device_buffer_token_locs,
+                scratch_offset=self._pr_verify_layout["scratch_offset"],
+            )
 
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
@@ -797,6 +833,7 @@ class HiSparseCoordinator:
             self.req_device_buffer_tokens[
                 :, req.req_pool_idx, : self.device_buffer_size
             ] = -1
+            self._initialize_spec_request(req.req_pool_idx)
 
         req.hisparse_staging = False
         self._skip_first_backup[req.req_pool_idx] = True
@@ -844,6 +881,13 @@ class HiSparseCoordinator:
             )
         )
         compressed_len = len(compressed_logical_indices)
+        if (
+            getattr(self, "_pr_verify_layout", None) is not None
+            and compressed_len <= self.device_buffer_size
+        ):
+            raise ValueError(
+                "pr_fused experiment requires long-context requests (compressed prefix > hot slots)"
+            )
 
         buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
             compressed_logical_indices, alloc_size
@@ -868,6 +912,22 @@ class HiSparseCoordinator:
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
+
+        self._initialize_spec_request(req.req_pool_idx)
+
+    def _initialize_spec_request(self, req_pool_idx: int) -> None:
+        states = getattr(self, "_spec_states", None)
+        if states is None:
+            return
+        req_pool_indices = torch.tensor(
+            [req_pool_idx], dtype=torch.int64, device=self.device
+        )
+        for layer_id, state in enumerate(states):
+            initialize_hisparse_spec_state(
+                device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+                req_pool_indices=req_pool_indices,
+                state=state,
+            )
 
     def _grow_device_buffers(
         self,
@@ -1165,9 +1225,9 @@ class HiSparseCoordinator:
         Returns:
             Device KV cache indices for the selected tokens.  Shape: (num_reqs, top_k)
         """
-        assert not self.is_dsv4_hisparse, (
-            "naive_load_topk is not implemented for dsv4 hisparse"
-        )
+        assert (
+            not self.is_dsv4_hisparse
+        ), "naive_load_topk is not implemented for dsv4 hisparse"
         num_reqs = req_pool_indices.size(0)
         top_k_indices = torch.full(
             (num_reqs, self.top_k), -1, dtype=torch.int32, device=self.device
@@ -1182,9 +1242,9 @@ class HiSparseCoordinator:
             req_idx = int(req_pool_indices[i].item())
             selected_tokens = top_k_tokens[i, :top_n].to(dtype=torch.int64)
 
-            assert torch.all(selected_tokens >= 0), (
-                f"Req {req_idx}: selected tokens contain negative positions"
-            )
+            assert torch.all(
+                selected_tokens >= 0
+            ), f"Req {req_idx}: selected tokens contain negative positions"
             assert torch.all(selected_tokens < seq_len), (
                 f"Req {req_idx}: selected tokens {selected_tokens.tolist()} "
                 f"out of range for seq_len={seq_len}"
@@ -1388,6 +1448,24 @@ class HiSparseCoordinator:
             self.top_k_device_locs_buffer if output_buffer is None else output_buffer
         )[:num_reqs]
 
+        if getattr(self, "_spec_states", None) is not None:
+            # A decode fallback must update the same persistent metadata as
+            # target verify, rather than leaving the hash stale after LRU I/O.
+            if record_plan or num_top_k != self.top_k:
+                raise ValueError(
+                    "Fused speculative cache does not support prefetch plans."
+                )
+            return self._run_swap_in_verify_window(
+                req_pool_indices=req_pool_indices,
+                compressed_seq_lens=compressed_seq_lens,
+                top_k_result=top_k_result,
+                layer_id=layer_id,
+                verify_width=1,
+                output_buffer=top_k_indices,
+                skip_io=skip_io,
+                num_real_reqs=num_real_reqs,
+            )
+
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla
             if self.is_dsv4_hisparse
@@ -1429,6 +1507,26 @@ class HiSparseCoordinator:
             **plan,
         )
         return top_k_indices
+
+    def _invalidate_hot_buffer_residency(
+        self, req_pool_indices: torch.Tensor, layer_id: int
+    ) -> None:
+        """Forget resident token identities while retaining physical slot mappings."""
+        if not getattr(self, "force_h2d_each_step", False):
+            return
+        req_pool_indices = req_pool_indices.to(torch.int64)
+        tokens = self.req_device_buffer_tokens[layer_id]
+        tokens.index_fill_(0, req_pool_indices, -1)
+        # req_device_buffer_token_locs is not residency metadata: it maps each
+        # logical hot-buffer slot to its allocated physical device location.
+        # Clearing it would make the swap-in kernel copy to device location -1.
+        self.lru_slots[layer_id, req_pool_indices] = self._lru_init
+        if getattr(self, "_spec_states", None) is not None:
+            initialize_hisparse_spec_state(
+                device_buffer_tokens=tokens,
+                req_pool_indices=req_pool_indices,
+                state=self._spec_states[layer_id],
+            )
 
     def _consume_previous_prefetch(
         self,
@@ -1872,6 +1970,8 @@ class HiSparseCoordinator:
             req_pool_indices_cpu,
             committed_lens_cpu,
         )
+        if getattr(self, "_spec_states", None) is None:
+            self._invalidate_hot_buffer_residency(req_pool_indices, layer_id)
         if not self.enable_prefetch:
             result = self._run_swap_in_kernel(
                 req_pool_indices,
@@ -1883,9 +1983,11 @@ class HiSparseCoordinator:
                 self._submit_previous_prefetch(
                     req_pool_indices,
                     compressed_seq_lens,
-                    top_k_result
-                    if prefetch_candidates is None
-                    else prefetch_candidates,
+                    (
+                        top_k_result
+                        if prefetch_candidates is None
+                        else prefetch_candidates
+                    ),
                     layer_id,
                 )
             elif self.prefetcher_name == "ema" and prefetch_candidates is not None:
@@ -1931,6 +2033,55 @@ class HiSparseCoordinator:
                     )
         return anchor_locs
 
+    def _run_swap_in_verify_window(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        layer_id: int,
+        verify_width: int,
+        output_buffer: torch.Tensor,
+        skip_io: Optional[bool] = None,
+        num_real_reqs: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Maintain the entire window and transfer KV in one gather/commit pair."""
+        if self._spec_states is None:
+            raise RuntimeError(
+                "Fused verify swap-in requires CUDA DeepSeek-V4 speculative state"
+            )
+        if verify_width <= 0 or verify_width > self._speculative_verify_width:
+            raise ValueError(
+                "HiSparse verify width exceeds the fixed one-shot capacity: "
+                f"width={verify_width}, capacity={self._speculative_verify_width}"
+            )
+        if skip_io or self.skip_io:
+            raise ValueError("pr_fused cannot skip KV IO")
+        self._invalidate_hot_buffer_residency(req_pool_indices, layer_id)
+        num_reqs = req_pool_indices.numel()
+        active = self._pr_verify_layout["active_slots"]
+        lengths = compressed_seq_lens.reshape(num_reqs, -1)
+        if lengths.shape[1] == 1:
+            lengths = lengths.expand(num_reqs, verify_width)
+        load_cache_to_device_buffer_spec_mla(
+            top_k_tokens=top_k_result.reshape(num_reqs, verify_width, self.top_k),
+            device_buffer_tokens=self.req_device_buffer_tokens[layer_id, :, :active],
+            device_buffer_locs=self.req_device_buffer_token_locs[layer_id, :, :active],
+            host_cache_locs=self.req_to_host_pool,
+            host_cache=self.mem_pool_host.kv_buffer[layer_id],
+            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+            top_k_device_locs=output_buffer.view(num_reqs, verify_width, self.top_k),
+            req_pool_indices=req_pool_indices.to(torch.int64),
+            seq_lens=lengths.to(torch.int32).contiguous().view(-1),
+            state=self._spec_states[layer_id],
+            num_real_reqs=(
+                self.num_real_reqs if num_real_reqs is None else num_real_reqs
+            ),
+            transfer_kind="dsv4_paged",
+            item_size_bytes=self.item_size_bytes,
+        )
+        return output_buffer
+
     def swap_in_selected_pages_spec(
         self,
         req_pool_indices: torch.Tensor,
@@ -1941,18 +2092,10 @@ class HiSparseCoordinator:
         verify_lens_cpu: Optional[List[int]] = None,
         output_buffer: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Swap DSPARK verify selections in request-major step order.
+        """Resolve the complete verify window with fused gather/commit.
 
-        ``top_k_result`` is the *real* Indexer output, with either static
-        ``[B * W, K]`` rows or compact ``[sum(verify_lens), K]`` rows. LRU and
-        resident-slot tables are per request, so two steps of one request must
-        never share a launch. Launch step-major batches instead: requests run
-        in parallel while each request's later step observes the prior launch.
-        Padding rows beyond ``sum(verify_lens)`` remain invalid and never launch.
-
-        This eager synchronous path is intentional: speculative decoding disables
-        shared-index/previous-layer prefetch, while preserving the Indexer's
-        Top-K unchanged.
+        Static request-major rows retain graph-captured output addresses. Ragged
+        eager rows are padded once, resolved together, and scattered back.
         """
         if top_k_result.dim() != 2:
             raise ValueError(
@@ -1974,8 +2117,6 @@ class HiSparseCoordinator:
                     f"rows={top_k_result.size(0)}, batch={batch_size}"
                 )
             verify_width = top_k_result.size(0) // batch_size
-            top_k_by_req = top_k_result.view(batch_size, verify_width, -1)
-            result_by_req = result.view(batch_size, verify_width, -1)
             if compressed_seq_lens.numel() == batch_size:
                 seq_lens_by_req = None
             elif compressed_seq_lens.numel() == top_k_result.size(0):
@@ -1987,21 +2128,19 @@ class HiSparseCoordinator:
                     f"lengths={compressed_seq_lens.numel()}, batch={batch_size}, "
                     f"rows={top_k_result.size(0)}"
                 )
-            # Static ownership is fixed and request-aligned, including CUDA
-            # Graph padding. Launch one full request batch per step: the kernel's
-            # num_real_reqs mask now correctly removes padded request blocks.
-            for step in range(verify_width):
-                self._run_swap_in_kernel(
-                    req_pool_indices,
-                    (
-                        compressed_seq_lens
-                        if seq_lens_by_req is None
-                        else seq_lens_by_req[:, step]
-                    ),
-                    top_k_by_req[:, step, : self.top_k],
-                    layer_id,
-                    output_buffer=result_by_req[:, step, : self.top_k],
-                )
+            window_seq_lens = (
+                compressed_seq_lens
+                if seq_lens_by_req is None
+                else seq_lens_by_req.reshape(-1)
+            )
+            self._run_swap_in_verify_window(
+                req_pool_indices=req_pool_indices,
+                compressed_seq_lens=window_seq_lens,
+                top_k_result=top_k_result,
+                layer_id=layer_id,
+                verify_width=verify_width,
+                output_buffer=result,
+            )
             return result
 
         result.fill_(-1)
@@ -2021,38 +2160,49 @@ class HiSparseCoordinator:
                 f"rows={top_k_result.size(0)}"
             )
 
-        # One launch per verify step, with all requests owning that step in the
-        # same launch. This preserves per-request ordering while retaining
-        # request-level GPU parallelism. Compact rows are request-major, hence
-        # offsets identify the row for (request, step).
+        # Ragged verify is eager today. Pad it to request-major fixed width so it
+        # uses the same fused gather/commit contract as graph-captured static
+        # verify, then scatter locations back to compact row order.
         offsets = [0]
         for verify_len in verify_lens_cpu:
             offsets.append(offsets[-1] + verify_len)
-        for step in range(max(verify_lens_cpu, default=0)):
-            active_reqs = [
-                i for i, length in enumerate(verify_lens_cpu) if step < length
-            ]
-            row_ids = [offsets[i] + step for i in active_reqs]
-            active_idx = torch.tensor(
-                active_reqs, dtype=torch.int64, device=self.device
-            )
-            row_idx = torch.tensor(row_ids, dtype=torch.int64, device=self.device)
-            step_seq_lens = (
-                compressed_seq_lens[active_idx]
-                if num_seq_lens == batch_size
-                else compressed_seq_lens[row_idx]
-            )
-            step_output = torch.empty(
-                (len(active_reqs), self.top_k), dtype=torch.int32, device=self.device
-            )
-            self._run_swap_in_kernel(
-                req_pool_indices[active_idx],
-                step_seq_lens,
-                top_k_result[row_idx, : self.top_k],
-                layer_id,
-                output_buffer=step_output,
-            )
-            result[row_idx, : self.top_k] = step_output
+        verify_width = max(verify_lens_cpu, default=0)
+        if verify_width == 0:
+            return result
+        padded_top_k = torch.full(
+            (batch_size, verify_width, self.top_k),
+            -1,
+            dtype=top_k_result.dtype,
+            device=self.device,
+        )
+        padded_seq_lens = torch.zeros(
+            (batch_size, verify_width),
+            dtype=compressed_seq_lens.dtype,
+            device=self.device,
+        )
+        for req, verify_len in enumerate(verify_lens_cpu):
+            if verify_len == 0:
+                continue
+            rows = slice(offsets[req], offsets[req + 1])
+            padded_top_k[req, :verify_len] = top_k_result[rows, : self.top_k]
+            if num_seq_lens == batch_size:
+                padded_seq_lens[req, :verify_len] = compressed_seq_lens[req]
+            else:
+                padded_seq_lens[req, :verify_len] = compressed_seq_lens[rows]
+        padded_output = torch.full_like(padded_top_k, -1, dtype=torch.int32)
+        self._run_swap_in_verify_window(
+            req_pool_indices=req_pool_indices,
+            compressed_seq_lens=padded_seq_lens.reshape(-1),
+            top_k_result=padded_top_k.reshape(-1, self.top_k),
+            layer_id=layer_id,
+            verify_width=verify_width,
+            output_buffer=padded_output.reshape(-1, self.top_k),
+        )
+        for req, verify_len in enumerate(verify_lens_cpu):
+            if verify_len:
+                result[offsets[req] : offsets[req + 1], : self.top_k] = padded_output[
+                    req, :verify_len
+                ]
         return result
 
     def prepare_dspark_verify_window(

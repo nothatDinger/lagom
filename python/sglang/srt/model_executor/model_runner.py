@@ -917,6 +917,7 @@ class ModelRunner:
                 )
                 else 0
             ),
+            force_h2d_each_step=hisparse_cfg.force_h2d_each_step,
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,
                 pp_size=self.ps.pp_size,
