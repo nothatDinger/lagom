@@ -18,7 +18,10 @@ manifest checks, split planner, probes and comparison scripts are not needed.
 The original serving restrictions are retained: CUDA DSv4 speculative verify,
 `force_h2d_each_step=true`, real KV IO, no named prefetcher, compressed prefixes
 longer than the hot buffer, and `verify_width * effective_top_k <= min(hot, 8192)`.
-For DSPARK, force-H2D promotes the hot buffer to `verify_width * effective_top_k`.
+For DSPARK, the hot buffer defaults to `2 * verify_width * effective_top_k`,
+including force-H2D mode (width 6 and effective Top-K 512 default to 6144 C4
+entries). Explicit buffer sizes are preserved if they can hold one complete
+verify window; force-H2D invalidates residency without changing that capacity.
 The canonical tail and provisional C4 placeholders remain fixed. Remaining slots
 in each request's existing allocation provide rotating KV scratch; separate
 coordinator-owned C4 writer scratch, accepted-token commit and rollback retain

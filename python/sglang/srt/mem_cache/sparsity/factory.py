@@ -87,10 +87,6 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         raise ValueError(
             f"force_h2d_each_step must be a boolean, got {force_h2d_each_step!r}"
         )
-    if force_h2d_each_step:
-        # This experiment intentionally removes spare hot-buffer capacity so
-        # every selected entry must be populated again on the next step.
-        device_buffer_size = top_k
     if device_buffer_size < top_k:
         raise ValueError(
             f"device_buffer_size ({device_buffer_size}) must be no smaller than top_k ({top_k})"
@@ -147,10 +143,10 @@ def resolve_dspark_device_buffer_size(
     Target verify computes attention for all rows after swap-in planning.  In the
     worst case their Top-K sets are disjoint, so every returned device location
     remains stable only when the resident buffer can hold ``verify_width * K``.
-    An omitted device_buffer_size adopts that safe bound; an explicit value is
-    never silently changed in normal mode.  The force-H2D experiment is the one
-    exception: parsing first reduces the buffer to Top-K, then DSPARK promotes
-    it to this union bound because all verify rows are consumed after planning.
+    An omitted device_buffer_size defaults to twice that bound, using the
+    model's effective Top-K. Explicit values are preserved if they can hold
+    one complete window. Force-H2D only invalidates residency; it does not
+    change the configured buffer capacity.
     """
     if verify_width <= 0 or effective_top_k <= 0:
         raise ValueError(
@@ -158,22 +154,6 @@ def resolve_dspark_device_buffer_size(
             f"got verify_width={verify_width}, effective_top_k={effective_top_k}"
         )
     required = verify_width * effective_top_k
-    if config.force_h2d_each_step:
-        # One DSPARK verification step contains ``verify_width`` Top-K rows.
-        # They are planned before attention runs, so their returned locations
-        # must remain resident together.  The experiment still invalidates the
-        # previous verification step, but cannot shrink this step's live union.
-        config.device_buffer_size = required
-        logger.info(
-            "HiSparse force-H2D uses a %d-entry DSPARK verify buffer "
-            "(%d verify rows * %d Top-K); residency is invalidated once "
-            "before the complete verify window.",
-            required,
-            verify_width,
-            effective_top_k,
-        )
-        return config
-
     explicit_device_buffer_size = (
         raw_hisparse_config is not None
         and "device_buffer_size" in json.loads(raw_hisparse_config)
@@ -185,7 +165,7 @@ def resolve_dspark_device_buffer_size(
             f"C4 entries), got {config.device_buffer_size}"
         )
     if not explicit_device_buffer_size:
-        config.device_buffer_size = required
+        config.device_buffer_size = 2 * required
     return config
 
 

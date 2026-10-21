@@ -31,34 +31,54 @@ def test_legacy_config_is_unchanged():
     assert config.prefetcher_config == {}
 
 
-def test_dspark_defaults_device_buffer_to_verify_union_upper_bound():
-    config = _config('{"top_k":2048,"host_to_device_ratio":5}')
+@pytest.mark.parametrize("force_h2d", [False, True])
+@pytest.mark.parametrize("verify_width,effective_top_k", [(1, 128), (3, 256), (6, 512)])
+def test_dspark_defaults_device_buffer_to_twice_verify_union(
+    force_h2d, verify_width, effective_top_k
+):
+    raw = json.dumps(
+        {"top_k": 2048, "host_to_device_ratio": 5, "force_h2d_each_step": force_h2d}
+    )
+    config = _config(raw)
     resolve_dspark_device_buffer_size(
         config,
-        raw_hisparse_config='{"top_k":2048,"host_to_device_ratio":5}',
+        raw_hisparse_config=raw,
+        verify_width=verify_width,
+        effective_top_k=effective_top_k,
+    )
+    assert config.device_buffer_size == 2 * verify_width * effective_top_k
+
+
+@pytest.mark.parametrize("force_h2d", [False, True])
+@pytest.mark.parametrize("buffer_size", [3072, 4096, 8192])
+def test_dspark_preserves_sufficient_explicit_device_buffer(force_h2d, buffer_size):
+    raw = json.dumps(
+        {
+            "top_k": 2048,
+            "device_buffer_size": buffer_size,
+            "force_h2d_each_step": force_h2d,
+        }
+    )
+    config = _config(raw)
+    resolve_dspark_device_buffer_size(
+        config,
+        raw_hisparse_config=raw,
         verify_width=6,
         effective_top_k=512,
     )
-    assert config.device_buffer_size == 3072
+    assert config.device_buffer_size == buffer_size
 
 
-def test_dspark_preserves_sufficient_explicit_device_buffer():
-    config = _config('{"top_k":2048,"device_buffer_size":4096}')
-    resolve_dspark_device_buffer_size(
-        config,
-        raw_hisparse_config='{"top_k":2048,"device_buffer_size":4096}',
-        verify_width=6,
-        effective_top_k=512,
+@pytest.mark.parametrize("force_h2d", [False, True])
+def test_dspark_rejects_insufficient_explicit_device_buffer(force_h2d):
+    raw = json.dumps(
+        {"top_k": 512, "device_buffer_size": 2048, "force_h2d_each_step": force_h2d}
     )
-    assert config.device_buffer_size == 4096
-
-
-def test_dspark_rejects_insufficient_explicit_device_buffer():
-    config = _config('{"top_k":512,"device_buffer_size":2048}')
+    config = _config(raw)
     with pytest.raises(ValueError, match=r"6 \* 512 = 3072"):
         resolve_dspark_device_buffer_size(
             config,
-            raw_hisparse_config='{"top_k":512,"device_buffer_size":2048}',
+            raw_hisparse_config=raw,
             verify_width=6,
             effective_top_k=512,
         )
@@ -309,12 +329,12 @@ def test_ema_prepares_shared_cpu_batch_metadata_once():
     assert metadata.required_rows == 8
 
 
-def test_force_h2d_each_step_uses_top_k_sized_device_buffer():
+def test_force_h2d_each_step_preserves_configured_device_buffer():
     config = _config(
         '{"top_k":128,"device_buffer_size":512,"force_h2d_each_step":true}'
     )
     assert config.force_h2d_each_step is True
-    assert config.device_buffer_size == 128
+    assert config.device_buffer_size == 512
 
 
 @pytest.mark.parametrize("value", [0, 1, "true", None])
@@ -323,20 +343,15 @@ def test_force_h2d_each_step_requires_boolean(value):
         _config(json.dumps({"force_h2d_each_step": value}))
 
 
-def test_force_h2d_each_step_keeps_dspark_verify_union_capacity():
-    config = _config(
-        '{"top_k":512,"device_buffer_size":512,"force_h2d_each_step":true}'
-    )
-    assert config.device_buffer_size == 512
+def test_dspark_defaults_without_explicit_hisparse_config():
+    config = _config(None)
     resolve_dspark_device_buffer_size(
         config,
-        raw_hisparse_config=(
-            '{"top_k":512,"device_buffer_size":512,"force_h2d_each_step":true}'
-        ),
+        raw_hisparse_config=None,
         verify_width=6,
         effective_top_k=512,
     )
-    assert config.device_buffer_size == 3072
+    assert config.device_buffer_size == 6144
 
 
 def test_force_h2d_invalidation_preserves_hot_buffer_allocation():

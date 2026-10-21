@@ -871,7 +871,8 @@ class ModelRunner:
             )
             logger.info(
                 "HiSparse DSPARK resident buffer uses %d C4 entries "
-                "(verify_width=%d * effective_top_k=%d).",
+                "(verify_width=%d, effective_top_k=%d; "
+                "default=2 * verify_width * effective_top_k).",
                 hisparse_cfg.device_buffer_size,
                 speculative_verify_width,
                 hisparse_top_k,
