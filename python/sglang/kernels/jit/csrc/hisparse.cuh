@@ -323,7 +323,9 @@ struct SmemLayout {
 // per miss, miss_count per request) for shared-index skip layers to replay via
 // copy_cache_planned_kernel. SkipIO elides only the KV byte movement (timing
 // probe; output is garbage). Both are compile-time flags so the production
-// (false, false) instantiation stays byte-identical.
+// (false, false) instantiation keeps its existing behavior. PlanOnly runs the
+// same hit/LRU algorithm on compact metadata outputs, leaving live tables and
+// KV bytes untouched until the foreground attention has finished reading.
 template <
     int BLOCK_SIZE,
     int NUM_TOP_K,
@@ -332,6 +334,7 @@ template <
     bool IsDsv4Layout,
     bool RecordMissPlan,
     bool SkipIO,
+    bool PlanOnly,
     typename SeqLensT,
     typename ReqPoolIndicesT>
 __global__ void load_cache_to_device_buffer_kernel(
@@ -358,8 +361,13 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t* __restrict__ miss_src_out,
     int32_t* __restrict__ miss_dst_out,
     int32_t* __restrict__ miss_count_out,
-    int64_t plan_stride) {
+    int64_t plan_stride,
+    int32_t* __restrict__ planned_tokens,
+    int16_t* __restrict__ planned_lru,
+    int64_t planned_tokens_stride,
+    int64_t planned_lru_stride) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
+  static_assert(!PlanOnly || (SkipIO && RecordMissPlan), "PlanOnly requires a miss plan and no KV writes.");
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
   constexpr int NUM_TOKEN_CHUNKS = (NUM_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
@@ -374,6 +382,9 @@ __global__ void load_cache_to_device_buffer_kernel(
   if (bid >= num_real_reqs[0]) {
     for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
       req_top_k_device_locs[i] = -1;
+    }
+    if constexpr (RecordMissPlan) {
+      if (tid == 0) miss_count_out[bid] = 0;
     }
     return;
   }
@@ -393,6 +404,18 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int32_t* req_device_buffer_locs = device_buffer_locs + buffer_offset;
   const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
   int16_t* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
+
+  if constexpr (PlanOnly) {
+    int32_t* next_tokens = planned_tokens + bid * planned_tokens_stride;
+    int16_t* next_lru = planned_lru + bid * planned_lru_stride;
+    for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
+      next_tokens[i] = req_device_buffer_tokens[i];
+      next_lru[i] = req_lru_slots[i];
+    }
+    __syncthreads();
+    req_device_buffer_tokens = next_tokens;
+    req_lru_slots = next_lru;
+  }
 
   // Fast path: short sequences have all tokens in the device buffer in order.
   if (seq_len <= HOT_BUFFER_SIZE) {
@@ -715,7 +738,8 @@ template <
     bool IsMLA,
     bool IsDsv4Layout,
     bool RecordMissPlan,
-    bool SkipIO>
+    bool SkipIO,
+    bool PlanOnly>
 void load_cache_to_device_buffer(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -734,7 +758,9 @@ void load_cache_to_device_buffer(
     int64_t item_size_bytes,
     tvm::ffi::TensorView miss_src_out,
     tvm::ffi::TensorView miss_dst_out,
-    tvm::ffi::TensorView miss_count_out) {
+    tvm::ffi::TensorView miss_count_out,
+    tvm::ffi::TensorView planned_tokens,
+    tvm::ffi::TensorView planned_lru) {
   using namespace host;
 
   const int64_t bs = top_k_tokens.shape()[0];
@@ -787,7 +813,11 @@ void load_cache_to_device_buffer(
         miss_src_ptr,
         miss_dst_ptr,
         miss_count_ptr,
-        plan_stride);
+        plan_stride,
+        PlanOnly ? static_cast<int32_t*>(planned_tokens.data_ptr()) : nullptr,
+        PlanOnly ? static_cast<int16_t*>(planned_lru.data_ptr()) : nullptr,
+        PlanOnly ? planned_tokens.strides()[0] : 0,
+        PlanOnly ? planned_lru.strides()[0] : 0);
   };
 
   const auto seq_dtype = seq_lens.dtype();
@@ -805,6 +835,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            PlanOnly,
             int64_t,
             int64_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()),
@@ -819,6 +850,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            PlanOnly,
             int64_t,
             int32_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()),
@@ -833,6 +865,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            PlanOnly,
             int32_t,
             int64_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),
@@ -847,6 +880,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            PlanOnly,
             int32_t,
             int32_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),

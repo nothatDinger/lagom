@@ -21,9 +21,10 @@ def _jit_sparse_module(
     is_dsv4_layout: bool = False,
     record_miss_plan: bool = False,
     skip_io: bool = False,
+    plan_only: bool = False,
 ) -> Module:
-    # record_miss_plan / skip_io are compile-time kernel flags; the
-    # (False, False) production instantiation stays byte-identical.
+    # Compile-time flags keep ordinary fused refill separate from read-only
+    # background planning and the copy-only replay.
     template_args = make_cpp_args(
         block_size,
         num_top_k,
@@ -32,6 +33,7 @@ def _jit_sparse_module(
         is_dsv4_layout,
         record_miss_plan,
         skip_io,
+        plan_only,
     )
     cache_args = make_cpp_args(
         item_size_bytes,
@@ -42,6 +44,7 @@ def _jit_sparse_module(
         is_dsv4_layout,
         record_miss_plan,
         skip_io,
+        plan_only,
     )
     return load_jit(
         "sparse_cache",
@@ -136,12 +139,35 @@ def _load_cache_to_device_buffer_mla(
     miss_dst: torch.Tensor | None,
     miss_count: torch.Tensor | None,
     skip_io: bool,
+    planned_tokens: torch.Tensor | None = None,
+    planned_lru: torch.Tensor | None = None,
 ) -> None:
-    assert (
-        hot_buffer_size >= num_top_k
-    ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    assert hot_buffer_size >= num_top_k, (
+        f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    )
 
     record_miss_plan = miss_src is not None
+    plan_only = planned_tokens is not None
+    if plan_only:
+        if not skip_io or not record_miss_plan or planned_lru is None:
+            raise ValueError(
+                "Read-only planning requires miss outputs, LRU output and skip_io"
+            )
+        for tensor, dtype in (
+            (planned_tokens, torch.int32),
+            (planned_lru, torch.int16),
+        ):
+            if tensor.dtype != dtype or tensor.shape != (
+                top_k_tokens.shape[0],
+                hot_buffer_size,
+            ):
+                raise ValueError("Invalid read-only planning metadata geometry")
+            if tensor.stride(1) != 1 or tensor.device != top_k_tokens.device:
+                raise ValueError(
+                    "Planning metadata must have contiguous rows on the query device"
+                )
+    elif planned_lru is not None:
+        raise ValueError("planned_tokens and planned_lru must be supplied together")
     module = _jit_sparse_module(
         item_size_bytes,
         block_size,
@@ -151,6 +177,7 @@ def _load_cache_to_device_buffer_mla(
         is_dsv4_layout=is_dsv4_layout,
         record_miss_plan=record_miss_plan,
         skip_io=skip_io,
+        plan_only=plan_only,
     )
 
     empty = torch.empty(0)
@@ -189,6 +216,8 @@ def _load_cache_to_device_buffer_mla(
         miss_src,
         miss_dst,
         miss_count,
+        planned_tokens if plan_only else empty,
+        planned_lru if plan_only else empty,
     )
 
 
@@ -213,11 +242,15 @@ def load_cache_to_device_buffer_mla(
     miss_dst: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
     skip_io: bool = False,
+    planned_tokens: torch.Tensor | None = None,
+    planned_lru: torch.Tensor | None = None,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes).
 
     Optional miss_src/miss_dst/miss_count record the miss plan for replay by
     copy_cache_planned_mla; skip_io elides only the KV bytes (timing probe).
+    Supplying planned_tokens/planned_lru with skip_io also redirects all token
+    and LRU writes to those outputs, preserving the live working set.
     """
     _load_cache_to_device_buffer_mla(
         is_dsv4_layout=False,
@@ -241,6 +274,8 @@ def load_cache_to_device_buffer_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+        planned_tokens=planned_tokens,
+        planned_lru=planned_lru,
     )
 
 
@@ -302,8 +337,10 @@ def load_cache_to_device_buffer_dsv4_mla(
     miss_dst: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
     skip_io: bool = False,
+    planned_tokens: torch.Tensor | None = None,
+    planned_lru: torch.Tensor | None = None,
 ) -> None:
-    """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
+    """DSv4 C4 refill, or read-only planning with separate token/LRU outputs."""
     _load_cache_to_device_buffer_mla(
         is_dsv4_layout=True,
         top_k_tokens=top_k_tokens,
@@ -326,4 +363,6 @@ def load_cache_to_device_buffer_dsv4_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+        planned_tokens=planned_tokens,
+        planned_lru=planned_lru,
     )

@@ -70,13 +70,12 @@ def plan_delta(candidates, resident, last_selected, step, cap=None):
 
 
 class OasisKVPipeline:
-    """Three GPU streams with layer-local dependencies, CPU synchronous fallback."""
+    """Background selection/transfer; prediction and attention use the caller stream."""
 
     def __init__(self, device):
         self.device = torch.device(device)
         self.cuda = self.device.type == "cuda"
         if self.cuda:
-            self.predict = torch.cuda.Stream(device=self.device)
             self.select = torch.cuda.Stream(device=self.device)
             self.transfer = torch.cuda.Stream(device=self.device)
 
@@ -103,11 +102,12 @@ class OasisKVLayerCache:
         self.capacity = 0
         self.host = None
         self.key_min = self.key_max = None
-        self.prediction_done = None
         self.selection_done = None
         self.pending = None
         self.backup_done = None
+        self.refill_done = None
         self.initialized = False
+        self.attention_blocks = None
         slots = config.history_blocks
         self.resident = torch.full((heads, slots), -1, dtype=torch.int64, device=device)
         self.ages = torch.full_like(self.resident, -1)
@@ -120,13 +120,13 @@ class OasisKVLayerCache:
         self.prefetch_submissions = 0
 
     def join(self, *, reclaim=False):
-        # A forward may fail after prediction/selection but before transfer.
-        # Reclamation and later summary writes must also join those readers.
+        # A forward may fail after selection but before transfer. Reclamation
+        # and the next real-query refill must also join that metadata reader.
         for event in (
-            self.prediction_done,
             self.selection_done,
             self.pending,
             self.backup_done,
+            self.refill_done,
         ):
             if event is not None:
                 if reclaim:
@@ -134,8 +134,9 @@ class OasisKVLayerCache:
                 else:
                     torch.cuda.current_stream(self.device).wait_event(event)
         if reclaim:
-            self.prediction_done = self.selection_done = None
+            self.selection_done = None
             self.pending = self.backup_done = None
+            self.refill_done = None
         elif self.pipeline.cuda:
             self.resident.record_stream(torch.cuda.current_stream(self.device))
             self.ages.record_stream(torch.cuda.current_stream(self.device))
@@ -261,48 +262,47 @@ class OasisKVLayerCache:
                     )
 
     def seed(self, query, explicit=None):
+        """Compatibility entry point for cold-start initialization."""
         if self.initialized:
             return
-        plan = plan_delta(
-            self.candidates(query, explicit), self.resident, self.ages, self.step
-        )
-        self._copy_plan(plan)
+        self.prepare_attention(query, explicit)
+
+    def prepare_attention(self, query, explicit=None):
+        """Resolve every real-query miss on the foreground stream, without a cap.
+
+        Draft predictions only warm the cache. They never decide which history
+        the real attention uses. The same refill handles cold start and later
+        prediction misses, using the UVA copy kernel for missing payloads only.
+        """
+        self.join()
+        selected = self.candidates(query, explicit)
+        plan = plan_delta(selected, self.resident, self.ages, self.step)
+        try:
+            self._copy_plan(plan)
+        finally:
+            # A forward can fail before background selection/transfer is
+            # submitted. Reclamation must still wait for this UVA host reader.
+            if self.pipeline.cuda:
+                self.refill_done = torch.cuda.Event()
+                self.refill_done.record(torch.cuda.current_stream(self.device))
         self.resident, self.ages = plan.block_ids, plan.last_selected
+        self.attention_blocks = selected
         self.initialized = True
 
     def predict_prefetch(self, draft_query, explicit=None):
-        """Submit prediction once projected queries and committed summaries exist.
-
-        This stage does not read or change the resident working set, so it can
-        overlap both cold-start seeding and the current paired attention.
-        """
-        pipeline = self.pipeline
-        if pipeline.cuda:
-            pipeline.predict.wait_stream(torch.cuda.current_stream(self.device))
-            draft_query.record_stream(pipeline.predict)
-            if explicit is not None:
-                explicit.record_stream(pipeline.predict)
-            elif self.key_min is not None:
-                self.key_min.record_stream(pipeline.predict)
-                self.key_max.record_stream(pipeline.predict)
-        with pipeline.context("predict"):
-            candidates = self.candidates(draft_query, explicit, next_step=True)
-            if pipeline.cuda:
-                self.prediction_done = torch.cuda.Event()
-                self.prediction_done.record(pipeline.predict)
-        return candidates
+        """Predict next-step candidates on the same stream as real attention."""
+        return self.candidates(draft_query, explicit, next_step=True)
 
     def plan_prefetch(self, candidates):
         """Plan the next working set without publishing it to current attention.
 
-        Call after seed(): the first plan must observe the real query's initial
-        resident set. All updates in plan_delta allocate new metadata tensors.
+        Call after prepare_attention(): the plan must observe the real query's
+        refilled resident set. Updates allocate independent metadata tensors.
         """
         self.step += 1
         pipeline = self.pipeline
         if pipeline.cuda:
-            pipeline.select.wait_event(self.prediction_done)
-            # Observe cold-start seed writes, but do not wait for attention.
+            # Observe prediction and real-query refill, but not attention.
             pipeline.select.wait_stream(torch.cuda.current_stream(self.device))
             candidates.record_stream(pipeline.select)
             self.resident.record_stream(pipeline.select)
@@ -357,6 +357,13 @@ class OasisKVLayerCache:
             self.config.block_size, device=self.device
         )
         valid = (block_ids[..., None] >= 0) & (positions < self.length)
+        if self.attention_blocks is not None:
+            # Unselected prefetched entries may remain in otherwise unused
+            # slots. They must not expand a padded/small real Top-K selection.
+            selected = (
+                self.resident[:, :, None] == self.attention_blocks[:, None, :]
+            ).any(-1)
+            valid[:, :-1] &= selected[..., None]
         packed = self.data.flatten(1, 2)
         key, value = (
             packed[..., : self.key_dim],

@@ -966,10 +966,9 @@ class C4IndexerBackendMixin:
             graph_capture = getattr(forward_batch, "is_oasiskv_graph_capture", False)
             keep = None if graph_capture else valid.to(torch.bool)
             if graph_capture or torch.any(keep):
-                # Keep this as data until root-only C4 commit/rollback finishes.
-                # Starting H2D after this layer alone would let the prefetch
-                # stream mutate resident/LRU mappings concurrently with the
-                # still-active verify transaction used by later layers.
+                # Predict on the foreground stream; selection can overlap this
+                # layer's attention after the real Top-K refill above. Only
+                # transfer publishes mappings, after attention/C4 commit.
                 pending = getattr(forward_batch, "_oasiskv_pending_prefetch", None)
                 if pending is None:
                     pending = {}
@@ -1006,6 +1005,11 @@ class C4IndexerBackendMixin:
                         layer_id=compress_layer_id,
                     ),
                 )
+                from sglang.srt.speculative.oasiskv_lookahead import (
+                    plan_oasiskv_layer_prefetch,
+                )
+
+                plan_oasiskv_layer_prefetch(forward_batch, c4_indexer.layer_id)
         elif hisparse_coordinator is not None:
             if hisparse_decode or hisparse_verify:
                 compress_layer_id = token_to_kv_pool.layer_mapping[

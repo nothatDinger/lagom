@@ -16,9 +16,9 @@ The generic backend is an experimental eager implementation. CPU tensor and inte
 | Native DSA, including DeepSeek-V3.2 / GLM DSA | The model's real draft-row indexer Top-K, before physical-page translation | CPU latent KV; bounded GPU KV slots; native indexer key cache stays on GPU | `--attention-backend oasiskv` |
 | DeepSeek-V4 | C4 draft-row indexer Top-K | Existing HiSparse C4 host/device pools and transactional scratch | `--enable-hisparse`, `prefetcher="oasiskv"` |
 
-For the generic path, both rows attend to the same resident history. The draft row can also see its own provisional KV; the real row cannot. Only real KV is appended to host history. The prediction, LRU delta selection, and UVA copy stages use separate CUDA streams. Each layer waits for its own previous transfer before reuse. Releasing or reusing a request waits for outstanding copies before freeing pinned memory.
+For the generic path, both rows attend to the history selected by the real query. The draft row can also see its own provisional KV; the real row cannot. Only real KV is appended to host history. Prediction, real-query miss refill, and attention run on the foreground CUDA stream. Read-only LRU planning runs on a selection stream; UVA transfer runs on another stream and waits for both selection and the current layer's attention reads. KV uses a single resident buffer without staging. Each layer waits for its own previous transfer before reuse. Releasing or reusing a request waits for outstanding selection and copies before freeing pinned memory.
 
-Prefill uses causal attention with chunked queries and transient per-layer KV materialization. Native DSA prefill applies the real indexer selection. The first decode seeds the resident set from the real query. Subsequent steps consume the preceding draft's predicted set, without synchronously replacing it with the current real query's Top-K.
+Prefill uses causal attention with chunked queries and transient per-layer KV materialization. Native DSA prefill applies the real indexer selection. At every decode step, the real query selects history using Quest bounds or the native indexer Top-K. A foreground kernel loads missing KV before attention; existing hits require no transfer. The first decode uses this same path to initialize residency. Draft predictions only warm the next step's cache: a prediction miss adds foreground I/O, rather than removing an entry from the real selection. Retained prefetched entries outside the real selection are masked from attention.
 
 ## Run the generic backend
 
@@ -52,7 +52,7 @@ Do not pass `--enable-hisparse` or an explicit `--speculative-algorithm` for the
 | --- | --- | --- |
 | `top_k` | 2048, or native DSA `index_topk` | Historical token budget per KV head. The active block is retained separately. |
 | `block_size` | 16; native DSA 1 | Tokens per logical Quest block. Must divide `top_k`. |
-| `max_new_blocks` | `null` | Maximum newly admitted historical blocks per head and step. `null` admits all misses; zero freezes historical slots after initial seeding. |
+| `max_new_blocks` | `null` | Maximum background admissions per KV head and step. `null` admits all predicted misses; zero disables predicted miss transfers. Real-query miss refill is always uncapped. |
 | `prefill_chunk_size` | 256 | Query rows per dense prefill chunk. Smaller values reduce transient prefill workspace. |
 
 The target's persistent GPU KV payload is bounded by `(top_k + block_size)` tokens per local KV head and layer. Quest summaries still grow with context length; native DSA retains its growing indexer cache instead. Host history grows with live requests. The draft's full KV history remains on GPU. Memory profiling reserves the target working sets, summaries/indexer keys, draft KV, and prefill workspace. Set `--max-total-tokens`, context length, and concurrency to fit both host RAM and GPU memory.
@@ -73,7 +73,9 @@ python -m sglang.launch_server \
   --hisparse-config '{"device_buffer_size":4096,"host_to_device_ratio":4,"prefetcher":"oasiskv","prefetcher_config":{"size":512}}'
 ```
 
-Here `prefetcher_config.size` counts logical C4 entries, so 512 entries cover 2048 original tokens. It is independent of the generic backend's block budget. The restored path includes per-layer prefetch task rings, generation/position validation, C4 transactional scratch, root-only commit, logprob row selection, and target/draft CUDA graph support. With `--disable-cuda-graph`, non-C4-boundary steps can submit each layer immediately; C4-boundary steps wait for commit. Graph replay publishes pending tasks after replay, so it does not provide the generic eager path's same-forward layer overlap.
+Here `prefetcher_config.size` counts logical C4 entries, so 512 entries cover 2048 original tokens. It is independent of the generic backend's block budget. The restored path includes per-layer prefetch task rings, generation/position validation, C4 transactional scratch, root-only commit, logprob row selection, and target/draft CUDA graph support. Indexer prediction and attention use the foreground stream, with the real Top-K miss refill between them. The draft row shares the real row's resolved history and does not trigger another immediate refill.
+
+With `--disable-cuda-graph`, steps without an active C4 transaction submit background selection after each layer's real refill. The planner writes task-owned token/LRU metadata and a miss list, leaving live tables and KV unchanged. After attention, the transfer stream copies missing KV and publishes the planned tables. This can overlap the layer's FFN and later layers; no extra KV staging buffer is allocated. C4-boundary steps plan and transfer after commit so they observe the committed residency. Graph replay publishes pending tasks after replay, so it retains post-replay selection/transfer and does not provide the eager path's same-forward layer overlap.
 
 See [HiSparse](/docs/advanced_features/hisparse_guide) for the underlying C4 pool configuration.
 

@@ -1418,6 +1418,12 @@ class MQALayer(MqaAttentionBase):
             and x.shape[0] <= self._multi_stream_bs_limit
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
+        # OasisKV keeps real/draft indexer kernels on the attention stream.
+        # Only read-only residency selection and the later KV transfer use
+        # background streams; the indexer and attention are separate kernels.
+        enable_multi_stream = enable_multi_stream and not getattr(
+            forward_batch, "is_oasiskv_paired", False
+        )
 
         tp_slice, q_padded, q_out = slice(None), None, None
         if self.attn_tp_size > 1:
@@ -1952,8 +1958,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if getattr(forward_batch, "is_oasiskv_paired", False):
-            # Start the layer-local prediction -> selection -> H2D chain while
-            # later layers and FFNs keep the foreground stream busy. A C4
+            # Selection was submitted by the indexer. Start its H2D after the
+            # attention reads, while FFN/later layers run on the foreground. A C4
             # boundary transaction is deliberately left for the post-commit
             # drain to avoid overwriting a destination being promoted.
             from sglang.srt.speculative.oasiskv_lookahead import (

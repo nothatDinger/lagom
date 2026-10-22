@@ -9,7 +9,8 @@ class OasisKVConfig:
     # Historical tokens per KV head; the active block is retained separately.
     token_budget: int = 2048
     block_size: int = 16
-    # None means fetch every miss. Zero deliberately freezes historical slots.
+    # Background admission only: None fetches every predicted miss, zero skips
+    # predicted misses. Real-query fallback always refills all required blocks.
     max_new_blocks: int | None = None
     prefill_chunk_size: int = 256
     native_sparse: bool = False

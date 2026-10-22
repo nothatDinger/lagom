@@ -124,7 +124,7 @@ def test_native_indexer_metadata_stays_immutable_and_logical():
     assert not original.force_unfused_topk
 
 
-def test_native_backend_consumes_previous_draft_set_without_real_topk_refetch():
+def test_native_backend_repairs_wrong_draft_prediction_with_real_topk():
     cache = OasisKVCache(
         OasisKVConfig(
             token_budget=2, block_size=1, max_new_blocks=1, native_sparse=True
@@ -160,7 +160,7 @@ def test_native_backend_consumes_previous_draft_set_without_real_topk_refetch():
     )
     for prefix, root_topk, draft_topk, history in (
         (4, [0, 1], [2, 3], [0, 1]),
-        (5, [0, 3], [0, 3], [2, 1]),
+        (5, [0, 3], [0, 3], [0, 3]),
     ):
         fb = batch([1], [prefix], [2], paired=True)
         backend.init_forward_metadata(fb)

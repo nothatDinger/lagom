@@ -76,7 +76,7 @@ def build_oasiskv_commit(
 
 
 def submit_oasiskv_pending_prefetches(forward_batch: Any) -> None:
-    """Launch draft predictions after target attention and C4 commit complete."""
+    """Drain deferred selection/transfers after target attention and C4 commit."""
     pending = getattr(forward_batch, "_oasiskv_pending_prefetch", None)
     if not pending:
         return
@@ -87,8 +87,27 @@ def submit_oasiskv_pending_prefetches(forward_batch: Any) -> None:
         coordinator.submit_oasiskv_prefetch(**kwargs)
 
 
+def plan_oasiskv_layer_prefetch(forward_batch: Any, layer_id: int) -> bool:
+    """Start read-only selection after the indexer's real-query miss refill.
+
+    C4 commits change residency, so those plans must use the post-commit state.
+    Captured graphs retain descriptors for the existing post-replay drain.
+    """
+    if getattr(forward_batch, "is_oasiskv_graph_capture", False):
+        return False
+    pending = getattr(forward_batch, "_oasiskv_pending_prefetch", None)
+    if not pending or layer_id not in pending:
+        return False
+    coordinator, kwargs = pending[layer_id]
+    if getattr(coordinator, "_active_dspark_window", None) is not None:
+        return False
+    if "task" not in kwargs:
+        kwargs["task"] = coordinator.plan_oasiskv_prefetch(**kwargs)
+    return True
+
+
 def submit_oasiskv_layer_prefetch(forward_batch: Any, layer_id: int) -> bool:
-    """Launch one eager layer's prefetch as soon as its attention is done.
+    """Transfer one eager layer's prefetch as soon as its attention is done.
 
     Most decode steps do not complete a new C4 group and therefore have no
     transactional scratch mapping to commit.  On those steps, retaining every

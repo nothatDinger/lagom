@@ -245,6 +245,111 @@ def _make_state(
     }
 
 
+@pytest.mark.parametrize("dsv4", [False, True])
+@pytest.mark.parametrize("seq_len", [3, 8])
+def test_read_only_plan_preserves_live_state_and_matches_fused_refill(dsv4, seq_len):
+    if dsv4 and is_hip():
+        pytest.skip("DSV4 layout requires CUDA")
+    state = _make_state(
+        [[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]],
+        [[0, 1, 2, 3, -1], [0, 1, 2, 3, -1]],
+        [seq_len - 1, seq_len - 1],
+    )
+    if dsv4:
+        state["host_cache"] = torch.zeros(
+            (1, DSV4_PAGE_BYTES), dtype=torch.uint8, pin_memory=True
+        )
+        state["device_buffer"] = torch.zeros(
+            (1, DSV4_PAGE_BYTES), dtype=torch.uint8, device=DEVICE
+        )
+        for token in range(HOST_CACHE_SIZE):
+            _write_dsv4_token(state["host_cache"], token, seed=token * 11)
+        for rid in range(2):
+            for slot in range(HOT_BUFFER_SIZE):
+                _write_dsv4_token(
+                    state["device_buffer"], rid * 5 + slot, seed=slot * 11
+                )
+            _write_dsv4_token(
+                state["device_buffer"], rid * 5 + 4, seed=(seq_len - 1) * 11
+            )
+    loader = (
+        load_cache_to_device_buffer_dsv4_mla
+        if dsv4
+        else load_cache_to_device_buffer_mla
+    )
+    original_tokens = state["device_buffer_tokens"].clone()
+    original_lru = state["lru_slots"].clone()
+    original_data = state["device_buffer"].clone()
+    candidates = torch.tensor(
+        [[1, 4], [2, 5], [-1, -1]], dtype=torch.int32, device=DEVICE
+    )
+    if seq_len <= HOT_BUFFER_SIZE:
+        candidates[:2] = torch.tensor([[0, 1], [1, 2]], device=DEVICE)
+    req_indices = torch.tensor([1, 0, 0], dtype=torch.int64, device=DEVICE)
+    real_reqs = torch.tensor([2], dtype=torch.int32, device=DEVICE)
+    args = dict(
+        top_k_tokens=candidates,
+        **state,
+        top_k_device_locs=torch.full_like(candidates, -1),
+        req_pool_indices=req_indices,
+        seq_lens=torch.full((3,), seq_len, dtype=torch.int32, device=DEVICE),
+        item_size_bytes=584 if dsv4 else ITEM_SIZE_BYTES,
+        num_top_k=2,
+        hot_buffer_size=HOT_BUFFER_SIZE,
+        num_real_reqs=real_reqs,
+    )
+    # Reference: ordinary real-Top-K kernel, including immediate miss refill.
+    baseline = dict(args)
+    for name in (
+        "device_buffer_tokens",
+        "lru_slots",
+        "device_buffer",
+        "top_k_device_locs",
+    ):
+        baseline[name] = args[name].clone()
+    loader(**baseline)
+    next_tokens = torch.full(
+        (3, HOT_BUFFER_SIZE), -99, dtype=torch.int32, device=DEVICE
+    )
+    next_lru = torch.full((3, HOT_BUFFER_SIZE), -99, dtype=torch.int16, device=DEVICE)
+    miss_src = torch.zeros((3, 2), dtype=torch.int64, device=DEVICE)
+    miss_dst = torch.zeros((3, 2), dtype=torch.int32, device=DEVICE)
+    miss_count = torch.full((3,), 99, dtype=torch.int32, device=DEVICE)
+    loader(
+        **args,
+        miss_src=miss_src,
+        miss_dst=miss_dst,
+        miss_count=miss_count,
+        skip_io=True,
+        planned_tokens=next_tokens,
+        planned_lru=next_lru,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(state["device_buffer_tokens"], original_tokens)
+    torch.testing.assert_close(state["lru_slots"], original_lru)
+    torch.testing.assert_close(state["device_buffer"], original_data)
+    torch.testing.assert_close(args["top_k_device_locs"], baseline["top_k_device_locs"])
+    torch.testing.assert_close(
+        next_tokens[:2],
+        baseline["device_buffer_tokens"][req_indices[:2], :HOT_BUFFER_SIZE],
+    )
+    torch.testing.assert_close(next_lru[:2], baseline["lru_slots"][req_indices[:2]])
+    assert miss_count[2].item() == 0  # padded rows never replay a stale miss plan
+    assert (next_tokens[2] == -99).all()
+    copy_cache_planned_mla(
+        miss_src=miss_src,
+        miss_dst=miss_dst,
+        miss_count=miss_count,
+        num_real_reqs=real_reqs,
+        host_cache=state["host_cache"],
+        device_buffer=state["device_buffer"],
+        item_size_bytes=args["item_size_bytes"],
+        is_dsv4_layout=dsv4,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(state["device_buffer"], baseline["device_buffer"])
+
+
 @pytest.mark.skipif(is_hip(), reason="DSV4 paged-layout HiSparse test is CUDA-only.")
 def test_transfer_cache_dsv4_mla_copies_paged_token() -> None:
     src_cache = torch.zeros((2, DSV4_PAGE_BYTES), dtype=torch.uint8, device=DEVICE)

@@ -78,7 +78,7 @@ def test_paired_attention_matches_dense_and_never_commits_draft(
     )
     for pos in range(7, 11):
         state.append(keys[pos : pos + 1], values[pos : pos + 1], pos)
-        state.seed(queries[pos])
+        state.prepare_attention(queries[pos])
         out = state.attend(
             queries[pos : pos + 2],
             scale,
@@ -109,6 +109,63 @@ def test_native_dsa_prefetch_uses_draft_indices_not_root_selection():
     assert state.resident.tolist() == [[5, 1]]
     assert state.prefetch_submissions == 1
     torch.testing.assert_close(state.data[0, 0, 0, :4], key[5, 0])
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("cap", [0, 1, None])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA UVA copy kernel"
+            ),
+        ),
+    ],
+)
+def test_real_query_refills_prediction_misses_without_prefetch_cap(native, cap, device):
+    cfg = OasisKVConfig(
+        token_budget=2, block_size=1, max_new_blocks=cap, native_sparse=native
+    )
+    state = OasisKVLayerCache(
+        cfg, 1, 1, 1, torch.float32, device, OasisKVPipeline(device)
+    )
+    key = torch.tensor([-4.0, -3.0, 3.0, 4.0, 0.0], device=device).view(-1, 1, 1)
+    value = torch.tensor([2.0, 5.0, 17.0, 29.0, 7.0], device=device).view(-1, 1, 1)
+    state.append(key, value, 0)
+    negative, positive = (
+        -torch.ones(1, 1, device=device),
+        torch.ones(1, 1, device=device),
+    )
+    wrong = torch.tensor([0, 1], device=device) if native else None
+    real = torch.tensor([3, 2], device=device) if native else None
+    state.prepare_attention(negative, wrong)
+    # A wrong draft keeps the negative keys hot; real attention wants both
+    # positive keys, even if background admission is disabled or capped at one.
+    state.prefetch(negative, wrong)
+    state.prepare_attention(positive, real)
+    assert set(state.resident[0].tolist()) == {2, 3}
+    expected = dense(positive[None], key[[2, 3, 4]], value[[2, 3, 4]], 1.0, prefix=2)
+    torch.testing.assert_close(state.attend(positive[None], 1.0), expected)
+    state.join(reclaim=True)
+
+
+def test_real_topk_padding_masks_unselected_resident_entries():
+    cfg = OasisKVConfig(token_budget=2, block_size=1, native_sparse=True)
+    state = OasisKVLayerCache(
+        cfg, 1, 1, 1, torch.float32, "cpu", OasisKVPipeline("cpu")
+    )
+    key = torch.zeros(4, 1, 1)
+    value = torch.tensor([2.0, 100.0, 6.0, 4.0]).view(-1, 1, 1)
+    state.append(key, value, 0)
+    q = torch.zeros(1, 1)
+    state.prepare_attention(q, torch.tensor([0, 1]))
+    state.prepare_attention(q, torch.tensor([2, -1]))
+    # The unused slot may retain value 100, but real Top-K only admits token 2
+    # plus the separately retained active token 3: mean(6, 4) = 5.
+    torch.testing.assert_close(state.attend(q[None], 1.0), torch.tensor([[[5.0]]]))
 
 
 def test_early_prediction_and_plan_preserve_current_working_set():

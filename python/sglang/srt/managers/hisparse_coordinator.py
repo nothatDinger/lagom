@@ -119,6 +119,20 @@ class OasisKVPrefetchTask:
     event: object
     submitted_entries: int = 0
     valid: bool = False
+    planned_tokens: Optional[torch.Tensor] = None
+    planned_lru: Optional[torch.Tensor] = None
+    req_indices: Optional[torch.Tensor] = None
+    real_reqs: Optional[torch.Tensor] = None
+    selection_event: object = None
+    planning: bool = False
+    pending_event: object = None
+
+    @property
+    def completion_event(self):
+        # A failed forward may have submitted selection but never transfer.
+        if self.pending_event is not None:
+            return self.pending_event
+        return self.selection_event if self.planning else self.event
 
     def matches(
         self,
@@ -546,6 +560,7 @@ class HiSparseCoordinator:
             self._oasiskv_ring = None
             self._oasiskv_next_slot = None
             if self.prefetcher_name == "oasiskv":
+                self._oasiskv_select_stream = device_module.Stream()
                 # Two slots per layer: attention may consume slot N while the
                 # no-commit lane prepares N+1.  No plan/output/event is shared
                 # by different layers or overlapping generations.
@@ -578,6 +593,20 @@ class HiSparseCoordinator:
                                     max_num_req_slots, dtype=torch.int32, device=device
                                 ),
                                 event=device_module.Event(),
+                                selection_event=device_module.Event(),
+                                planned_tokens=torch.empty(
+                                    (max_num_req_slots, self.device_buffer_size),
+                                    dtype=torch.int32,
+                                    device=device,
+                                ),
+                                planned_lru=torch.empty(
+                                    (max_num_req_slots, self.device_buffer_size),
+                                    dtype=torch.int16,
+                                    device=device,
+                                ),
+                                real_reqs=torch.zeros(
+                                    1, dtype=torch.int32, device=device
+                                ),
                             )
                         )
                     self._oasiskv_ring.append(layer_slots)
@@ -592,6 +621,9 @@ class HiSparseCoordinator:
                         task.miss_src,
                         task.miss_dst,
                         task.miss_count,
+                        task.planned_tokens,
+                        task.planned_lru,
+                        task.real_reqs,
                     )
                 )
                 logger.info(
@@ -1247,10 +1279,15 @@ class HiSparseCoordinator:
             return
         for layer_slots in self._oasiskv_ring:
             for task in layer_slots:
-                if task.valid and bool((task.req_slots == req_pool_idx).any()):
-                    task.event.synchronize()
+                if (
+                    task.valid or task.planning or task.pending_event is not None
+                ) and bool((task.req_slots == req_pool_idx).any()):
+                    task.completion_event.synchronize()
+                    if task.valid or task.planning:
+                        self.prefetcher.stats.stale_tasks += 1
                     task.valid = False
-                    self.prefetcher.stats.stale_tasks += 1
+                    task.planning = False
+                    task.pending_event = None
 
     def request_finished(self, req: Req):
         # release resources only after the execution of a potential overlapped batch
@@ -1323,6 +1360,8 @@ class HiSparseCoordinator:
         output_buffer: Optional[torch.Tensor] = None,
         miss_plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         skip_io: Optional[bool] = None,
+        planned_metadata: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        num_real_reqs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the full plan+IO swap-in kernel for one layer; return its slot table.
 
@@ -1353,6 +1392,10 @@ class HiSparseCoordinator:
             )
         else:
             plan = {}
+        if planned_metadata is not None:
+            plan.update(
+                planned_tokens=planned_metadata[0], planned_lru=planned_metadata[1]
+            )
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -1369,7 +1412,9 @@ class HiSparseCoordinator:
             hot_buffer_size=self.device_buffer_size,
             page_size=1,
             block_size=self.swap_in_block_size,
-            num_real_reqs=self.num_real_reqs,
+            num_real_reqs=self.num_real_reqs
+            if num_real_reqs is None
+            else num_real_reqs,
             skip_io=self.skip_io if skip_io is None else skip_io,
             **plan,
         )
@@ -1385,13 +1430,18 @@ class HiSparseCoordinator:
         if self.prefetcher_name == "oasiskv":
             if self._oasiskv_ring is None:
                 return
-            valid_tasks = [task for task in self._oasiskv_ring[layer_id] if task.valid]
+            valid_tasks = [
+                task
+                for task in self._oasiskv_ring[layer_id]
+                if task.valid or task.planning
+            ]
             if not valid_tasks:
                 return
             if req_pool_indices_cpu is None or committed_lens_cpu is None:
                 for task in valid_tasks:
-                    task.event.wait(device_module.current_stream())
+                    task.completion_event.wait(device_module.current_stream())
                     task.valid = False
+                    task.planning = False
                 self.prefetcher.stats.stale_tasks += len(valid_tasks)
                 return
             cpu_slots = torch.as_tensor(
@@ -1421,8 +1471,9 @@ class HiSparseCoordinator:
             # resident mapping/buffer.  Queue dependencies for all of them
             # before either the real fallback or attention is allowed to run.
             for task in valid_tasks:
-                task.event.wait(device_module.current_stream())
+                task.completion_event.wait(device_module.current_stream())
                 task.valid = False
+                task.planning = False
                 if task is not matching_task:
                     self.prefetcher.stats.stale_tasks += 1
 
@@ -1525,6 +1576,79 @@ class HiSparseCoordinator:
         self._previous_prefetch_pending_entries = submitted_entries
         self.prefetcher.stats.submitted_entries += submitted_entries
 
+    def plan_oasiskv_prefetch(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        source_committed_lens_cpu: torch.Tensor,
+        predicted_c4_entries: torch.Tensor,
+        layer_id: int,
+    ) -> OasisKVPrefetchTask:
+        """Select on a background stream after the real Top-K refill is ready.
+
+        The kernel snapshots token/LRU metadata into task-owned outputs. It
+        never changes live mappings or KV, so current attention may run beside
+        it. C4-boundary callers defer planning until the transaction commits.
+        """
+        if self.prefetcher_name != "oasiskv" or self.prefetcher is None:
+            raise RuntimeError("plan_oasiskv_prefetch requires OasisKV mode")
+        if (
+            req_pool_indices_cpu.device.type != "cpu"
+            or source_committed_lens_cpu.device.type != "cpu"
+        ):
+            raise ValueError("OasisKV scheduler metadata must use CPU mirror tensors")
+        slots = req_pool_indices_cpu.to(torch.int64).clone()
+        task = self._acquire_oasiskv_ring_task(layer_id)
+        stream = self._oasiskv_select_stream
+        if task.valid or task.planning or task.pending_event is not None:
+            task.completion_event.wait(stream)
+            if task.valid or task.planning:
+                self.prefetcher.stats.stale_tasks += 1
+            task.valid = False
+            task.planning = False
+        task.req_slots = slots
+        task.generations = self._prefetch_generation[slots].clone()
+        task.source_lens = torch.as_tensor(
+            source_committed_lens_cpu, dtype=torch.int64, device="cpu"
+        ).clone()
+        task.target_positions = task.source_lens + 1
+        task.req_indices = req_pool_indices.to(torch.int64).clone()
+        num_reqs = req_pool_indices.numel()
+        task.submitted_entries = num_reqs * self.prefetcher.logical_entries
+        stream.wait_stream(device_module.current_stream())
+        for tensor in (task.req_indices, compressed_seq_lens, predicted_c4_entries):
+            tensor.record_stream(stream)
+        with device_module.stream(stream):
+            try:
+                selected = self.prefetcher.select(predicted_c4_entries)
+                task.predicted_entries[:num_reqs].copy_(selected)
+                # Own the count as well: the next batch may update the shared
+                # graph-padding scalar while this task is still transferring.
+                task.real_reqs.fill_(num_reqs)
+                self._run_swap_in_kernel(
+                    task.req_indices,
+                    compressed_seq_lens,
+                    task.predicted_entries[:num_reqs],
+                    layer_id,
+                    record_plan=True,
+                    num_top_k=self.prefetcher.logical_entries,
+                    output_buffer=task.device_locs,
+                    miss_plan=(task.miss_src, task.miss_dst, task.miss_count),
+                    skip_io=True,
+                    planned_metadata=(
+                        task.planned_tokens[:num_reqs],
+                        task.planned_lru[:num_reqs],
+                    ),
+                    num_real_reqs=task.real_reqs,
+                )
+            finally:
+                task.selection_event.record(stream)
+                task.pending_event = task.selection_event
+                task.planning = True
+        return task
+
     def submit_oasiskv_prefetch(
         self,
         *,
@@ -1534,65 +1658,54 @@ class HiSparseCoordinator:
         source_committed_lens_cpu: torch.Tensor,
         predicted_c4_entries: torch.Tensor,
         layer_id: int,
+        task: Optional[OasisKVPrefetchTask] = None,
     ) -> None:
-        """Prefetch target-C4 predictions for the next token of this layer.
-
-        Callers invoke this only after normal and no-commit draft attention
-        have finished reading the layer working set.  The stream edge in
-        ``_submit_previous_prefetch`` makes the H2D write wait for those reads.
-        Predictions never feed the current attention selection.
-        """
-        if self.prefetcher_name != "oasiskv" or self.prefetcher is None:
-            raise RuntimeError("submit_oasiskv_prefetch requires OasisKV mode")
-        if (
-            req_pool_indices_cpu.device.type != "cpu"
-            or source_committed_lens_cpu.device.type != "cpu"
-        ):
-            raise ValueError("OasisKV scheduler metadata must use CPU mirror tensors")
-        slots = req_pool_indices_cpu.to(torch.int64).clone()
-        task = self._acquire_oasiskv_ring_task(layer_id)
-        if task.valid:
-            # Never rewrite a plan while the prefetch stream may still read it.
-            task.event.wait(device_module.current_stream())
-            task.valid = False
-            self.prefetcher.stats.stale_tasks += 1
-        selected = self.prefetcher.select(predicted_c4_entries)
-        num_reqs = selected.size(0)
-        task.predicted_entries[:num_reqs].copy_(selected)
-        self._run_swap_in_kernel(
-            req_pool_indices,
-            compressed_seq_lens,
-            task.predicted_entries[:num_reqs],
-            layer_id,
-            record_plan=True,
-            num_top_k=self.prefetcher.logical_entries,
-            output_buffer=task.device_locs,
-            miss_plan=(task.miss_src, task.miss_dst, task.miss_count),
-            skip_io=True,
-        )
-        self._previous_prefetch_stream.wait_stream(device_module.current_stream())
-        with device_module.stream(self._previous_prefetch_stream):
-            copy_cache_planned_mla(
-                miss_src=task.miss_src[:num_reqs],
-                miss_dst=task.miss_dst[:num_reqs],
-                miss_count=task.miss_count[:num_reqs],
-                num_real_reqs=self.num_real_reqs,
-                host_cache=self.mem_pool_host.kv_buffer[layer_id],
-                device_buffer=self.mem_pool_device.kv_buffer[layer_id],
-                item_size_bytes=self.item_size_bytes,
-                num_blocks=4,
-                is_dsv4_layout=self.is_dsv4_hisparse,
-                skip_io=self.skip_io,
+        """After attention/commit, transfer misses and publish the planned tables."""
+        if task is None:
+            task = self.plan_oasiskv_prefetch(
+                req_pool_indices=req_pool_indices,
+                req_pool_indices_cpu=req_pool_indices_cpu,
+                compressed_seq_lens=compressed_seq_lens,
+                source_committed_lens_cpu=source_committed_lens_cpu,
+                predicted_c4_entries=predicted_c4_entries,
+                layer_id=layer_id,
             )
-            task.event.record(self._previous_prefetch_stream)
-        task.req_slots = slots
-        task.generations = self._prefetch_generation[slots].clone()
-        task.source_lens = torch.as_tensor(
-            source_committed_lens_cpu, dtype=torch.int64, device="cpu"
-        ).clone()
-        task.target_positions = task.source_lens + 1
-        task.submitted_entries = num_reqs * self.prefetcher.logical_entries
-        task.valid = True
+        if not task.planning or task.layer_id != layer_id:
+            raise RuntimeError(
+                "OasisKV transfer requires an unconsumed plan for this layer"
+            )
+        num_reqs = task.req_slots.numel()
+        stream = self._previous_prefetch_stream
+        task.selection_event.wait(stream)
+        # Called only after this layer's attention has been enqueued. Preserve
+        # the single-buffer read-before-write edge without blocking the CPU.
+        stream.wait_stream(device_module.current_stream())
+        task.req_indices.record_stream(stream)
+        with device_module.stream(stream):
+            try:
+                copy_cache_planned_mla(
+                    miss_src=task.miss_src[:num_reqs],
+                    miss_dst=task.miss_dst[:num_reqs],
+                    miss_count=task.miss_count[:num_reqs],
+                    num_real_reqs=task.real_reqs,
+                    host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                    device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                    item_size_bytes=self.item_size_bytes,
+                    num_blocks=4,
+                    is_dsv4_layout=self.is_dsv4_hisparse,
+                    skip_io=self.skip_io,
+                )
+                self.req_device_buffer_tokens[
+                    layer_id, :, : self.device_buffer_size
+                ].index_copy_(0, task.req_indices, task.planned_tokens[:num_reqs])
+                self.lru_slots[layer_id].index_copy_(
+                    0, task.req_indices, task.planned_lru[:num_reqs]
+                )
+            finally:
+                task.event.record(stream)
+                task.pending_event = task.event
+                task.planning = False
+                task.valid = True
         self.prefetcher.stats.submitted_entries += task.submitted_entries
 
     def _acquire_oasiskv_ring_task(self, layer_id: int) -> OasisKVPrefetchTask:

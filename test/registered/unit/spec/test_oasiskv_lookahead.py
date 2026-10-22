@@ -10,6 +10,7 @@ from sglang.srt.speculative.oasiskv_lookahead import (
     compute_oasiskv_logprobs,
     configure_oasiskv_forward_batch,
     paired_batch_from_eagle_verify,
+    plan_oasiskv_layer_prefetch,
     select_oasiskv_normal_rows,
     submit_oasiskv_layer_prefetch,
     submit_oasiskv_pending_prefetches,
@@ -246,6 +247,46 @@ def test_eager_layer_prefetch_launches_immediately_without_c4_transaction():
     assert forward_batch._oasiskv_pending_prefetch == {}
 
 
+def test_layer_selection_precedes_attention_and_transfer_reuses_its_plan():
+    calls = []
+    task = object()
+
+    def plan(**kwargs):
+        calls.append(("select", kwargs["layer_id"]))
+        return task
+
+    def transfer(**kwargs):
+        assert kwargs["task"] is task
+        calls.append(("transfer", kwargs["layer_id"]))
+
+    coordinator = SimpleNamespace(
+        _active_dspark_window=None,
+        plan_oasiskv_prefetch=plan,
+        submit_oasiskv_prefetch=transfer,
+    )
+    fb = SimpleNamespace(_oasiskv_pending_prefetch={3: (coordinator, {"layer_id": 1})})
+    assert plan_oasiskv_layer_prefetch(fb, 3)
+    assert plan_oasiskv_layer_prefetch(fb, 3)  # no duplicate selection
+    calls.append(("attention", 1))
+    assert submit_oasiskv_layer_prefetch(fb, 3)
+    assert calls == [("select", 1), ("attention", 1), ("transfer", 1)]
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_layer_selection_defers_until_residency_is_stable(graph):
+    calls = []
+    coordinator = SimpleNamespace(
+        _active_dspark_window=None if graph else object(),
+        plan_oasiskv_prefetch=lambda **kwargs: calls.append(kwargs),
+    )
+    pending = {3: (coordinator, {"layer_id": 1})}
+    fb = SimpleNamespace(
+        is_oasiskv_graph_capture=graph, _oasiskv_pending_prefetch=pending
+    )
+    assert not plan_oasiskv_layer_prefetch(fb, 3)
+    assert not calls and "task" not in pending[3][1]
+
+
 def test_layer_prefetch_defers_while_c4_commit_owns_destinations():
     calls = []
     coordinator = SimpleNamespace(
@@ -453,3 +494,170 @@ def test_ring_rotation_and_request_drain_use_cpu_event_sync():
 
     assert calls == [("synchronize", "first")]
     assert not first.valid and second.valid
+
+
+def test_abandoned_selection_is_drained_before_request_reclamation():
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+    calls = []
+    coordinator = object.__new__(HiSparseCoordinator)
+    coordinator.prefetcher = SimpleNamespace(stats=HiSparsePrefetchStats())
+    task = _task(
+        "transfer-not-recorded",
+        calls,
+        slots=[3],
+        generations=[0],
+        source_lens=[1],
+        ring_slot=0,
+    )
+    task.valid, task.planning = False, True
+    task.selection_event = _FakeEvent("selection", calls)
+    coordinator._oasiskv_ring = [[task]]
+    coordinator._drain_oasiskv_tasks_for_request(3)
+    assert calls == [("synchronize", "selection")]
+    assert not task.valid and not task.planning
+
+
+def test_consumed_transfer_is_still_drained_before_host_memory_reclamation():
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+    calls = []
+    coordinator = object.__new__(HiSparseCoordinator)
+    coordinator.prefetcher = SimpleNamespace(stats=HiSparsePrefetchStats())
+    task = _task(
+        "consumed-transfer",
+        calls,
+        slots=[3],
+        generations=[0],
+        source_lens=[1],
+        ring_slot=0,
+    )
+    # consume() enqueues a GPU wait; it does not prove host memory can be freed
+    # immediately on the CPU while that wait is still pending.
+    task.valid = False
+    task.pending_event = task.event
+    coordinator._oasiskv_ring = [[task]]
+    coordinator._drain_oasiskv_tasks_for_request(3)
+    assert calls == [("synchronize", "consumed-transfer")]
+    assert task.pending_event is None
+
+
+def test_coordinator_separates_read_only_selection_from_transfer(monkeypatch):
+    from contextlib import contextmanager
+
+    import sglang.srt.managers.hisparse_coordinator as module
+
+    calls = []
+    current = ["main"]
+
+    class Stream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_stream(self, source):
+            calls.append(("wait_stream", self.name, source))
+
+    class Event:
+        def __init__(self, name):
+            self.name = name
+            self.recorded = False
+
+        def record(self, stream):
+            assert current[0] == stream.name
+            self.recorded = True
+            calls.append(("record", self.name, stream.name))
+
+        def wait(self, stream):
+            assert self.recorded
+            calls.append(("wait_event", stream.name, self.name))
+
+    @contextmanager
+    def context(stream):
+        old, current[0] = current[0], stream.name
+        try:
+            yield
+        finally:
+            current[0] = old
+
+    monkeypatch.setattr(module.device_module, "current_stream", lambda: current[0])
+    monkeypatch.setattr(module.device_module, "stream", context)
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda *args: None)
+    coordinator = object.__new__(module.HiSparseCoordinator)
+    coordinator.prefetcher_name = "oasiskv"
+    coordinator.prefetcher = SimpleNamespace(
+        logical_entries=2, stats=HiSparsePrefetchStats(), select=lambda x: x
+    )
+    coordinator._prefetch_generation = torch.tensor([0, 0, 3])
+    coordinator._oasiskv_select_stream = Stream("select")
+    coordinator._previous_prefetch_stream = Stream("transfer")
+    coordinator.device_buffer_size = 2
+    coordinator.req_device_buffer_tokens = torch.tensor(
+        [[[0, 1, 5]] * 3], dtype=torch.int32
+    )
+    coordinator.lru_slots = torch.tensor([[[0, 1]] * 3], dtype=torch.int16)
+    coordinator.mem_pool_host = SimpleNamespace(kv_buffer=[object()])
+    coordinator.mem_pool_device = SimpleNamespace(kv_buffer=[object()])
+    coordinator.item_size_bytes = 32
+    coordinator.is_dsv4_hisparse, coordinator.skip_io = True, False
+    coordinator.num_real_reqs = torch.tensor([1], dtype=torch.int32)
+    task = _task("unused", [], slots=[], generations=[], source_lens=[], ring_slot=0)
+    task.valid = False
+    task.predicted_entries = torch.empty((3, 2), dtype=torch.int32)
+    task.planned_tokens = torch.empty((3, 2), dtype=torch.int32)
+    task.planned_lru = torch.empty((3, 2), dtype=torch.int16)
+    task.miss_src = torch.empty((3, 2), dtype=torch.int64)
+    task.miss_dst = torch.empty((3, 2), dtype=torch.int32)
+    task.miss_count = torch.empty(3, dtype=torch.int32)
+    task.real_reqs = torch.zeros(1, dtype=torch.int32)
+    task.selection_event, task.event = Event("selected"), Event("transferred")
+    coordinator._oasiskv_ring, coordinator._oasiskv_next_slot = [[task]], [0]
+    before = coordinator.req_device_buffer_tokens.clone()
+
+    def plan_kernel(req_indices, seq_lens, predicted, layer_id, **kwargs):
+        assert current[0] == "select" and kwargs["skip_io"]
+        assert kwargs["num_real_reqs"] is task.real_reqs
+        assert req_indices.tolist() == [2]
+        tokens, lru = kwargs["planned_metadata"]
+        tokens.copy_(torch.tensor([[1, 4]]))
+        lru.copy_(torch.tensor([[1, 0]]))
+        task.miss_count[0] = 1
+        calls.append(("select_kernel",))
+
+    def transfer_kernel(**kwargs):
+        assert current[0] == "transfer"
+        assert kwargs["num_real_reqs"].tolist() == [1]
+        torch.testing.assert_close(coordinator.req_device_buffer_tokens, before)
+        calls.append(("transfer_kernel",))
+
+    coordinator._run_swap_in_kernel = plan_kernel
+    monkeypatch.setattr(module, "copy_cache_planned_mla", transfer_kernel)
+    kwargs = dict(
+        req_pool_indices=torch.tensor([2]),
+        req_pool_indices_cpu=torch.tensor([2]),
+        compressed_seq_lens=torch.tensor([6]),
+        source_committed_lens_cpu=torch.tensor([24]),
+        predicted_c4_entries=torch.tensor([[1, 4]], dtype=torch.int32),
+        layer_id=0,
+    )
+    assert coordinator.plan_oasiskv_prefetch(**kwargs) is task
+    torch.testing.assert_close(coordinator.req_device_buffer_tokens, before)
+    assert task.planning and not task.valid
+    calls.append(("attention",))
+    coordinator.num_real_reqs.zero_()  # a later scheduler batch cannot change this task
+    coordinator.submit_oasiskv_prefetch(**kwargs, task=task)
+    assert coordinator.req_device_buffer_tokens[0, 2].tolist() == [1, 4, 5]
+    torch.testing.assert_close(
+        coordinator.req_device_buffer_tokens[0, :2], before[0, :2]
+    )
+    assert coordinator.lru_slots[0, 2].tolist() == [1, 0]
+    assert task.valid and not task.planning
+    assert calls == [
+        ("wait_stream", "select", "main"),
+        ("select_kernel",),
+        ("record", "selected", "select"),
+        ("attention",),
+        ("wait_event", "transfer", "selected"),
+        ("wait_stream", "transfer", "main"),
+        ("transfer_kernel",),
+        ("record", "transferred", "transfer"),
+    ]

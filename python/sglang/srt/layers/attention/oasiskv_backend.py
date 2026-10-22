@@ -1,8 +1,9 @@
 """Eager OasisKV backend for MHA, GQA, absorbed MLA and native DSA.
 
-Native DSA delegates only Indexer metadata to SGLang's DSA backend. Its real
-logical Top-K becomes the lookahead signal; all models share host ownership,
-bounded working sets and the three-stream prefetch pipeline.
+Native DSA delegates Indexer metadata to SGLang's DSA backend. Real logical
+Top-K drives demand refill; draft logical Top-K drives lookahead prefetch.
+All models share host ownership, bounded working sets, foreground prediction
+and attention, and background selection/transfer streams.
 """
 
 from dataclasses import replace
@@ -162,9 +163,9 @@ class OasisKVAttnBackend(AttentionBackend):
                 # Q/K already include RoPE (and MLA absorption). append() has
                 # updated this step's committed summaries, including a block
                 # completed by the real token. Prediction needs no attention
-                # output and can start before even the cold-start seed.
+                # output. Both real and draft selection run on the main stream.
                 candidates = state.predict_prefetch(q[start + 1], draft_topk)
-                state.seed(q[start], root_topk)
+                state.prepare_attention(q[start], root_topk)
                 plan = state.plan_prefetch(candidates)
                 output[start:end] = state.attend(
                     q[start:end],
@@ -180,7 +181,7 @@ class OasisKVAttnBackend(AttentionBackend):
                 state.append(keys, values, prefix)
                 if forward_batch.forward_mode.is_decode():
                     selection = None if topk_indices is None else topk_indices[start]
-                    state.seed(q[start], selection)
+                    state.prepare_attention(q[start], selection)
                     output[start:end] = state.attend(
                         q[start:end], layer.scaling, logit_cap=layer.logit_cap
                     )
