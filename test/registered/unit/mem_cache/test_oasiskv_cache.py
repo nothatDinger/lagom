@@ -111,6 +111,48 @@ def test_native_dsa_prefetch_uses_draft_indices_not_root_selection():
     torch.testing.assert_close(state.data[0, 0, 0, :4], key[5, 0])
 
 
+def test_early_prediction_and_plan_preserve_current_working_set():
+    cfg = OasisKVConfig(token_budget=1, block_size=1, native_sparse=True)
+    state = OasisKVLayerCache(
+        cfg, 1, 4, 3, torch.float32, "cpu", OasisKVPipeline("cpu")
+    )
+    torch.manual_seed(17)
+    key, value, query = torch.randn(4, 1, 4), torch.randn(4, 1, 3), torch.randn(2, 2, 4)
+    state.append(key[:3], value[:3], 0)
+    # Prediction can precede cold-start seeding; selection must see its result.
+    candidates = state.predict_prefetch(query[1], torch.tensor([1]))
+    state.seed(query[0], torch.tensor([0]))
+    before = (state.resident.clone(), state.ages.clone(), state.data.clone())
+    plan = state.plan_prefetch(candidates)
+    assert plan.block_ids.tolist() == [[1]]
+    for actual, expected in zip((state.resident, state.ages, state.data), before):
+        torch.testing.assert_close(actual, expected)
+    out = state.attend(query, 0.5, draft_key=key[3], draft_value=value[3])
+    expected = dense(query, key[[0, 2, 3]], value[[0, 2, 3]], 0.5, prefix=1)
+    torch.testing.assert_close(out, expected)
+    state.submit_prefetch(plan)
+    assert state.resident.tolist() == [[1]]
+    torch.testing.assert_close(state.data[0, 0, 0, :4], key[1, 0])
+
+
+def test_early_prediction_includes_block_completed_by_real_token():
+    cfg = OasisKVConfig(token_budget=2, block_size=2)
+    state = OasisKVLayerCache(
+        cfg, 1, 1, 1, torch.float32, "cpu", OasisKVPipeline("cpu")
+    )
+    key = torch.tensor([1.0, 1.0, -1.0, 10.0]).view(4, 1, 1)
+    state.append(key[:3], key[:3], 0)
+    state.append(key[3:], key[3:], 3)
+    # The root closes block 1. Its new maximum must be visible to prediction.
+    candidates = state.predict_prefetch(torch.ones(1, 1))
+    assert candidates.tolist() == [[1]]
+    state.seed(torch.ones(1, 1))
+    assert state.resident.tolist() == [[0]]
+    plan = state.plan_prefetch(candidates)
+    assert plan.block_ids.tolist() == [[1]]
+    assert state.resident.tolist() == [[0]]
+
+
 def test_native_dsa_prefill_padding_does_not_erase_token_zero():
     cfg = OasisKVConfig(token_budget=2, block_size=1, native_sparse=True)
     state = OasisKVLayerCache(
@@ -187,3 +229,28 @@ def test_cuda_pipeline_copies_only_selected_block_heads(kdim, vdim, dtype):
                     state.data[h, slot, :, kdim : kdim + vdim],
                     value[block * 2 : block * 2 + 2, h],
                 )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires CUDA UVA copy kernel"
+)
+def test_cuda_early_prefetch_waits_for_current_attention_reads():
+    cfg = OasisKVConfig(token_budget=1, block_size=1, native_sparse=True)
+    state = OasisKVLayerCache(
+        cfg, 1, 4, 4, torch.float32, "cuda", OasisKVPipeline("cuda")
+    )
+    key = torch.zeros(3, 1, 4, device="cuda")
+    value = torch.tensor([2.0, 20.0, 4.0], device="cuda")[:, None, None].expand(3, 1, 4)
+    query = torch.zeros(1, 1, 4, device="cuda")
+    state.append(key, value, 0)
+    candidates = state.predict_prefetch(query[0], torch.tensor([1], device="cuda"))
+    state.seed(query[0], torch.tensor([0], device="cuda"))
+    plan = state.plan_prefetch(candidates)
+    # Leave the early plan ready while foreground KV reads are still queued.
+    # Without the read-completion dependency, transfer overwrites value 2 by 20.
+    torch.cuda._sleep(50_000_000)
+    output = state.attend(query, 0.5)
+    state.submit_prefetch(plan)
+    state.join(reclaim=True)
+    torch.testing.assert_close(output, torch.full_like(output, 3.0))
+    torch.testing.assert_close(state.data[0, 0, 0, 4:8], value[1, 0])

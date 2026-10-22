@@ -103,6 +103,8 @@ class OasisKVLayerCache:
         self.capacity = 0
         self.host = None
         self.key_min = self.key_max = None
+        self.prediction_done = None
+        self.selection_done = None
         self.pending = None
         self.backup_done = None
         self.initialized = False
@@ -118,13 +120,21 @@ class OasisKVLayerCache:
         self.prefetch_submissions = 0
 
     def join(self, *, reclaim=False):
-        for event in (self.pending, self.backup_done):
+        # A forward may fail after prediction/selection but before transfer.
+        # Reclamation and later summary writes must also join those readers.
+        for event in (
+            self.prediction_done,
+            self.selection_done,
+            self.pending,
+            self.backup_done,
+        ):
             if event is not None:
                 if reclaim:
                     event.synchronize()
                 else:
                     torch.cuda.current_stream(self.device).wait_event(event)
         if reclaim:
+            self.prediction_done = self.selection_done = None
             self.pending = self.backup_done = None
         elif self.pipeline.cuda:
             self.resident.record_stream(torch.cuda.current_stream(self.device))
@@ -260,19 +270,40 @@ class OasisKVLayerCache:
         self.resident, self.ages = plan.block_ids, plan.last_selected
         self.initialized = True
 
-    def prefetch(self, draft_query, explicit=None):
-        """Enqueue next-step prediction, capped delta selection, and host gather."""
-        self.step += 1
+    def predict_prefetch(self, draft_query, explicit=None):
+        """Submit prediction once projected queries and committed summaries exist.
+
+        This stage does not read or change the resident working set, so it can
+        overlap both cold-start seeding and the current paired attention.
+        """
         pipeline = self.pipeline
         if pipeline.cuda:
             pipeline.predict.wait_stream(torch.cuda.current_stream(self.device))
             draft_query.record_stream(pipeline.predict)
             if explicit is not None:
                 explicit.record_stream(pipeline.predict)
+            elif self.key_min is not None:
+                self.key_min.record_stream(pipeline.predict)
+                self.key_max.record_stream(pipeline.predict)
         with pipeline.context("predict"):
             candidates = self.candidates(draft_query, explicit, next_step=True)
+            if pipeline.cuda:
+                self.prediction_done = torch.cuda.Event()
+                self.prediction_done.record(pipeline.predict)
+        return candidates
+
+    def plan_prefetch(self, candidates):
+        """Plan the next working set without publishing it to current attention.
+
+        Call after seed(): the first plan must observe the real query's initial
+        resident set. All updates in plan_delta allocate new metadata tensors.
+        """
+        self.step += 1
+        pipeline = self.pipeline
         if pipeline.cuda:
-            pipeline.select.wait_stream(pipeline.predict)
+            pipeline.select.wait_event(self.prediction_done)
+            # Observe cold-start seed writes, but do not wait for attention.
+            pipeline.select.wait_stream(torch.cuda.current_stream(self.device))
             candidates.record_stream(pipeline.select)
             self.resident.record_stream(pipeline.select)
             self.ages.record_stream(pipeline.select)
@@ -284,9 +315,19 @@ class OasisKVLayerCache:
                 self.step,
                 self.config.max_new_blocks,
             )
-            self.resident, self.ages = plan.block_ids, plan.last_selected
+            if pipeline.cuda:
+                self.selection_done = torch.cuda.Event()
+                self.selection_done.record(pipeline.select)
+        return plan
+
+    def submit_prefetch(self, plan):
+        """After current attention's reads, submit the planned KV overwrites."""
+        pipeline = self.pipeline
         if pipeline.cuda:
-            pipeline.transfer.wait_stream(pipeline.select)
+            pipeline.transfer.wait_event(self.selection_done)
+            # Prediction and selection may finish before current attention.
+            # Only the writer must wait until that attention has read data.
+            pipeline.transfer.wait_stream(torch.cuda.current_stream(self.device))
             for tensor in (plan.sources, plan.destinations, plan.counts):
                 tensor.record_stream(pipeline.transfer)
         with pipeline.context("transfer"):
@@ -294,7 +335,15 @@ class OasisKVLayerCache:
             if pipeline.cuda:
                 self.pending = torch.cuda.Event()
                 self.pending.record(pipeline.transfer)
+        # Keep current-round logical IDs unchanged until attention is enqueued.
+        # The next append/attention joins pending before using these new IDs.
+        self.resident, self.ages = plan.block_ids, plan.last_selected
         self.prefetch_submissions += 1
+
+    def prefetch(self, draft_query, explicit=None):
+        """Convenience path for callers whose current attention is already done."""
+        candidates = self.predict_prefetch(draft_query, explicit)
+        self.submit_prefetch(self.plan_prefetch(candidates))
 
     def attend(self, query, scale, *, draft_key=None, draft_value=None, logit_cap=0):
         """Both queries see the same resident history; only draft sees draft KV."""

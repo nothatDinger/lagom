@@ -159,7 +159,13 @@ class OasisKVAttnBackend(AttentionBackend):
                 state.append(keys[:1], values[:1], prefix)
                 root_topk = None if topk_indices is None else topk_indices[start]
                 draft_topk = None if topk_indices is None else topk_indices[start + 1]
+                # Q/K already include RoPE (and MLA absorption). append() has
+                # updated this step's committed summaries, including a block
+                # completed by the real token. Prediction needs no attention
+                # output and can start before even the cold-start seed.
+                candidates = state.predict_prefetch(q[start + 1], draft_topk)
                 state.seed(q[start], root_topk)
+                plan = state.plan_prefetch(candidates)
                 output[start:end] = state.attend(
                     q[start:end],
                     layer.scaling,
@@ -167,7 +173,9 @@ class OasisKVAttnBackend(AttentionBackend):
                     draft_value=values[1],
                     logit_cap=layer.logit_cap,
                 )
-                state.prefetch(q[start + 1], draft_topk)
+                # Publish the new mapping and overwrite slots only after the
+                # current pair has finished reading the old working set.
+                state.submit_prefetch(plan)
             else:
                 state.append(keys, values, prefix)
                 if forward_batch.forward_mode.is_decode():
