@@ -324,10 +324,14 @@ class ReqToTokenPool:
 
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
+        if hasattr(self, "oasiskv_cache"):
+            self.oasiskv_cache.release(req.req_pool_idx)
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
 
     def clear(self):
+        if hasattr(self, "oasiskv_cache"):
+            self.oasiskv_cache.clear()
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation.zero_()
 

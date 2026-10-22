@@ -957,6 +957,52 @@ class KVCacheConfigurator:
         # selected by swapping in the PageMajorMHATokenToKVPool subclass. The
         # default keeps upstream's per-layer layout. The Mamba state pool is routed
         # separately via `mamba_envelope_layout` on the req-to-token pool above.
+        from sglang.srt.mem_cache.oasiskv_config import (
+            OasisKVConfig,
+            uses_oasiskv_backend,
+        )
+
+        if uses_oasiskv_backend(self.server_args) and not self.is_draft_worker:
+            if is_dsv4_model or self.is_hybrid_swa or self.mambaish_config:
+                raise ValueError(
+                    "Use the specialized HiSparse OasisKV path for DeepSeek-V4; "
+                    "the generic backend supports full-attention MHA/GQA/MLA/DSA"
+                )
+            if self.kv_cache_dtype not in (
+                torch.float16,
+                torch.bfloat16,
+                torch.float32,
+            ):
+                raise ValueError(
+                    "Generic OasisKV requires fp16/bf16 (float32 for reference tests)"
+                )
+            from sglang.srt.mem_cache.oasiskv_pool import OasisKVTokenToKVPool
+
+            config = OasisKVConfig.from_json(
+                self.server_args.hisparse_config,
+                native_sparse=is_dsa_model,
+                native_top_k=getattr(
+                    self.model_config.hf_text_config, "index_topk", None
+                ),
+            )
+            if is_dsa_model:
+                pool = self._build_dsa_kv_pool(
+                    max_total_num_tokens=sizes.max_total_num_tokens
+                )
+            else:
+                pool = OasisKVTokenToKVPool(
+                    sizes.max_total_num_tokens,
+                    self.pool_page_size,
+                    self.kv_cache_dtype,
+                    self.layer_info.num_effective_layers,
+                    self.device,
+                    get_exec().features.enable_memory_saver,
+                    self.layer_info.start_layer,
+                    self.layer_info.end_layer,
+                )
+            pool.init_oasiskv(config, req_to_token_pool)
+            return pool
+
         enable_page_major = get_memory().enable_page_major_kv_layout
         if self.is_draft_worker and get_memory().enable_unified_memory:
             # Page-major is a target-pool layout choice; the draft backend
@@ -1312,7 +1358,13 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
-        if get_memory().enable_hisparse and not self.is_draft_worker:
+        from sglang.srt.mem_cache.oasiskv_config import uses_oasiskv_backend
+
+        if uses_oasiskv_backend(self.server_args) and not self.is_draft_worker:
+            from sglang.srt.mem_cache.oasiskv_pool import OasisKVDSATokenToKVPool
+
+            PoolCls = OasisKVDSATokenToKVPool
+        elif get_memory().enable_hisparse and not self.is_draft_worker:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 

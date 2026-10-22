@@ -268,6 +268,7 @@ def resolve_draft_attention_backend(
     draft_attention_backend: Optional[str],
     server_args: ServerArgs,
     is_draft_worker: bool,
+    model_config: Optional[ModelConfig] = None,
 ) -> Optional[str]:
     """The attention backend a runner uses because it is a draft runner.
 
@@ -278,7 +279,16 @@ def resolve_draft_attention_backend(
     """
     if not is_draft_worker:
         return None
-    return draft_attention_backend or server_args.speculative_draft_attention_backend
+    backend = draft_attention_backend or server_args.speculative_draft_attention_backend
+    if backend == "oasiskv":
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+
+        if model_config is None:
+            raise ValueError(
+                "OasisKV draft backend resolution requires its model config"
+            )
+        return "dsa" if is_deepseek_dsa(model_config.hf_config) else "triton"
+    return backend
 
 
 class ModelRunner:
@@ -323,6 +333,7 @@ class ModelRunner:
             draft_attention_backend=draft_attention_backend,
             server_args=server_args,
             is_draft_worker=is_draft_worker,
+            model_config=model_config,
         )
         # This runner's own load format, resolved before anything keys off it:
         # the remote-instance transfer engine is initialized at the top of
@@ -1514,6 +1525,8 @@ class ModelRunner:
 
     def prepare_dummy_forward_batch(self, forward_batch: ForwardBatch) -> ForwardBatch:
         """Customize a runner-created dummy batch before attention metadata initialization."""
+        if self.server_args.attention_backend == "oasiskv" and not self.is_draft_worker:
+            forward_batch.is_oasiskv_dummy = True
         return forward_batch
 
     def _prepare_eager_forward_batch(self, forward_batch: ForwardBatch) -> None:

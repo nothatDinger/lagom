@@ -159,6 +159,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = kvc.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
+        target_dense_cell_size = self._cell_size
+        self._oasiskv_reserved_bytes = 0
         has_kv_on_another_pp_stage = (
             self._cell_size == 0
             and mambaish is not None
@@ -231,6 +233,67 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * get_parallel().attn_dcp_size,
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
+
+        from sglang.srt.mem_cache.oasiskv_config import (
+            OasisKVConfig,
+            uses_oasiskv_backend,
+        )
+
+        if uses_oasiskv_backend(kvc.server_args) and not kvc.is_draft_worker:
+            native = is_deepseek_dsa(kvc.model_config.hf_config)
+            config = OasisKVConfig.from_json(
+                kvc.server_args.hisparse_config,
+                native_sparse=native,
+                native_top_k=getattr(
+                    kvc.model_config.hf_text_config, "index_topk", None
+                ),
+            )
+            if kvc.use_mla_backend:
+                heads = 1
+                key_dim = (
+                    kvc.model_config.kv_lora_rank + kvc.model_config.qk_rope_head_dim
+                )
+                value_dim = kvc.model_config.kv_lora_rank
+            else:
+                heads = kvc.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+                key_dim = kvc.model_config.head_dim
+                value_dim = getattr(kvc.model_config, "v_head_dim", None) or key_dim
+            element_bytes = torch._utils._element_size(kvc.kv_cache_dtype)
+            entry_bytes = heads * (
+                ((key_dim + value_dim) * element_bytes + 15) // 16 * 16
+            )
+            index_bytes = (
+                self._compute_dsa_indexer_cell_size(kvc=kvc, num_layers=num_layers)
+                if native
+                else 0
+            )
+            # Summary capacities can round up while growing. Preserve the draft
+            # model's dense KV accounting instead of shrinking it with the target.
+            summary_bytes = (
+                0
+                if native
+                else (16 * heads * key_dim * num_layers + config.block_size - 1)
+                // config.block_size
+            )
+            self._cell_size = (
+                self._cell_size - target_dense_cell_size + index_bytes + summary_bytes
+            )
+            requests = kvc.server_args.max_running_requests or 32
+            q_heads = (
+                kvc.model_config.num_attention_heads // get_parallel().attn_tp_size
+            )
+            self._oasiskv_reserved_bytes = (
+                requests
+                * (config.token_budget + config.block_size)
+                * entry_bytes
+                * num_layers
+                + requests * config.history_blocks * heads * 16 * num_layers
+                + requests * 4 * heads * key_dim * 8 * num_layers
+                # One layer's transient dense prefill and bounded query masks.
+                + kvc.model_config.context_len
+                * (entry_bytes + config.prefill_chunk_size * (8 * q_heads + 2))
+                + heads * config.history_blocks**2 * 4
+            )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
@@ -415,6 +478,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        available_bytes = max(0, available_bytes - self._oasiskv_reserved_bytes)
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size

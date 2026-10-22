@@ -152,13 +152,62 @@ def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
     scratch allocation.  Its verify forward is replaced by root-only OasisKV
     sampling, so no draft token can be accepted.
     """
+    generic = getattr(server_args, "attention_backend", None) == "oasiskv"
+    if not generic and any(
+        getattr(server_args, name, None) == "oasiskv"
+        for name in ("prefill_attention_backend", "decode_attention_backend")
+    ):
+        raise ValueError(
+            "Select OasisKV with --attention-backend oasiskv for both phases"
+        )
     try:
         config = json.loads(server_args.hisparse_config or "{}")
     except json.JSONDecodeError:
+        if generic:
+            raise ValueError(
+                "OasisKV --hisparse-config must contain a JSON object"
+            ) from None
         return  # the canonical HiSparse parser emits the detailed error later
-    if str(config.get("prefetcher", "")).lower() != "oasiskv":
+    if not isinstance(config, dict):
+        if generic:
+            raise ValueError("OasisKV --hisparse-config must contain a JSON object")
         return
-    if not server_args.enable_hisparse:
+    if str(config.get("prefetcher", "")).lower() != "oasiskv" and not generic:
+        return
+    if generic:
+        if server_args.enable_hisparse:
+            raise ValueError(
+                "The generic OasisKV backend owns its cache; omit --enable-hisparse"
+            )
+        if not server_args.disable_radix_cache:
+            raise ValueError("OasisKV requires --disable-radix-cache")
+        if server_args.pp_size != 1:
+            raise ValueError("OasisKV currently requires --pp-size=1")
+        for name in ("prefill_attention_backend", "decode_attention_backend"):
+            if getattr(server_args, name, None) not in (None, "oasiskv"):
+                raise ValueError("OasisKV must own both prefill and decode attention")
+        if (
+            getattr(server_args, "attn_cp_size", 1) != 1
+            or getattr(server_args, "attn_dcp_size", 1) != 1
+            or getattr(server_args, "enable_prefill_cp", False)
+            or getattr(server_args, "enable_two_batch_overlap", False)
+            or getattr(server_args, "enable_torch_compile", False)
+            or getattr(server_args, "enable_dsa_cache_layer_split", False)
+            or getattr(server_args, "enable_unified_memory", False)
+            or getattr(server_args, "disaggregation_mode", "null") != "null"
+        ):
+            raise ValueError(
+                "Generic OasisKV requires eager attention without context "
+                "parallelism, layer sharding, unified KV pools, two-batch overlap, or PD disaggregation"
+            )
+        # Native DSA defaults to FP8 on some GPUs, but this pool stores the
+        # unquantized latent K/V delivered by the absorbed attention path.
+        if getattr(server_args, "kv_cache_dtype", "auto") == "auto":
+            server_args.kv_cache_dtype = "bfloat16"
+        server_args.disable_cuda_graph = True
+        if server_args.max_running_requests is None:
+            server_args.max_running_requests = 32
+    if not server_args.enable_hisparse and not generic:
         raise ValueError('HiSparse prefetcher "oasiskv" requires --enable-hisparse.')
     if not server_args.speculative_draft_model_path:
         raise ValueError(
@@ -199,11 +248,13 @@ def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
     # one TP rank, causing the remaining peers to report ncclRemoteError.
     # Force the ordinary TP all-reduce path instead of relying on the
     # workspace's per-rank exception fallback.
-    server_args.enforce_disable_flashinfer_allreduce_fusion = True
+    if not generic:
+        server_args.enforce_disable_flashinfer_allreduce_fusion = True
     server_args.is_oasiskv_lookahead = True
     logger.info(
         "OasisKV LOOKAHEAD_ONLY enabled: EAGLE-3 steps=1 topk=1; "
-        "draft acceptance/rejection disabled; target and draft graphs enabled"
+        "only root tokens are committed; %s",
+        "generic eager execution" if generic else "target and draft graphs enabled",
     )
 
 

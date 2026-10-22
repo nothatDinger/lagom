@@ -179,6 +179,7 @@ QUANTIZATION_CHOICES = [
 ]
 
 ATTENTION_BACKEND_CHOICES = [
+    "oasiskv",
     # Common
     "triton",
     "torch_native",
@@ -5967,6 +5968,10 @@ class ServerArgs:
 
         # Torch native and flex attention backends
         attention_backend = resolved_view(self).attention_backend
+        if attention_backend == "oasiskv":
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+
         if attention_backend == "torch_native":
             logger.warning(
                 "Cuda graph is disabled because of using torch native attention backend"

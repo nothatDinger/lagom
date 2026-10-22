@@ -116,12 +116,12 @@ Pass as a JSON string via `--hisparse-config`:
     <tr>
       <td><code>prefetcher</code></td>
       <td>string / unset</td>
-      <td>Optional HiSparse prefetch algorithm. When unset, preserves the existing model-specific automatic behavior. Currently supports <code>previous</code>.</td>
+      <td>Optional HiSparse prefetch algorithm. When unset, preserves the existing model-specific automatic behavior. Supports <code>previous</code> and the DeepSeek-V4 <code>oasiskv</code> lookahead mode.</td>
     </tr>
     <tr>
       <td><code>prefetcher_config</code></td>
       <td>object / <code>{"{}"}</code></td>
-      <td>Optional algorithm-specific configuration. For <code>previous</code>, supports token-coverage <code>size</code>.</td>
+      <td>Optional algorithm-specific configuration. For <code>previous</code> and <code>oasiskv</code>, <code>size</code> counts logical KV entries.</td>
     </tr>
   </tbody>
 </table>
@@ -144,15 +144,17 @@ Use the previous sparse layer's highest-score positions to prefetch the next spa
 --hisparse-config='{"top_k":2048,"device_buffer_size":6144,"host_to_device_ratio":10,"swap_in_block_size":960,"prefetcher":"previous"}'
 ```
 
-Or set the original-token coverage explicitly:
+Or set the logical-entry count explicitly:
 
 ```bash
 --hisparse-config='{"top_k":2048,"device_buffer_size":6144,"host_to_device_ratio":10,"swap_in_block_size":960,"prefetcher":"previous","prefetcher_config":{"size":2048}}'
 ```
 
-The configured Indexer backend continues to produce the formal attention Top-k exactly as it does without this prefetcher. A separate candidate selection reuses the already-computed Indexer scores and chooses the requested number of highest-score positions only for warming the next sparse layer; it does not recompute the Indexer query or scores. Candidate positions never substitute for either layer's formal Top-k: the next Indexer still runs normally, matching positions become resident hits, and all other real misses retain the normal host-to-device path. If `size` is omitted, it defaults to the runtime `effective_top_k` coverage.
+The configured Indexer backend continues to produce the formal attention Top-k exactly as it does without this prefetcher. A separate candidate selection reuses the already-computed Indexer scores and chooses the requested number of highest-score positions only for warming the next sparse layer; it does not recompute the Indexer query or scores. Candidate positions never substitute for either layer's formal Top-k: the next Indexer still runs normally, matching positions become resident hits, and all other real misses retain the normal host-to-device path. If `size` is omitted, it defaults to the runtime `effective_top_k` entry count.
 
-For ordinary DSA, one logical KV entry covers one token. For DeepSeek-V4-Flash C4, one compressed KV entry covers four original tokens, so `size=2048` selects 512 compressed prefetch candidates. Values not divisible by four round up so the requested token coverage is not reduced. For example, with DeepSeek-V4-Flash attention K=512 compressed entries, `size=4096` independently selects 1024 prefetch candidates while the configured backend's formal Top-512 remains unchanged. The requested logical-entry count cannot exceed `device_buffer_size`. Candidate sizes different from K are currently supported by the DeepSeek-V4 C4 path; generic DSA currently requires `size` to equal K.
+For ordinary DSA, one logical KV entry covers one token. For DeepSeek-V4 C4, one entry covers four original tokens: `size=512` selects 512 C4 candidates, covering 2048 original tokens. With attention K=512, `size=1024` selects 1024 prefetch candidates while the formal Top-512 remains unchanged. The entry count cannot exceed `device_buffer_size`. Candidate sizes different from K are supported by the DeepSeek-V4 C4 path; generic DSA's previous-layer prefetcher requires `size` to equal K.
+
+For the restored lookahead-only mode and the generic MHA/GQA/MLA/DSA backend, see [OasisKV reproduction](/docs/advanced_features/oasiskv).
 
 When no `prefetcher` is specified, existing behavior is unchanged: eligible GLM-5.2 shared-index layers use automatic cross-layer prefetch, while DeepSeek-V4 does not prefetch. Legacy shared-index prefetch has priority over `previous`; the two modes never operate on the same device buffer concurrently. `SGLANG_DISABLE_HISPARSE_PREFETCH=1` disables both modes.
 

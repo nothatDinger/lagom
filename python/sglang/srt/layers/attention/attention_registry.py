@@ -494,3 +494,14 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("oasiskv")
+def create_oasiskv_backend(runner):
+    if runner.is_draft_worker:
+        raise ValueError(
+            "Resolve the OasisKV draft's native backend before constructing attention"
+        )
+    from sglang.srt.layers.attention.oasiskv_backend import OasisKVAttnBackend
+
+    return OasisKVAttnBackend(runner)

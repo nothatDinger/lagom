@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
 
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
+    "oasiskv",
     "fa3",
     "fa4",
     "dsa",

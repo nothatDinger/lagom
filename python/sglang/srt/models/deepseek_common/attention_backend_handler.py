@@ -245,3 +245,6 @@ AttentionBackendRegistry.register(
 )  # Deprecated alias; use "dsa"
 AttentionBackendRegistry.register("triton", handle_attention_triton)
 AttentionBackendRegistry.register("intel_xpu", handle_attention_intel_xpu)
+
+
+AttentionBackendRegistry.register("oasiskv", lambda attn, batch: AttnForwardMethod.MLA)

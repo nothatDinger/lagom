@@ -168,6 +168,29 @@ class TestDraftPerRunnerConfig(CustomTestCase):
         )
         self.assertEqual((target.prefill, target.decode), ("flashinfer", "fa3"))
 
+    def test_oasiskv_resolves_against_the_draft_architecture(self):
+        server_args = self._seed(attention_backend="oasiskv")
+        for arch, index_topk, expected in (
+            ("LlamaForCausalLM", None, "triton"),
+            ("DeepseekV3ForCausalLM", None, "triton"),
+            ("DeepseekV3ForCausalLMNextN", 2048, "dsa"),
+        ):
+            model_config = SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=[arch],
+                    index_topk=index_topk,
+                )
+            )
+            self.assertEqual(
+                resolve_draft_attention_backend(
+                    draft_attention_backend="oasiskv",
+                    server_args=server_args,
+                    is_draft_worker=True,
+                    model_config=model_config,
+                ),
+                expected,
+            )
+
     # -- the scheduler hands over the process's own config ---------------------
 
     def _scheduler(self, server_args, create_worker):

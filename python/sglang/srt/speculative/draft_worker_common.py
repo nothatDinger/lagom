@@ -48,6 +48,10 @@ def _resolve_draft_attention_backend_fallback(
         draft_backend, _ = server_args.get_attention_backends()
     if draft_backend is None:
         return "triton" if torch.version.hip else "flashinfer"
+    if draft_backend == "oasiskv":
+        # Resolve against the draft's actual architecture in ModelRunner.
+        # MHA/MLA drafts use Triton; native DSA drafts need indexer metadata.
+        return draft_backend
     if draft_backend not in _SUPPORTED_DRAFT_BACKENDS:
         fallback = "triton" if torch.version.hip else "flashinfer"
         logger.warning(
@@ -109,7 +113,7 @@ def build_draft_tp_worker(
         draft_worker=draft_worker,
         draft_model_runner=draft_model_runner,
         draft_model=draft_model_runner.model,
-        resolved_attention_backend=draft_backend,
+        resolved_attention_backend=draft_model_runner.draft_attention_backend,
     )
 
 
