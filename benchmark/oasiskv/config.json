@@ -25,13 +25,13 @@
   "models": {
     "qwen3-8b": {
       "path": "/mnt/public_data/Qwen/Qwen3-8B",
-      "draft": "Tengyunw/qwen3_8b_eagle3",
+      "draft": "/mnt/public_data/Qwen3-8B_eagle3",
       "tp": 1,
       "cuda_visible_devices": "0"
     },
     "qwen3-235b-a22b": {
       "path": "/mnt/public_data/Qwen/Qwen3-235B-A22B",
-      "draft": "nvidia/Qwen3-235B-A22B-Eagle3",
+      "draft": "/mnt/public_data/Qwen3-235B-A22B-EAGLE3",
       "tp": 8,
       "cuda_visible_devices": "0,1,2,3,4,5,6,7"
     }

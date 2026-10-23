@@ -10,7 +10,7 @@
 | --- | --- |
 | Target | `/mnt/public_data/Qwen/Qwen3-8B`；`/mnt/public_data/Qwen/Qwen3-235B-A22B` |
 | GPU / TP | 8B：1 × H100 80GB / TP=1；235B：8 × H100 80GB / TP=8 |
-| Draft（论文所列） | `Tengyunw/qwen3_8b_eagle3`；`nvidia/Qwen3-235B-A22B-Eagle3` |
+| Draft 本地目录 | 8B：`/mnt/public_data/Qwen3-8B_eagle3`；235B：`/mnt/public_data/Qwen3-235B-A22B-EAGLE3` |
 | 输入 / 输出 | 16,384、32,768 / 2,048 token；上下文上限 40,960，留出 lookahead 空间 |
 | 最大并发 | 8、16、32、64、128、256；同时设置客户端并发与服务端 `max-running-requests` |
 | 方法 | SGLang dense FA3；本分支 OasisKV |
@@ -55,17 +55,13 @@ preflight 检查可见 H100 数量和显存，并保存 CPU、内存和 GPU 拓�
 python -m pip install -r benchmark/oasiskv/requirements.txt
 ```
 
-权重必须事先准备好。两个 target 使用上述本地路径；draft 可下载到 Hugging Face 缓存，
-或把 `config.json` 中 `draft` 改为本地目录。下载操作独立于 benchmark：
+两个 target 和 draft 均使用上表中的本地目录，已写入 `config.json`。
+论文列出的 draft 来源分别为 `Tengyunw/qwen3_8b_eagle3` 和 `nvidia/Qwen3-235B-A22B-Eagle3`，
+供核对 checkpoint 版本。
 
-```bash
-hf download Tengyunw/qwen3_8b_eagle3
-hf download nvidia/Qwen3-235B-A22B-Eagle3
-```
-
-运行前会用 `local_files_only=True` 解析已缓存 snapshot，记录解析后的路径、配置文件哈希，
-检查权重索引中所有 shard 存在；不会在计时阶段下载模型。
-正式复跑建议保存这些 snapshot 并使用固定 revision；无需重复下载数百 GB 的 target 权重。
+运行前会检查本地目录中的配置文件及权重 shard，记录解析后的路径、配置文件哈希和权重文件元数据。
+benchmark 不会下载模型；本地目录缺失时 preflight 直接报错。
+正式复跑应保留同一份 checkpoint，并记录其来源 revision。
 
 ```bash
 # 不需要 GPU、权重或数据即可检查 144 点矩阵及每点完整命令。
