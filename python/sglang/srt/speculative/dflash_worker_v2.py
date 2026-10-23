@@ -13,11 +13,13 @@ from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
 )
+from sglang.kernels.ops.speculative.dspark.dspark_accept import accept_sampling
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.managers.dhisparse_coordinator import rollback_dhisparse_on_error
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -195,6 +197,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             server_args.speculative_draft_window_size
         )
         self.use_compact_draft_cache = self.draft_window_size is not None
+        from sglang.srt.mem_cache.dhisparse import draft_ring_for
+
+        self.dhisparse_ring = draft_ring_for(server_args)
         self.device = target_worker.device
 
         self._warned_sampling_fallback = False
@@ -232,6 +237,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                     model_block_size,
                 )
         self.speculative_num_draft_tokens = int(self.block_size)
+        self.selector = getattr(self.draft_model, "candidate_selector", None)
+        self._selector_sample = None
+        self._draft_probs_buf = None
+        if self.selector is not None:
+            if self.block_size < 2:
+                raise ValueError("DFlash2 requires an anchor and at least one proposal")
+            self.draft_model.set_block_size(self.block_size)
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -379,6 +391,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def _maybe_build_draft_sampler(self):
+        if self.selector is not None:
+            # The ordinary folded greedy head does not evaluate learned transitions.
+            return None
+
         def _eager(reason):
             if self.ps.tp_rank == 0:
                 logger.info("DFLASH draft greedy head kept eager (reason=%s).", reason)
@@ -423,6 +439,89 @@ class DFlashWorkerV2(BaseSpecWorker):
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             tp_group=tp_group if tp_group.world_size > 1 else None,
         )
+
+    def _propose_selector_block(self, hidden, anchor, sampling_info, lm_head):
+        from sglang.srt.speculative.dspark_components.dspark_draft import (
+            resolve_greedy_mask,
+        )
+
+        model = self.draft_model
+        model.lm_head = lm_head
+        bs, width, dim = hidden.shape
+        hidden = hidden[:, 1:].contiguous()
+        ids, unary = model.compute_candidates(hidden.reshape(-1, dim))
+        ids = ids.view(bs, width - 1, -1)
+        unary = unary.view_as(ids)
+        scores = self.selector.build_lattice(
+            candidate_ids=ids,
+            unary_logits=unary,
+            hidden_states=hidden,
+            anchor_token_ids=anchor,
+        )
+        temperatures = (
+            torch.ones(bs, device=hidden.device)
+            if sampling_info is None
+            else sampling_info.temperatures.view(-1).float().clamp_min(1e-5)
+        )
+        uniforms = torch.rand(bs, width - 1, device=hidden.device)
+        get_tp_group().broadcast(uniforms)
+        tokens, q = self.selector.sample_path(
+            candidate_ids=ids,
+            scores=scores,
+            uniforms=uniforms,
+            temperatures=temperatures,
+            greedy_mask=resolve_greedy_mask(
+                bs=bs, sampling_info=sampling_info, device=hidden.device
+            ),
+        )
+        self._selector_sample = (
+            (ids, q)
+            if sampling_info is not None and not sampling_info.is_all_greedy
+            else None
+        )
+        return tokens
+
+    def _selector_sampling_accept(
+        self,
+        *,
+        candidates: torch.Tensor,
+        next_token_logits: torch.Tensor,
+        candidate_ids: torch.Tensor,
+        q_rows: torch.Tensor,
+        sampling_info,
+        draft_input,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Scatter the selector's sparse q into a dense one for DSpark's kernel."""
+        bs, block = candidates.shape
+        gamma = block - 1
+        vocab = int(next_token_logits.shape[-1])
+        # A fresh dense q would zero the whole vocabulary to carry top_k per row.
+        buffer = self._draft_probs_buf
+        if buffer is None or buffer.shape[0] < bs or buffer.shape[1:] != (gamma, vocab):
+            cap = bs if buffer is None else max(bs, buffer.shape[0] * 2)
+            buffer = torch.zeros(
+                (cap, gamma, vocab), dtype=torch.float32, device=candidates.device
+            )
+            self._draft_probs_buf = buffer
+        draft_probs = buffer[:bs]
+        try:
+            draft_probs.scatter_(-1, candidate_ids, q_rows.float())
+            accept_len, bonus, _ = accept_sampling(
+                candidates=candidates,
+                target_logits=next_token_logits,
+                draft_probs=draft_probs,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+                gamma=gamma,
+                verify_num_draft_tokens=block,
+                cutoff_verify_lens=None,
+            )
+        finally:
+            # Here, not before the next write: candidate_ids may be a view of a
+            # buffer the next draft step overwrites. In finally because the next
+            # call scatters different ids and reads q across the whole vocabulary.
+            draft_probs.scatter_(-1, candidate_ids, 0.0)
+        return accept_len.to(torch.int32), bonus.to(torch.int64)
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -701,6 +800,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         """Write the draft-local compact req->token rows: the committed suffix
         window at [0, draft_prefix_len) plus the verify block slots after it."""
         suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(torch.int64)
+        if self.dhisparse_ring is not None:
+            self.dhisparse_ring.rebuild(
+                self.draft_model_runner.req_to_token_pool.req_to_token,
+                req_pool_indices,
+                prefix_lens,
+                draft_prefix_lens,
+                block_size,
+            )
+            return
         if self._use_triton_compact_rebuild:
             rebuild_compact_draft_req_to_token_func(
                 draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
@@ -1075,6 +1183,31 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return out_tokens
 
+    def _draft_prefill_kv_inputs(self, batch, hidden, positions):
+        if self.dhisparse_ring is None:
+            return dict(
+                target_hidden=hidden, cache_loc=batch.out_cache_loc, positions=positions
+            )
+        # A long prefill contains several turns around the ring. Select its last
+        # live suffix before launching writes, so no two writers alias a slot.
+        pieces, owners, offset = [], [], 0
+        for row, count in enumerate(batch.extend_lens):
+            keep = min(count, self.dhisparse_ring.rows)
+            pieces.append(
+                torch.arange(
+                    offset + count - keep, offset + count, device=positions.device
+                )
+            )
+            owners.append(batch.req_pool_indices[row].expand(keep))
+            offset += count
+        indices = torch.cat(pieces)
+        positions = positions[indices]
+        return dict(
+            target_hidden=hidden[indices],
+            positions=positions,
+            cache_loc=self.dhisparse_ring.locations(torch.cat(owners), positions),
+        )
+
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
         *,
@@ -1409,6 +1542,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         if sampling_info is None or sampling_info.is_all_greedy:
             return
 
+        if self.selector is not None and not is_dflash_sampling_verify_available():
+            raise RuntimeError(
+                "DFlash2 sampling requires a probability-correct verification backend"
+            )
+
         if (
             not is_dflash_sampling_verify_available()
             and not self._warned_sampling_fallback
@@ -1436,6 +1574,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
+    @rollback_dhisparse_on_error
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -1443,6 +1582,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
     ) -> GenerationBatchResult:
         self._validate_phase1_sampling_support(batch)
+        if (
+            getattr(self.model_runner.hisparse_coordinator, "adaptive", None)
+            is not None
+            and batch.has_grammar
+        ):
+            raise RuntimeError(
+                "DHiSparse verification requires final accepted-prefix lengths before KV commit"
+            )
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
@@ -1489,9 +1636,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 int(sum(batch.extend_lens)),
             )
             self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=logits_output.hidden_states,
-                cache_loc=batch.out_cache_loc,
-                positions=positions,
+                **self._draft_prefill_kv_inputs(
+                    batch, logits_output.hidden_states, positions
+                ),
             )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
@@ -1542,6 +1689,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         device = self.device
 
         # --- 1) Draft a fixed block with the draft model.
+        sampling_info = batch.sampling_info
         target_model = self.target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
         lm_head = getattr(target_model, "lm_head", None)
@@ -1630,6 +1778,11 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+        draft_out_cache_loc = verify_out_cache_loc
+        if self.dhisparse_ring is not None:
+            draft_out_cache_loc = self.dhisparse_ring.locations(
+                batch.req_pool_indices[:, None], positions_2d
+            ).reshape(-1)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
@@ -1675,7 +1828,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             input_ids=block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,
             seq_lens=draft_seq_lens,
-            out_cache_loc=verify_out_cache_loc,
+            out_cache_loc=draft_out_cache_loc,
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
@@ -1689,7 +1842,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        if self._draft_sampler is not None and draft_out.can_run_graph:
+        if self.selector is not None:
+            hidden = draft_logits_output.hidden_states
+            if hidden is None:
+                raise RuntimeError("DFlash2 draft model returned no hidden states")
+            draft_next = self._propose_selector_block(
+                hidden.view(bs, block_size, -1),
+                block_ids[:, 0],
+                sampling_info,
+                lm_head,
+            )
+        elif self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
@@ -1750,6 +1913,22 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
+        hisparse = self.model_runner.hisparse_coordinator
+        hisparse_window = None
+        if getattr(hisparse, "adaptive", None) is not None:
+            if hisparse.is_dsv4_hisparse:
+                hisparse_window = hisparse.prepare_dspark_verify_window(
+                    req_pool_indices=batch.req_pool_indices,
+                    prefix_lens=prefix_lens,
+                    verify_width=block_size,
+                    req_pool_indices_cpu=batch.req_pool_indices_cpu,
+                    prefix_lens_cpu=prefix_lens.to("cpu"),
+                )
+            else:
+                hisparse.adaptive.prepare_verify(
+                    batch.req_pool_indices, prefix_lens, verify_out_cache_loc_2d
+                )
+
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -1785,7 +1964,23 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Only the greedy branch sets target_predict; the simulated-acceptance
         # override below checks for it.
         target_predict = None
-        if (
+        if self._selector_sample is not None:
+            ids, q_rows = self._selector_sample
+            accept_len, bonus = self._selector_sampling_accept(
+                candidates=candidates,
+                next_token_logits=logits_output.next_token_logits,
+                candidate_ids=ids,
+                q_rows=q_rows,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+            )
+            get_tp_group().broadcast(accept_len)
+            get_tp_group().broadcast(bonus)
+            commit_lens = accept_len.to(torch.int32) + 1
+            out_tokens = torch.zeros_like(candidates)
+            out_tokens[:, :-1] = candidates[:, 1:]
+            out_tokens.scatter_(1, accept_len.long()[:, None], bonus[:, None])
+        elif (
             sampling_info is not None
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
@@ -1912,6 +2107,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens=commit_lens,
             )
 
+        if getattr(hisparse, "adaptive", None) is not None:
+            if hisparse_window is not None:
+                hisparse.commit_dspark_verify_window(hisparse_window, commit_lens)
+            else:
+                hisparse.adaptive.commit_verify(commit_lens)
+
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
@@ -1927,8 +2128,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            cache_loc_2d=verify_out_cache_loc_2d,
+            cache_loc=draft_out_cache_loc,
+            cache_loc_2d=draft_out_cache_loc.view(bs, block_size),
             positions=positions,
             commit_lens=commit_lens,
         )

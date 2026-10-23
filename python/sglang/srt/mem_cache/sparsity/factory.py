@@ -82,11 +82,27 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     prefetcher = extra_config.pop("prefetcher", None)
     prefetcher_config = extra_config.pop("prefetcher_config", {})
     force_h2d_each_step = extra_config.pop("force_h2d_each_step", False)
+    from sglang.srt.mem_cache.dhisparse import DHiSparseConfig
 
+    dhisparse = DHiSparseConfig(
+        enabled=extra_config.pop("adaptive", True),
+        admission_reserve_pages=extra_config.pop("admission_reserve_pages", 1),
+        refill_pages_per_step=extra_config.pop("refill_pages_per_step", 16),
+        resident_first=extra_config.pop("resident_first", True),
+    )
     if not isinstance(force_h2d_each_step, bool):
         raise ValueError(
             f"force_h2d_each_step must be a boolean, got {force_h2d_each_step!r}"
         )
+    if dhisparse.enabled and force_h2d_each_step:
+        raise ValueError(
+            "Adaptive DHiSparse requires persistent residency; remove force_h2d_each_step"
+        )
+    if dhisparse.enabled and prefetcher is not None:
+        raise ValueError(
+            "Adaptive DHiSparse uses exact shared-index prefetch; remove the named prefetcher"
+        )
+
     if device_buffer_size < top_k:
         raise ValueError(
             f"device_buffer_size ({device_buffer_size}) must be no smaller than top_k ({top_k})"
@@ -122,6 +138,7 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         prefetcher=prefetcher,
         prefetcher_config=prefetcher_config,
         force_h2d_each_step=force_h2d_each_step,
+        dhisparse=dhisparse,
         sparse_extra_config=extra_config,
     )
 
@@ -148,6 +165,18 @@ def resolve_dspark_device_buffer_size(
     one complete window. Force-H2D only invalidates residency; it does not
     change the configured buffer capacity.
     """
+    if config.dhisparse.enabled:
+        # Verification overflow lives in a separate reusable arena. The hot
+        # budget continues to be set per query, independent of verify width.
+        explicit = (
+            raw_hisparse_config is not None
+            and "device_buffer_size" in json.loads(raw_hisparse_config)
+        )
+        if not explicit:
+            config.device_buffer_size = 2 * effective_top_k
+        if config.device_buffer_size < effective_top_k:
+            raise ValueError("DHiSparse hot cache must hold one query's Top-K")
+        return config
     if verify_width <= 0 or effective_top_k <= 0:
         raise ValueError(
             "DSPARK HiSparse verify_width and effective_top_k must be positive, "

@@ -679,6 +679,7 @@ def alloc_for_spec_decode(
 ) -> None:
     from sglang.srt.mem_cache.allocator.hisparse import (
         DeepSeekV4HiSparseTokenToKVPoolAllocator,
+        HiSparseTokenToKVPoolAllocator,
     )
 
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -687,9 +688,29 @@ def alloc_for_spec_decode(
         and batch.spec_algorithm.is_dspark()
         and isinstance(allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator)
     )
+    adaptive_hisparse = (
+        batch is not None
+        and isinstance(
+            allocator,
+            (HiSparseTokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
+        )
+        and getattr(getattr(batch, "hisparse_coordinator", None), "adaptive", None)
+        is not None
+        and batch.spec_algorithm.is_dflash_family()
+    )
+    use_dsv4_hisparse_logical_only |= adaptive_hisparse
     if num_needed_tokens > 0:
         if allocator.page_size == 1:
-            out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)
+            if adaptive_hisparse:
+                out_cache_loc = allocator.logical_attn_allocator.alloc(
+                    num_needed_tokens
+                )
+                if out_cache_loc is None:
+                    raise RuntimeError(
+                        "DHiSparse logical verification allocation exhausted"
+                    )
+            else:
+                out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)
         else:
             last_loc = get_last_loc(
                 req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens

@@ -188,7 +188,16 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         enable_memory_saver: bool,
         start_layer: int | None = None,
         end_layer: int | None = None,
+        dhisparse_layout=None,
+        dhisparse_hot: int = 0,
+        dhisparse_context: int = 0,
     ):
+        self.dhisparse_layout = dhisparse_layout
+        if dhisparse_layout is not None:
+            page_bytes = ceil_div(page_size * 584, 576) * 576
+            size = dhisparse_layout.owned_rows(
+                size, page_bytes // page_size, dhisparse_hot, dhisparse_context
+            )
         super().__init__(
             size,
             page_size,
@@ -208,6 +217,32 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
             device=self.device,
         )
         self.compress_ratio = 4
+
+    def _create_buffers(self):
+        if self.dhisparse_layout is None:
+            return super()._create_buffers()
+        from sglang.srt.mem_cache.dhisparse import allocate_payload_slab
+
+        self.kv_cache_total_dim = self.get_bytes_per_token()
+        self.bytes_per_page_padded = (
+            ceil_div(self.page_size * self.kv_cache_total_dim, 576) * 576
+        )
+        self._dhisparse_owned_units = (self.size + self.page_size + 1) // self.page_size
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE), (
+            torch.cuda.use_mem_pool(self.custom_mem_pool)
+            if self.custom_mem_pool
+            else nullcontext()
+        ):
+            self._dhisparse_slab, self.kv_buffer, self.dhisparse_staging_offsets = (
+                allocate_payload_slab(
+                    owned_units=self._dhisparse_owned_units,
+                    unit_shape=(self.bytes_per_page_padded,),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                    layout=self.dhisparse_layout,
+                    rows_per_unit=self.page_size,
+                )
+            )
 
     def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
         self.full_to_hisparse_device_index_mapping = (
@@ -488,6 +523,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
+        dhisparse_pool_kwargs: Optional[dict] = None,
     ):
         super().__init__(
             swa_size,
@@ -499,6 +535,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             start_layer,
             end_layer,
         )
+        self.dhisparse_pool_kwargs = dhisparse_pool_kwargs or {}
         c4_logical_size = c128_size * 32
 
         logger.info(
@@ -718,11 +755,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.c128_kv_pool.kv_buffer,
         ]
 
-        for bufs in buf_groups:
+        for group_index, bufs in enumerate(buf_groups):
             for buf in bufs:
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
                 data_ptrs.append(buf.data_ptr())
-                data_lens.append(buf.nbytes)
+                owned = getattr(self.c4_kv_pool, "_dhisparse_owned_units", None)
+                data_lens.append(
+                    owned * buf[0].nbytes
+                    if group_index == 0 and owned is not None
+                    else buf.nbytes
+                )
                 item_lens.append(buf[0].nbytes)
 
         return data_ptrs, data_lens, item_lens
@@ -854,6 +896,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             layer_num,
             device,
             enable_memory_saver,
+            **(self.dhisparse_pool_kwargs if cls is HiSparseC4DevicePool else {}),
         )
 
     def _make_indexer_pool(

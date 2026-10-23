@@ -25,7 +25,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ):
         self._kvcache = kvcache
         self._size_full = size * host_to_device_ratio
-        self._size_hisparse = size
+        self._size_hisparse = kvcache.size
         self.compress_ratio = 1
         self.dtype = dtype
         self.device = device

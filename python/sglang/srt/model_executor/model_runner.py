@@ -451,9 +451,9 @@ class ModelRunner:
         )
 
         if self.ps.pp_size > 1:
-            assert self.support_pp, (
-                "Pipeline Parallel is not compatible with this model."
-            )
+            assert (
+                self.support_pp
+            ), "Pipeline Parallel is not compatible with this model."
 
         # For weight updates
         self.init_weight_updater()
@@ -862,6 +862,11 @@ class ModelRunner:
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
         speculative_verify_width = get_spec().speculative_num_draft_tokens or 0
+        if hisparse_cfg.dhisparse.enabled:
+            speculative_verify_width = (
+                self.server_args.max_speculative_num_draft_tokens
+                or speculative_verify_width
+            )
         if self.spec_algorithm.is_dspark():
             hisparse_cfg = resolve_dspark_device_buffer_size(
                 hisparse_cfg,
@@ -872,7 +877,7 @@ class ModelRunner:
             logger.info(
                 "HiSparse DSPARK resident buffer uses %d C4 entries "
                 "(verify_width=%d, effective_top_k=%d; "
-                "default=2 * verify_width * effective_top_k).",
+                "independent staging enabled for adaptive mode).",
                 hisparse_cfg.device_buffer_size,
                 speculative_verify_width,
                 hisparse_top_k,
@@ -912,6 +917,10 @@ class ModelRunner:
                 if (
                     self.spec_algorithm.is_dspark()
                     or (
+                        hisparse_cfg.dhisparse.enabled
+                        and self.spec_algorithm.is_dflash_family()
+                    )
+                    or (
                         self.spec_algorithm.is_eagle()
                         and not self.spec_algorithm.is_frozen_kv_mtp()
                     )
@@ -919,10 +928,12 @@ class ModelRunner:
                 else 0
             ),
             force_h2d_each_step=hisparse_cfg.force_h2d_each_step,
+            dhisparse_config=hisparse_cfg.dhisparse,
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,
                 pp_size=self.ps.pp_size,
-                is_speculative=self.spec_algorithm.is_speculative(),
+                is_speculative=self.spec_algorithm.is_speculative()
+                and not hisparse_cfg.dhisparse.enabled,
             ),
         )
         disable_decode_graph_reason = None

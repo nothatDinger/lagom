@@ -15,6 +15,7 @@ from typing import (
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.managers.dhisparse_coordinator import finish_dhisparse_attention
 from sglang.srt.runtime_context import get_parallel, get_spec
 
 logger = logging.getLogger(__name__)
@@ -1870,6 +1871,7 @@ class DeepseekSparseAttnBackend(
 
         self.forward_metadata = metadata
 
+    @finish_dhisparse_attention
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1968,47 +1970,73 @@ class DeepseekSparseAttnBackend(
             forward_batch.forward_mode
         )
 
-        if self.use_fused_topk:
-            if topk_indices is not None:
-                topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+        adaptive_verify = (
+            getattr(self.hisparse_coordinator, "adaptive", None) is not None
+            and forward_batch.forward_mode.is_target_verify()
+        )
+        if adaptive_verify:
+            from sglang.srt.speculative.ragged_verify import (
+                resolve_ragged_verify_layout,
+            )
 
-            page_table_1 = self._get_fused_topk_page_table(topk_indices)
+            layout = resolve_ragged_verify_layout(forward_batch)
+            verify_lens_cpu = None
+            if layout is not None:
+                verify_lens_cpu = layout.verify_lens_cpu
+                if verify_lens_cpu is None:
+                    verify_lens_cpu = layout.verify_lens.to("cpu").tolist()
+            topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+            page_table_1 = self.hisparse_coordinator.swap_in_selected_pages_spec(
+                forward_batch.req_pool_indices,
+                forward_batch.positions[: topk_indices.shape[0]].to(torch.int32) + 1,
+                topk_indices,
+                layer.layer_id - self.token_to_kv_pool.start_layer,
+                verify_lens_cpu=verify_lens_cpu,
+            )
         else:
-            if topk_transform_method == TopkTransformMethod.RAGGED:
+            if self.use_fused_topk:
                 if topk_indices is not None:
                     topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
-                topk_indices_offset = metadata.topk_indices_offset
-                assert topk_indices_offset is not None
-                mask = topk_indices != -1
-                topk_indices_offset = (
-                    topk_indices_offset.unsqueeze(1)
-                    if topk_indices_offset.ndim == 1
-                    else topk_indices_offset
-                )
-                topk_indices = torch.where(
-                    mask, topk_indices + topk_indices_offset, topk_indices
-                )
-            elif topk_transform_method == TopkTransformMethod.PAGED:
-                assert metadata.dsa_extend_seq_lens_list is not None
-                page_table_1 = transform_index_page_table_prefill(
-                    page_table=metadata.page_table_1,
-                    topk_indices=topk_indices,
-                    extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
-                    page_size=1,
-                    output_num_tokens=q_nope.shape[0],
-                    page_table_is_expanded=(
-                        forward_batch.forward_mode.is_target_verify()
-                        or forward_batch.forward_mode.is_draft_extend_v2()
-                    ),
-                    cu_seqlens_q=metadata.cu_seqlens_q,
-                )
 
-        # todo hisparse: to cover more backends
-        if self.hisparse_coordinator is not None:
-            # flash_mla_sparse_fwd / tilelang require int32 page indices.
-            page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
-                page_table_1
-            ).to(torch.int32)
+                page_table_1 = self._get_fused_topk_page_table(topk_indices)
+            else:
+                if topk_transform_method == TopkTransformMethod.RAGGED:
+                    if topk_indices is not None:
+                        topk_indices = self._pad_topk_indices(
+                            topk_indices, q_nope.shape[0]
+                        )
+                    topk_indices_offset = metadata.topk_indices_offset
+                    assert topk_indices_offset is not None
+                    mask = topk_indices != -1
+                    topk_indices_offset = (
+                        topk_indices_offset.unsqueeze(1)
+                        if topk_indices_offset.ndim == 1
+                        else topk_indices_offset
+                    )
+                    topk_indices = torch.where(
+                        mask, topk_indices + topk_indices_offset, topk_indices
+                    )
+                elif topk_transform_method == TopkTransformMethod.PAGED:
+                    assert metadata.dsa_extend_seq_lens_list is not None
+                    page_table_1 = transform_index_page_table_prefill(
+                        page_table=metadata.page_table_1,
+                        topk_indices=topk_indices,
+                        extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
+                        page_size=1,
+                        output_num_tokens=q_nope.shape[0],
+                        page_table_is_expanded=(
+                            forward_batch.forward_mode.is_target_verify()
+                            or forward_batch.forward_mode.is_draft_extend_v2()
+                        ),
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                    )
+
+            # todo hisparse: to cover more backends
+            if self.hisparse_coordinator is not None:
+                # flash_mla_sparse_fwd / tilelang require int32 page indices.
+                page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
+                    page_table_1
+                ).to(torch.int32)
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -2180,6 +2208,7 @@ class DeepseekSparseAttnBackend(
                 f"Unsupported {dsa_impl = } for forward_extend. Consider using an other attention backend."
             )
 
+    @finish_dhisparse_attention
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -2260,7 +2289,11 @@ class DeepseekSparseAttnBackend(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 topk_indices,
-                layer.layer_id,
+                (
+                    layer.layer_id - self.token_to_kv_pool.start_layer
+                    if getattr(self.hisparse_coordinator, "adaptive", None) is not None
+                    else layer.layer_id
+                ),
                 req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
                 committed_lens_cpu=forward_batch.seq_lens_cpu,
             )
@@ -3389,7 +3422,13 @@ class DeepseekSparseAttnBackend(
     ) -> DSAIndexerMetadata:
         force_unfused = not self.use_fused_topk or (
             self.hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode_or_idle()
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or (
+                    getattr(self.hisparse_coordinator, "adaptive", None) is not None
+                    and forward_batch.forward_mode.is_target_verify()
+                )
+            )
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,

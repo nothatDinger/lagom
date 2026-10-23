@@ -494,8 +494,86 @@ class KVCacheConfigurator:
                 )
 
         # Initialize token_to_kv_pool
+        from sglang.srt.mem_cache.dhisparse import draft_ring_for
+
+        draft_ring = draft_ring_for(self.server_args)
+        fixed_draft_bytes = 0
+        if draft_ring is not None:
+            ring_rows = req_to_token_pool.req_to_token.shape[0] * draft_ring.rows
+            if self.is_draft_worker:
+                sizes = msgspec.structs.replace(sizes, max_total_num_tokens=ring_rows)
+            else:
+                draft_cell = self.spec_aux_config.dflash_draft_cell_size_per_token
+                if not draft_cell:
+                    raise ValueError(
+                        "DHiSparse draft ring requires the draft model's KV byte geometry"
+                    )
+                fixed_draft_bytes = ring_rows * int(draft_cell)
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
         is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
+        self._dhisparse_pool_kwargs = {}
+        if get_memory().enable_hisparse and not self.is_draft_worker:
+            from sglang.srt.managers.hisparse_coordinator import (
+                resolve_shared_index_layers,
+            )
+            from sglang.srt.mem_cache.dhisparse import (
+                VerificationLayout,
+                staging_groups,
+            )
+            from sglang.srt.mem_cache.sparsity import (
+                parse_hisparse_config,
+                resolve_dspark_device_buffer_size,
+            )
+
+            cfg = parse_hisparse_config(self.server_args)
+            if cfg.dhisparse.enabled:
+                width = max(
+                    1,
+                    self.server_args.max_speculative_num_draft_tokens
+                    or self.server_args.speculative_num_draft_tokens
+                    or 1,
+                )
+                top_k = getattr(
+                    self.model_config.hf_text_config, "index_topk", cfg.top_k
+                )
+                if self.spec_algorithm.is_dspark():
+                    cfg = resolve_dspark_device_buffer_size(
+                        cfg,
+                        raw_hisparse_config=self.server_args.hisparse_config,
+                        verify_width=width,
+                        effective_top_k=top_k,
+                    )
+                if is_dsv4_model:
+                    ratios = self.model_config.compress_ratios[
+                        self.layer_info.start_layer : self.layer_info.end_layer
+                    ]
+                    slots = [0] * sum(r == 4 for r in ratios)
+                    page = self.pool_page_size // 4
+                    context = (req_to_token_pool.max_context_len + 3) // 4 + page
+                else:
+                    pattern = (
+                        resolve_shared_index_layers(
+                            hf_text_config=self.model_config.hf_text_config,
+                            pp_size=self.ps.pp_size,
+                            is_speculative=False,
+                        )
+                        or [False] * self.layer_info.num_effective_layers
+                    )
+                    slots, _ = staging_groups(pattern)
+                    page = self.pool_page_size
+                    context = req_to_token_pool.max_context_len + page
+                self._dhisparse_pool_kwargs = dict(
+                    dhisparse_layout=VerificationLayout(
+                        req_to_token_pool.req_to_token.shape[0],
+                        width,
+                        top_k,
+                        page,
+                        tuple(slots),
+                        fixed_draft_bytes,
+                    ),
+                    dhisparse_hot=cfg.device_buffer_size,
+                    dhisparse_context=context,
+                )
 
         self._validate_prefill_only_disable_kv_cache_pool_family(
             is_dsa_model, is_dsv4_model, current_platform
@@ -507,6 +585,8 @@ class KVCacheConfigurator:
             is_dsv4_model=is_dsv4_model,
             req_to_token_pool=req_to_token_pool,
         )
+        if draft_ring is not None and self.is_draft_worker:
+            token_to_kv_pool.dhisparse_ring = draft_ring
 
         if draft_virtual_id_space is not None:
             assert token_to_kv_pool.size >= draft_virtual_id_space, (
@@ -1128,6 +1208,7 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             enable_hisparse=get_memory().enable_hisparse and not self.is_draft_worker,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
+            dhisparse_pool_kwargs=getattr(self, "_dhisparse_pool_kwargs", None),
         )
         return token_to_kv_pool
 
@@ -1319,6 +1400,7 @@ class KVCacheConfigurator:
             pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                 self.server_args
             ).host_to_device_ratio
+            pool_kwargs.update(getattr(self, "_dhisparse_pool_kwargs", {}))
         elif dsa_cp_layer_shard_rank is not None:
             # DSA cache layer split: shard KV/indexer layers across CP ranks.
             from sglang.srt.mem_cache.dsa_cache_layer_split import (
@@ -1720,7 +1802,11 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
 
-            if get_memory().enable_hisparse and not self.is_draft_worker and is_dsv4_model:
+            if (
+                get_memory().enable_hisparse
+                and not self.is_draft_worker
+                and is_dsv4_model
+            ):
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
                 token_to_kv_pool_allocator = DeepSeekV4HiSparseTokenToKVPoolAllocator(
                     token_to_kv_pool_allocator

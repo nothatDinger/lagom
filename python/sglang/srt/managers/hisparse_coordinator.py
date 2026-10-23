@@ -263,7 +263,10 @@ class HiSparseCoordinator:
         is_speculative: bool = False,
         speculative_verify_width: int = 0,
         force_h2d_each_step: bool = False,
+        dhisparse_config=None,
     ):
+        self.adaptive = None
+        adaptive_enabled = dhisparse_config is not None and dhisparse_config.enabled
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.top_k = top_k
@@ -308,7 +311,10 @@ class HiSparseCoordinator:
             )
             self.mem_pool_host = MLATokenToKVPoolHost(
                 device_pool=self.mem_pool_device,
-                host_to_device_ratio=host_to_device_ratio,
+                host_to_device_ratio=(
+                    self.token_to_kv_pool_allocator.size_full
+                    / self.mem_pool_device.size
+                ),
                 host_size=0,
                 page_size=self.mem_pool_device.page_size,
                 layout="layer_first",
@@ -316,8 +322,26 @@ class HiSparseCoordinator:
             )
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
+        if adaptive_enabled:
+            if _is_hip:
+                raise ValueError(
+                    "Adaptive DHiSparse currently requires CUDA; use adaptive=false for legacy ROCm"
+                )
+            if self.skip_io or force_h2d_each_step:
+                raise ValueError(
+                    "Adaptive DHiSparse requires exact KV IO and persistent residency"
+                )
+            if device_buffer_size % self.page_size:
+                raise ValueError(
+                    "DHiSparse hot cache must be a whole number of payload pages"
+                )
         self._pr_verify_layout = None
-        if self.is_dsv4_hisparse and is_speculative and speculative_verify_width > 0:
+        if (
+            self.is_dsv4_hisparse
+            and is_speculative
+            and speculative_verify_width > 0
+            and not adaptive_enabled
+        ):
             self._pr_verify_layout = validate_pr_fused_config(
                 cuda=not _is_hip and str(device).startswith("cuda"),
                 dsv4=self.is_dsv4_hisparse,
@@ -341,9 +365,14 @@ class HiSparseCoordinator:
         ) // self.compress_ratio
 
         # to have an extra page for new tokens
-        self.padded_buffer_size = (
-            self.device_buffer_size + self.mem_pool_device.page_size
-        )
+        tail_size = self.mem_pool_device.page_size
+        if adaptive_enabled and not self.is_dsv4_hisparse:
+            from sglang.srt.mem_cache.dhisparse import page_round
+
+            tail_size = max(
+                tail_size, page_round(speculative_verify_width + 1, tail_size)
+            )
+        self.padded_buffer_size = self.device_buffer_size + tail_size
 
         self.req_to_device_buffer = torch.zeros(
             (max_num_req_slots, self.padded_buffer_size),
@@ -471,6 +500,7 @@ class HiSparseCoordinator:
             shared_index_layers=shared_index_layers,
             layer_num=layer_num,
             max_num_req_slots=max_num_req_slots,
+            allocate_buffers=not adaptive_enabled,
         )
         self.prefetcher = None
         self.prefetcher_name = prefetcher_name.lower() if prefetcher_name else None
@@ -679,12 +709,17 @@ class HiSparseCoordinator:
                 self.prefetcher.size,
                 self.top_k,
             )
+        if adaptive_enabled:
+            from sglang.srt.managers.dhisparse_coordinator import AdaptiveHiSparse
+
+            self.adaptive = AdaptiveHiSparse(self, dhisparse_config)
 
     def _init_shared_index_prefetch(
         self,
         shared_index_layers: Optional[List[bool]],
         layer_num: int,
         max_num_req_slots: int,
+        allocate_buffers: bool = True,
     ) -> None:
         """Set up the plan-then-IO prefetch for shared-index (IndexShare) models:
         the anchor's kernel records its miss plan and skip layers replay it on
@@ -704,7 +739,7 @@ class HiSparseCoordinator:
         self._prefetch_groups, self._prefetch_slot = _build_prefetch_groups(
             self._is_shared_index_layer
         )
-        if not self.enable_prefetch:
+        if not self.enable_prefetch or not allocate_buffers:
             return
 
         # Small fixed grid for the copy-only kernel: low SM footprint so the
@@ -741,7 +776,9 @@ class HiSparseCoordinator:
         # See HostKVCache.destroy for why the explicit unregister matters.
         self.write_staging_stream.synchronize()
         self.decode_backup_stream.synchronize()
-        if self.enable_prefetch:
+        if getattr(self, "adaptive", None) is not None:
+            self.adaptive.abort_forward()
+        elif self.enable_prefetch:
             # Skip-layer copies read the pinned host pool on the prefetch stream.
             self.prefetch_stream.synchronize()
         if self.prefetcher is not None:
@@ -750,6 +787,8 @@ class HiSparseCoordinator:
 
     def get_token_stats(self) -> HiSparseTokenStats:
         device_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        if getattr(self, "adaptive", None) is not None:
+            device_allocator = self.adaptive.raw_allocator
         device_capacity = device_allocator.size
         device_tokens = device_capacity - device_allocator.available_size()
         host_capacity = self.mem_pool_host.size
@@ -766,6 +805,10 @@ class HiSparseCoordinator:
         )
 
     def admit_request_into_staging(self, req: Req) -> None:
+        if getattr(self, "adaptive", None) is not None and self.adaptive.admit_resident(
+            req
+        ):
+            return
         req.hisparse_staging = True
 
         full_kv_indices = self.req_to_token_pool.req_to_token[
@@ -874,6 +917,8 @@ class HiSparseCoordinator:
             )
             if alloc_size == self.device_buffer_size:
                 alloc_size = self.padded_buffer_size
+            if getattr(self, "adaptive", None) is not None:
+                alloc_size = self.padded_buffer_size
 
         compressed_logical_indices = (
             self.mem_pool_device.translate_loc_from_full_to_compressed(
@@ -914,6 +959,29 @@ class HiSparseCoordinator:
         )
 
         self._initialize_spec_request(req.req_pool_idx)
+        if getattr(self, "adaptive", None) is not None:
+            # The legacy admission path has already completed the host backup.
+            self.adaptive.register_backed(req.req_pool_idx, compressed_len)
+            self.req_device_buffer_tokens[
+                :, req.req_pool_idx, compressed_len : self.device_buffer_size
+            ] = -1
+            if compressed_len:
+                # The reserved address is independent of the prefill layout.
+                # Publish its identity only after loading the actual newest row.
+                host = self.req_to_host_pool[
+                    req.req_pool_idx, compressed_len - 1 : compressed_len
+                ]
+                tail = self.req_to_device_buffer[
+                    req.req_pool_idx,
+                    self.device_buffer_size : self.device_buffer_size + 1,
+                ]
+                for layer_id in range(self.mem_pool_device.layer_num):
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mem_pool_device, host, tail, layer_id, io_backend="kernel"
+                    )
+                self.req_device_buffer_tokens[
+                    :, req.req_pool_idx, self.device_buffer_size
+                ] = (compressed_len - 1)
 
     def _initialize_spec_request(self, req_pool_idx: int) -> None:
         states = getattr(self, "_spec_states", None)
@@ -1027,7 +1095,13 @@ class HiSparseCoordinator:
         while finish_count > 0:
             _, _, req = self.ack_staging_queue.pop(0)
             # prepare device buffer and update req
-            self.alloc_device_buffer(req)
+            if (
+                getattr(self, "adaptive", None) is None
+                or req.req_pool_idx not in self.adaptive.prepared_requests
+            ):
+                self.alloc_device_buffer(req)
+            else:
+                self.adaptive.prepared_requests.remove(req.req_pool_idx)
             self._skip_first_backup[req.req_pool_idx] = True
             req.hisparse_staging = False
             finish_count -= 1
@@ -1048,12 +1122,21 @@ class HiSparseCoordinator:
 
         if not self.is_dsv4_hisparse:
             # Grow device buffers if needed and resolve the latest-token slot.
-            reserved_buffer_loc = self._grow_device_buffers(
-                seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
-            )
+            if getattr(self, "adaptive", None) is not None:
+                reserved_buffer_loc = self.req_to_device_buffer[
+                    req_pool_indices, self.device_buffer_size
+                ]
+            else:
+                reserved_buffer_loc = self._grow_device_buffers(
+                    seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
+                )
             self.req_device_buffer_token_locs[
                 :, req_pool_indices, self.device_buffer_size
             ] = reserved_buffer_loc.to(torch.int32)
+            if getattr(self, "adaptive", None) is not None:
+                self.adaptive.set_tail(
+                    req_pool_indices, seq_lens - 1, reserved_buffer_loc
+                )
 
             compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
                 out_cache_loc
@@ -1091,6 +1174,8 @@ class HiSparseCoordinator:
         reserved_positions = (compressed_seq_lens - 1).clamp(
             max=self.device_buffer_size
         )
+        if getattr(self, "adaptive", None) is not None:
+            reserved_positions.fill_(self.device_buffer_size)
         reserved_buffer_loc = self.req_to_device_buffer[
             active_req_pool_indices, reserved_positions
         ]
@@ -1098,6 +1183,10 @@ class HiSparseCoordinator:
         self.req_device_buffer_token_locs[
             :, active_req_pool_indices, self.device_buffer_size
         ] = reserved_buffer_loc.to(torch.int32)
+        if getattr(self, "adaptive", None) is not None:
+            self.adaptive.set_tail(
+                active_req_pool_indices, compressed_seq_lens - 1, reserved_buffer_loc
+            )
 
         compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
             active_out_cache_loc
@@ -1154,6 +1243,8 @@ class HiSparseCoordinator:
         actual_compressed_pos = compressed_prev_seq_lens - 1
 
         buffer_slot = actual_compressed_pos.clamp(max=self.device_buffer_size)
+        if getattr(self, "adaptive", None) is not None:
+            buffer_slot.fill_(self.device_buffer_size)
 
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
 
@@ -1304,6 +1395,12 @@ class HiSparseCoordinator:
         ]
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
+        if (
+            getattr(self, "adaptive", None) is not None
+            and req.req_pool_idx in self.adaptive.prepared_requests
+        ):
+            self.request_finished(req)
+            return
         self._drain_oasiskv_tasks_for_request(req.req_pool_idx)
 
         prefill_len = req.extend_range.end
@@ -1376,6 +1473,8 @@ class HiSparseCoordinator:
         # EMA/previous RESOLVE also reads the shared request mappings. This must
         # precede allocator frees, mapping clears, and host-page reclamation.
         self._drain_named_prefetch_before_request_release()
+        if getattr(self, "adaptive", None) is not None:
+            self.adaptive.release(req.req_pool_idx)
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
         # allocator can over-allocate beyond the committed seqlen, and those
@@ -1634,6 +1733,8 @@ class HiSparseCoordinator:
         """
         self.consume_previous_graph_prefetch()
         self.num_real_reqs.fill_(num_real_reqs)
+        if getattr(self, "adaptive", None) is not None:
+            self.adaptive.begin_forward()
 
     def consume_oasiskv_prefetch(
         self,
@@ -1964,6 +2065,13 @@ class HiSparseCoordinator:
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
         """
+        if getattr(self, "adaptive", None) is not None:
+            return self.adaptive.resolve(
+                req_pool_indices,
+                compressed_seq_lens.reshape(-1, 1),
+                top_k_result[:, : self.top_k].reshape(-1, 1, self.top_k),
+                layer_id,
+            ).reshape(-1, self.top_k)
         self._consume_previous_prefetch(
             req_pool_indices,
             layer_id,
@@ -2046,6 +2154,17 @@ class HiSparseCoordinator:
         num_real_reqs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Maintain the entire window and transfer KV in one gather/commit pair."""
+        if getattr(self, "adaptive", None) is not None:
+            lengths = compressed_seq_lens.reshape(req_pool_indices.numel(), -1)
+            if lengths.shape[1] == 1:
+                lengths = lengths.expand(-1, verify_width)
+            return self.adaptive.resolve(
+                req_pool_indices,
+                lengths,
+                top_k_result.reshape(-1, verify_width, self.top_k),
+                layer_id,
+                output=output_buffer,
+            )
         if self._spec_states is None:
             raise RuntimeError(
                 "Fused verify swap-in requires CUDA DeepSeek-V4 speculative state"
@@ -2311,6 +2430,22 @@ class HiSparseCoordinator:
             self._dspark_scratch_valid_mapping[compressed_locs] = False
             raise
         self._active_dspark_window = window
+        if getattr(self, "adaptive", None) is not None:
+            next_slot = {}
+            for i, (req_offset, position) in enumerate(
+                zip(window.req_offsets, window.c4_positions)
+            ):
+                rid = window.req_pool_indices_cpu[req_offset]
+                slot = next_slot.get(rid, self.device_buffer_size + 1)
+                if slot >= self.padded_buffer_size:
+                    raise ValueError(
+                        "Verification tail exceeds reserved request storage"
+                    )
+                self.req_device_buffer_tokens[:, rid, slot] = position
+                self.req_device_buffer_token_locs[:, rid, slot] = window.device_locs[
+                    i
+                ].to(torch.int32)
+                next_slot[rid] = slot + 1
         return window
 
     def select_dspark_scratch_locs(
@@ -2352,6 +2487,10 @@ class HiSparseCoordinator:
         # full tensor would add another decode-step kernel with no semantic
         # effect.
         self._dspark_scratch_valid_mapping[window.compressed_locs] = False
+        if getattr(self, "adaptive", None) is not None:
+            self.req_device_buffer_tokens[
+                :, window.req_pool_indices_cpu, self.device_buffer_size + 1 :
+            ] = -1
         if self._active_dspark_window is window:
             self._active_dspark_window = None
         # Record every non-empty rollback, including all-rejected and exception
@@ -2406,12 +2545,19 @@ class HiSparseCoordinator:
                 window.c4_positions,
                 self.device_buffer_size,
             )
+            if getattr(self, "adaptive", None) is not None:
+                latest = {}
+                for i in accepted:
+                    latest[window.req_offsets[i]] = i
+                fixed_copy = list(latest.values())
             fixed_idx = torch.tensor(fixed_copy, dtype=torch.int64, device=self.device)
             accepted_req_slots = [
                 window.req_pool_indices_cpu[window.req_offsets[i]] for i in fixed_copy
             ]
             accepted_c4_pos = [window.c4_positions[i] for i in fixed_copy]
             fixed_slots = [min(pos, self.device_buffer_size) for pos in accepted_c4_pos]
+            if getattr(self, "adaptive", None) is not None:
+                fixed_slots = [self.device_buffer_size] * len(fixed_copy)
             dst_locs = self.req_to_device_buffer[
                 torch.tensor(accepted_req_slots, dtype=torch.int64, device=self.device),
                 torch.tensor(fixed_slots, dtype=torch.int64, device=self.device),

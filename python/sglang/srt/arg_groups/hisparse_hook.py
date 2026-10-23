@@ -90,14 +90,24 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     hf_config = server_args.get_model_config().hf_config
     is_v4_hisparse = is_deepseek_v4(hf_config)
     is_hip = _is_hip()
+    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+    if (
+        parse_hisparse_config(server_args).dhisparse.enabled
+        and not is_v4_hisparse
+        and server_args.speculative_algorithm not in (None, "DFLASH", "DSPARK")
+    ):
+        raise ValueError(
+            "Adaptive DHiSparse on DSA supports linear DFLASH/DSPARK verification"
+        )
     assert is_deepseek_dsa(hf_config) or is_v4_hisparse, (
         "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) "
         "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
     )
 
-    assert server_args.disable_radix_cache, (
-        "Hierarchical sparse attention currently requires --disable-radix-cache."
-    )
+    assert (
+        server_args.disable_radix_cache
+    ), "Hierarchical sparse attention currently requires --disable-radix-cache."
 
     # A branching EAGLE tree contains several candidates at the same logical
     # token position.  DeepSeek-V4 C4 has one entry per logical four-token

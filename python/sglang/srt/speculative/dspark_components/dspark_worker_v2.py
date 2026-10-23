@@ -647,6 +647,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         hisparse_coordinator = self.model_runner.hisparse_coordinator
         hisparse_window = None
+        adaptive_verify = getattr(hisparse_coordinator, "adaptive", None)
         if hisparse_coordinator is not None and hisparse_coordinator.is_dsv4_hisparse:
             if batch.has_grammar:
                 raise RuntimeError(
@@ -659,6 +660,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 verify_width=verify_ids_2d.shape[1],
                 req_pool_indices_cpu=batch.req_pool_indices_cpu,
                 prefix_lens_cpu=batch.seq_lens_cpu,
+            )
+        elif adaptive_verify is not None:
+            if batch.has_grammar:
+                raise RuntimeError(
+                    "DHiSparse verification requires final accepted-prefix lengths before KV commit"
+                )
+            adaptive_verify.prepare_verify(
+                batch.req_pool_indices, prefix_lens, verify_window.verify_cache_loc_2d
             )
 
         hisparse_committed = False
@@ -749,13 +758,20 @@ class DSparkWorkerV2(BaseSpecWorker):
                     hisparse_window, accept.commit_lens
                 )
                 hisparse_committed = True
+            elif adaptive_verify is not None:
+                adaptive_verify.commit_verify(accept.commit_lens)
+                hisparse_committed = True
 
         finally:
+            if adaptive_verify is not None and not hisparse_committed:
+                adaptive_verify.abort_forward()
             if hisparse_window is not None and not hisparse_committed:
                 # prepare mutates the global C4 mapping. Any failure in target
                 # forward, grammar, acceptance, logprob, or commit must restore
                 # it before the scheduler can continue or retract the request.
                 hisparse_coordinator.rollback_dspark_verify_window(hisparse_window)
+            elif adaptive_verify is not None and not hisparse_committed:
+                adaptive_verify.rollback_verify()
 
         if on_publish is not None:
             if confidence is not None:

@@ -19,7 +19,11 @@ from sglang.srt.mem_cache.sparsity import (
 
 
 def _config(value):
-    return parse_hisparse_config(SimpleNamespace(hisparse_config=value))
+    # These tests exercise the legacy prefetch experiment explicitly. Adaptive
+    # DHiSparse has independent staging and rejects predictive prefetch/force-H2D.
+    values = json.loads(value) if value is not None else {}
+    values.setdefault("adaptive", False)
+    return parse_hisparse_config(SimpleNamespace(hisparse_config=json.dumps(values)))
 
 
 def test_legacy_config_is_unchanged():
