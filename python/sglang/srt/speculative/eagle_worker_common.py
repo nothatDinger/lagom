@@ -655,8 +655,8 @@ def run_eagle_verify(
             )
             hisparse_committed = True
         if oasiskv_lookahead:
-            # The verify transaction owns temporary C4 mappings. It must finish
-            # before prefetch updates the same resident/LRU tables.
+            # Eager C4-boundary tasks use post-commit residency. Captured tasks
+            # already ran with committed-history candidates and joined in graph.
             from sglang.srt.speculative.oasiskv_lookahead import (
                 submit_oasiskv_pending_prefetches,
             )

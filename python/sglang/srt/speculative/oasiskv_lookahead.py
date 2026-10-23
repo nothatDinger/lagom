@@ -90,15 +90,23 @@ def submit_oasiskv_pending_prefetches(forward_batch: Any) -> None:
 def plan_oasiskv_layer_prefetch(forward_batch: Any, layer_id: int) -> bool:
     """Start read-only selection after the indexer's real-query miss refill.
 
-    C4 commits change residency, so those plans must use the post-commit state.
-    Captured graphs retain descriptors for the existing post-replay drain.
+    Eager C4 transactions use post-commit residency. Captured plans restrict
+    candidates to committed history and join before C4 promotion instead.
     """
-    if getattr(forward_batch, "is_oasiskv_graph_capture", False):
-        return False
     pending = getattr(forward_batch, "_oasiskv_pending_prefetch", None)
     if not pending or layer_id not in pending:
         return False
     coordinator, kwargs = pending[layer_id]
+    if getattr(forward_batch, "is_oasiskv_graph_capture", False):
+        if "task" not in kwargs:
+            coordinator.oasiskv_graph_state.plan(
+                forward_batch,
+                layer_id=kwargs["layer_id"],
+                predicted_c4_entries=kwargs["predicted_c4_entries"],
+                compressed_seq_lens=kwargs["compressed_seq_lens"],
+            )
+            kwargs["task"] = "captured"
+        return True
     if getattr(coordinator, "_active_dspark_window", None) is not None:
         return False
     if "task" not in kwargs:
@@ -107,23 +115,29 @@ def plan_oasiskv_layer_prefetch(forward_batch: Any, layer_id: int) -> bool:
 
 
 def submit_oasiskv_layer_prefetch(forward_batch: Any, layer_id: int) -> bool:
-    """Transfer one eager layer's prefetch as soon as its attention is done.
+    """Transfer one layer's prefetch as soon as its attention is done.
 
     Most decode steps do not complete a new C4 group and therefore have no
     transactional scratch mapping to commit.  On those steps, retaining every
     layer task until the end of the model destroys OasisKV's layer pipeline.
-    C4-boundary steps remain deferred until the root-only commit because their
+    Eager C4-boundary steps remain deferred until the root-only commit because their
     fixed destination slots must not race prefetch eviction or H2D writes.
 
-    CUDA-graph replay publishes its captured task descriptors only after the
-    graph returns, so it naturally continues to use the post-commit drain.
+    Captured selection/transfer run inside the graph, restrict candidates to
+    authoritative history, and join before the root-only C4 commit.
     """
-    if getattr(forward_batch, "is_oasiskv_graph_capture", False):
-        return False
     pending = getattr(forward_batch, "_oasiskv_pending_prefetch", None)
     if not pending or layer_id not in pending:
         return False
     coordinator, kwargs = pending[layer_id]
+    if getattr(forward_batch, "is_oasiskv_graph_capture", False):
+        if kwargs.get("task") != "captured":
+            raise RuntimeError("V4 graph transfer requires this layer's selection")
+        coordinator.oasiskv_graph_state.transfer(
+            forward_batch, layer_id=kwargs["layer_id"]
+        )
+        pending.pop(layer_id)
+        return True
     if getattr(coordinator, "_active_dspark_window", None) is not None:
         return False
     pending.pop(layer_id)

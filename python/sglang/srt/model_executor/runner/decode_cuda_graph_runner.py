@@ -345,10 +345,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Per-tier capture layouts; their verify_lens / qo_indptr tensors are
         # baked into the captured graphs and refreshed in place each replay.
         self._captured_ragged_layouts: dict[int, object] = {}
-        # Graph-keyed references to tensors produced by an OasisKV paired
-        # target graph.  They have graph-pool-stable addresses and are turned
-        # into live prefetch submissions only after replay and root commit.
-        self._oasiskv_graph_prefetch: dict[object, dict] = {}
         if self.ragged_verify_mode and (
             self.enable_two_batch_overlap
             or model_runner.server_args.enable_lora
@@ -1007,6 +1003,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.oasiskv_draft_valid = torch.ones(
                 bs, dtype=torch.bool, device=input_ids.device
             )
+            if forward_batch.hisparse_coordinator is not None:
+                # Do not mutate request zero (repeated by dummy capture rows).
+                # Real replay updates this same scalar to the unpadded size.
+                forward_batch.hisparse_coordinator.num_real_reqs.zero_()
 
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
@@ -1249,12 +1249,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
-                pending = getattr(forward_batch, "_oasiskv_pending_prefetch", None)
-                if pending:
-                    # Keep the final capture's graph-pool tensor references;
-                    # warmup-created descriptors have been overwritten by the
-                    # capture invocation of run_once.
-                    self._oasiskv_graph_prefetch[shape_key] = dict(pending)
+                if getattr(forward_batch, "_oasiskv_pending_prefetch", None):
+                    raise RuntimeError("OasisKV graph left a layer prefetch unsubmitted")
 
     def _prepare_oasiskv_graph_replay(self, forward_batch: ForwardBatch) -> None:
         """Join prior H2D writers before the target graph reads C4 mappings."""
@@ -1262,9 +1258,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if (
             coordinator is None
             or coordinator.prefetcher_name != "oasiskv"
-            or not getattr(forward_batch, "is_oasiskv_paired", False)
+            or not (
+                getattr(forward_batch, "is_oasiskv_paired", False)
+                or forward_batch.forward_mode.is_idle()
+            )
         ):
             return
+        if (state := getattr(coordinator, "oasiskv_graph_state", None)) is not None:
+            state.prepare_replay()
         for layer_id in range(coordinator.mem_pool_device.layer_num):
             coordinator.consume_oasiskv_prefetch(
                 req_pool_indices=forward_batch.req_pool_indices,
@@ -1272,27 +1273,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
                 committed_lens_cpu=forward_batch.seq_lens_cpu,
             )
-
-    def _publish_oasiskv_graph_prefetch(self, forward_batch: ForwardBatch) -> None:
-        """Expose graph-produced draft Top-K tensors to post-commit submission."""
-        templates = self._oasiskv_graph_prefetch.get(self._replay_graph_key)
-        if not templates or not getattr(forward_batch, "is_oasiskv_paired", False):
-            return
-        raw_bs = forward_batch.batch_size
-        pending = {}
-        for layer_key, (coordinator, captured) in templates.items():
-            pending[layer_key] = (
-                coordinator,
-                dict(
-                    req_pool_indices=forward_batch.req_pool_indices,
-                    req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
-                    compressed_seq_lens=captured["compressed_seq_lens"][:raw_bs],
-                    source_committed_lens_cpu=forward_batch.seq_lens_cpu,
-                    predicted_c4_entries=captured["predicted_c4_entries"][:raw_bs],
-                    layer_id=captured["layer_id"],
-                ),
-            )
-        forward_batch._oasiskv_pending_prefetch = pending
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
@@ -1480,7 +1460,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             output = self.backend.replay(self._replay_graph_key, forward_batch)
             self._replay_attn_backend().finish_cuda_graph_replay(forward_batch)
-            self._publish_oasiskv_graph_prefetch(forward_batch)
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

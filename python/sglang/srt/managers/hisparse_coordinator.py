@@ -357,6 +357,7 @@ class HiSparseCoordinator:
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
         self._active_dspark_window: Optional[HiSparseDSparkWindow] = None
+        self.oasiskv_graph_state = None
         self._dspark_commit_done_event = device_module.Event()
         self._has_pending_dspark_commit = False
         self._dspark_scratch_compressed_locs: Optional[torch.Tensor] = None
@@ -1275,6 +1276,13 @@ class HiSparseCoordinator:
         Request finish is a slow path, so synchronizing the few matching task
         events is preferable to a global device/stream synchronization.
         """
+        if (state := getattr(self, "oasiskv_graph_state", None)) is not None:
+            state.drain_request(req_pool_idx)
+            # The graph joins before root-only promotion. Its completion event
+            # does not cover that later host write; reclaim must cover both.
+            if self._has_pending_dspark_commit:
+                self._dspark_commit_done_event.synchronize()
+                self._has_pending_dspark_commit = False
         if getattr(self, "_oasiskv_ring", None) is None:
             return
         for layer_slots in self._oasiskv_ring:
@@ -1428,6 +1436,8 @@ class HiSparseCoordinator:
         committed_lens_cpu: Optional[torch.Tensor] = None,
     ) -> None:
         if self.prefetcher_name == "oasiskv":
+            if (state := getattr(self, "oasiskv_graph_state", None)) is not None:
+                state.wait()
             if self._oasiskv_ring is None:
                 return
             valid_tasks = [
@@ -1594,6 +1604,8 @@ class HiSparseCoordinator:
         """
         if self.prefetcher_name != "oasiskv" or self.prefetcher is None:
             raise RuntimeError("plan_oasiskv_prefetch requires OasisKV mode")
+        if (state := getattr(self, "oasiskv_graph_state", None)) is not None:
+            state.wait()
         if (
             req_pool_indices_cpu.device.type != "cpu"
             or source_committed_lens_cpu.device.type != "cpu"
@@ -1986,6 +1998,8 @@ class HiSparseCoordinator:
         """
         if not self.is_dsv4_hisparse:
             raise RuntimeError("DSPARK HiSparse windows require DeepSeek-V4 C4")
+        if (state := getattr(self, "oasiskv_graph_state", None)) is not None:
+            state.wait()
         if self._has_pending_dspark_commit:
             # Commit copies may have been issued by another producer stream.
             # A stream dependency preserves overlap without a CPU-wide barrier.

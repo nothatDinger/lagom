@@ -272,16 +272,15 @@ def test_layer_selection_precedes_attention_and_transfer_reuses_its_plan():
     assert calls == [("select", 1), ("attention", 1), ("transfer", 1)]
 
 
-@pytest.mark.parametrize("graph", [False, True])
-def test_layer_selection_defers_until_residency_is_stable(graph):
+def test_eager_layer_selection_defers_until_residency_is_stable():
     calls = []
     coordinator = SimpleNamespace(
-        _active_dspark_window=None if graph else object(),
+        _active_dspark_window=object(),
         plan_oasiskv_prefetch=lambda **kwargs: calls.append(kwargs),
     )
     pending = {3: (coordinator, {"layer_id": 1})}
     fb = SimpleNamespace(
-        is_oasiskv_graph_capture=graph, _oasiskv_pending_prefetch=pending
+        is_oasiskv_graph_capture=False, _oasiskv_pending_prefetch=pending
     )
     assert not plan_oasiskv_layer_prefetch(fb, 3)
     assert not calls and "task" not in pending[3][1]
@@ -303,7 +302,7 @@ def test_layer_prefetch_defers_while_c4_commit_owns_destinations():
     assert forward_batch._oasiskv_pending_prefetch is pending
 
 
-def test_cuda_graph_replay_joins_all_layers_and_publishes_live_batch_metadata():
+def test_cuda_graph_replay_joins_all_previous_eager_layers():
     from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
     )
@@ -316,21 +315,6 @@ def test_cuda_graph_replay_joins_all_layers_and_publishes_live_batch_metadata():
     )
     runner = object.__new__(DecodeCudaGraphRunner)
     runner.model_runner = SimpleNamespace(hisparse_coordinator=coordinator)
-    runner._replay_graph_key = "bs2"
-    predicted = torch.arange(12).view(3, 4)
-    compressed_lens = torch.tensor([7, 13, 0])
-    runner._oasiskv_graph_prefetch = {
-        "bs2": {
-            3: (
-                coordinator,
-                {
-                    "compressed_seq_lens": compressed_lens,
-                    "predicted_c4_entries": predicted,
-                    "layer_id": 1,
-                },
-            )
-        }
-    }
     forward_batch = SimpleNamespace(
         is_oasiskv_paired=True,
         batch_size=2,
@@ -340,15 +324,13 @@ def test_cuda_graph_replay_joins_all_layers_and_publishes_live_batch_metadata():
     )
 
     runner._prepare_oasiskv_graph_replay(forward_batch)
-    runner._publish_oasiskv_graph_prefetch(forward_batch)
 
     assert [call["layer_id"] for call in consume_calls] == [0, 1]
-    _, submitted = forward_batch._oasiskv_pending_prefetch[3]
-    assert submitted["req_pool_indices"] is forward_batch.req_pool_indices
-    assert submitted["req_pool_indices_cpu"] is forward_batch.req_pool_indices_cpu
-    assert submitted["source_committed_lens_cpu"] is forward_batch.seq_lens_cpu
-    assert submitted["compressed_seq_lens"].tolist() == [7, 13]
-    assert submitted["predicted_c4_entries"].tolist() == predicted[:2].tolist()
+    for submitted in consume_calls:
+        assert submitted["req_pool_indices"] is forward_batch.req_pool_indices
+        assert submitted["req_pool_indices_cpu"] is forward_batch.req_pool_indices_cpu
+        assert submitted["committed_lens_cpu"] is forward_batch.seq_lens_cpu
+    assert not hasattr(forward_batch, "_oasiskv_pending_prefetch")
 
 
 def test_oasiskv_graph_logits_and_hidden_states_have_different_live_widths():

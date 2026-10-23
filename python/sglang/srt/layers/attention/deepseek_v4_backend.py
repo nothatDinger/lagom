@@ -1138,6 +1138,14 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ) -> None:
+        if (
+            not in_capture
+            and (
+                state := getattr(self.hisparse_coordinator, "oasiskv_graph_state", None)
+            )
+            is not None
+        ):
+            state.wait()
         bucket = _GraphBucket.of(forward_batch.forward_mode)
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
@@ -1465,6 +1473,16 @@ class DeepseekV4AttnBackend(
         self.forward_metadata = capture_metadata
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
+        coordinator = self.hisparse_coordinator
+        if (
+            not self.is_draft_runner
+            and coordinator is not None
+            and coordinator.prefetcher_name == "oasiskv"
+            and coordinator.oasiskv_graph_state is None
+        ):
+            from sglang.srt.managers.oasiskv_v4_graph import OasisKVV4GraphState
+
+            coordinator.oasiskv_graph_state = OasisKVV4GraphState(coordinator)
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
             _GraphBucket,
             Dict[
@@ -1495,6 +1513,19 @@ class DeepseekV4AttnBackend(
             device=self.device,
             is_read=False,
         )
+
+    def finish_forward_in_graph(self, forward_batch: ForwardBatch) -> None:
+        if not self.is_draft_runner and getattr(
+            forward_batch, "is_oasiskv_paired", False
+        ):
+            self.hisparse_coordinator.oasiskv_graph_state.finish_in_graph()
+
+    def finish_cuda_graph_replay(self, forward_batch: ForwardBatch) -> None:
+        # An IDLE replay still executes the captured side streams with a zero
+        # real-request count, and writes task scratch. Fence it before reuse too.
+        state = getattr(self.hisparse_coordinator, "oasiskv_graph_state", None)
+        if not self.is_draft_runner and state is not None:
+            state.finish_replay(forward_batch)
 
     @property
     def verify_mask(self) -> Optional[VerifyMask]:

@@ -1960,8 +1960,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         if getattr(forward_batch, "is_oasiskv_paired", False):
             # Selection was submitted by the indexer. Start its H2D after the
             # attention reads, while FFN/later layers run on the foreground. A C4
-            # boundary transaction is deliberately left for the post-commit
-            # drain to avoid overwriting a destination being promoted.
+            # boundary in eager mode uses the post-commit drain; graphs filter
+            # uncommitted C4s and join these transfers before root promotion.
             from sglang.srt.speculative.oasiskv_lookahead import (
                 submit_oasiskv_layer_prefetch,
             )

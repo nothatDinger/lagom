@@ -5,7 +5,7 @@ description: "Lookahead KV prefetch for MHA/GQA, MLA, native DSA, and DeepSeek-V
 
 This branch implements the lookahead execution contract from [OasisKV v1](https://arxiv.org/pdf/2608.08097v1): run a real token and one draft token through the target, use the draft query to prepare the next working set, and commit only the real token. You need a compatible EAGLE-3 draft checkpoint; an arbitrary smaller language model is not a substitute.
 
-The generic backend includes eager execution and a full CUDA graph decode implementation. CPU reference, Triton interpreter, and integration tests cover attention, ownership, configuration, and memory accounting. Capture/replay, full model generation, quality, and performance still require validation on NVIDIA GPUs. This branch does not implement the paper's remote partial fetch service or claim its reported speedups.
+The generic backend and DeepSeek-V4 specialization include full CUDA graph decode paths with captured selection and transfer streams. CPU reference, Triton interpreter, and integration tests cover attention, ownership, configuration, and memory accounting. Capture/replay, full model generation, quality, and performance still require validation on NVIDIA GPUs. This branch does not implement the paper's remote partial fetch service or claim its reported speedups.
 
 ## Choose a path
 
@@ -77,7 +77,20 @@ python -m sglang.launch_server \
 
 Here `prefetcher_config.size` counts logical C4 entries, so 512 entries cover 2048 original tokens. It is independent of the generic backend's block budget. The restored path includes per-layer prefetch task rings, generation/position validation, C4 transactional scratch, root-only commit, logprob row selection, and target/draft CUDA graph support. Indexer prediction and attention use the foreground stream, with the real Top-K miss refill between them. The draft row shares the real row's resolved history and does not trigger another immediate refill.
 
-With `--disable-cuda-graph`, steps without an active C4 transaction submit background selection after each layer's real refill. The planner writes task-owned token/LRU metadata and a miss list, leaving live tables and KV unchanged. After attention, the transfer stream copies missing KV and publishes the planned tables. This can overlap the layer's FFN and later layers; no extra KV staging buffer is allocated. C4-boundary steps plan and transfer after commit so they observe the committed residency. Graph replay publishes pending tasks after replay, so it retains post-replay selection/transfer and does not provide the eager path's same-forward layer overlap.
+The full target graph captures per-layer background selection after the real-query refill. Selection snapshots token/LRU metadata and records misses without changing live KV. After that layer's attention, the transfer stream waits for selection, copies host KV directly into the resident slots, and publishes the planned metadata. This can overlap the layer's FFN and later layers. The graph reuses fixed per-layer ring scratch; it allocates no extra KV staging buffer. Padding rows cannot publish metadata even when their request IDs repeat a live request.
+
+Captured selection admits only C4 entries that were committed before the paired forward. A C4 completed by the current real token remains in transactional scratch for attention, then moves to its fixed slot after the graph finishes. Draft-only C4 entries are discarded. The selection and transfer streams join at the model tail before root-only C4 promotion: short-context selection leaves the hot table unchanged, and long-context selection never writes the reserved newest slot. C4 host-page allocation, promotion, and scratch rollback remain outside the captured target forward. These graph boundaries preserve cross-layer overlap within the forward; transfers do not extend past the graph's end.
+
+With `--disable-cuda-graph`, steps without an active C4 transaction keep the same per-layer selection/attention/transfer ordering. Eager C4-boundary steps still plan and transfer after commit. Switching between eager and graph execution waits for outstanding writers before reusing ring scratch. Request reclamation waits for both graph transfers and any later C4 commit before freeing host pages.
+
+Before running a full V4 model, run the checkpoint-free CUDA regression from the repository root:
+
+```bash
+PYTHONPATH=python python -m pytest -q \
+  test/registered/cuda_graph/test_oasiskv_v4_cuda_graph.py
+```
+
+It covers two layers and multiple graph buckets, real-query misses, byte-exact V4 KV reads, padding, request reordering/reuse, short and long C4 boundaries, root-only commit, and the native 512-entry selection width. This test is skipped without a CUDA GPU; it does not validate the complete V4 indexer or attention model.
 
 See [HiSparse](/docs/advanced_features/hisparse_guide) for the underlying C4 pool configuration.
 
