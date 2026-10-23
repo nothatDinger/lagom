@@ -10,7 +10,7 @@
 | --- | --- |
 | Target | `/mnt/public_data/Qwen/Qwen3-8B`；`/mnt/public_data/Qwen/Qwen3-235B-A22B` |
 | GPU / TP | 8B：1 × H100 80GB / TP=1；235B：8 × H100 80GB / TP=8 |
-| Draft 本地目录 | 8B：`/mnt/public_data/Qwen3-8B_eagle3`；235B：`/mnt/public_data/Qwen3-235B-A22B-EAGLE3` |
+| Draft 本地目录 | 8B：`/mnt/public_data/Qwen3-8B_eagle3`；235B：`/mnt/public_data/Qwen3-235B-A22B-Eagle3` |
 | 输入 / 输出 | 16,384、32,768 / 2,048 token；上下文上限 40,960，留出 lookahead 空间 |
 | 最大并发 | 8、16、32、64、128、256；同时设置客户端并发与服务端 `max-running-requests` |
 | 方法 | SGLang dense FA3；本分支 OasisKV |
@@ -29,6 +29,18 @@ preflight 检查可见 H100 数量和显存，并保存 CPU、内存和 GPU 拓�
 `config.json` 的 CUDA 设备编号可按目标机器调整；两模型按顺序执行，不同时争用 GPU。
 
 ## 与论文的边界
+
+当前 decode CUDA graph 状态（配置与代码核对，尚未在 GPU 上验证 capture/replay）：
+
+| 测试方法 | Decode CUDA graph |
+| --- | --- |
+| SGLang dense / FA3 | 使用默认 `full` 配置；启动命令没有关闭 graph。实际 capture、batch 覆盖与 replay 需看运行日志。 |
+| 通用 OasisKV（本次两个 Qwen 模型） | 强制 `disabled`；target 和 EAGLE-3 draft 都走 eager。 |
+
+通用路径在 `arg_groups/speculative_hook.py` 中设置 `disable_cuda_graph=True`，
+`server_args.py` 的 attention backend 兼容处理又将 decode/prefill backend 设为 `disabled`；
+draft worker 也据此跳过 graph capture。因此不能仅添加一个启用参数就视为完成 graph 支持。
+要对齐论文的 graph 配置，还需要实现并验证通用 OasisKV 的 graph 执行路径。
 
 - 原论文使用 vLLM V1 v0.12.0；dense 使用 FA3/full CUDA graphs，OasisKV 使用 piecewise graphs。
   此处是 **SGLang 移植版与同框架 dense 的对照**。当前通用 OasisKV 禁用 CUDA graphs，预测在主流、
