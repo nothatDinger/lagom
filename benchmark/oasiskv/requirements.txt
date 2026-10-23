@@ -1,0 +1,8 @@
+# The server must already have this branch of SGLang and its CUDA dependencies.
+aiohttp>=3.9
+numpy>=1.26
+transformers>=4.51
+huggingface-hub>=0.30
+msgspec>=0.18
+pyzmq>=25
+matplotlib>=3.8

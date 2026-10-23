@@ -270,7 +270,9 @@ class SchedulerMetricsReporter:
         if batch.forward_mode.is_mixed():
             decode_req_ids = {id(req) for req in batch.decoding_reqs or []}
             prefill_reqs = [req for req in batch.reqs if id(req) not in decode_req_ids]
-        elif batch.forward_mode.is_extend():
+        elif (
+            batch.forward_mode.is_extend() and not batch.forward_mode.is_target_verify()
+        ):
             prefill_reqs = batch.reqs
         else:
             prefill_reqs = []
@@ -287,7 +289,9 @@ class SchedulerMetricsReporter:
         if batch.forward_mode.is_mixed():
             for req in batch.decoding_reqs or []:
                 decode_kv.add(req.seqlen)
-        elif batch.forward_mode.is_decode():
+        elif batch.forward_mode.is_decode() or batch.forward_mode.is_target_verify():
+            # Verification is a decode iteration. seq_lens_cpu has one entry
+            # per request, unlike the expanded target/draft query rows.
             for sl in batch.seq_lens_cpu:
                 decode_kv.add(int(sl))
 

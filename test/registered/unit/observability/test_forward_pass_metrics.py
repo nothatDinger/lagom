@@ -54,6 +54,9 @@ class _FakeForwardMode:
     def is_decode(self):
         return not self._is_mixed and not self._is_extend
 
+    def is_target_verify(self):
+        return False
+
 
 class _CollectingPublisher:
     def __init__(self):
@@ -205,6 +208,20 @@ class TestForwardPassMetrics(unittest.TestCase):
             self.scheduler._fpm_publisher.metrics[0].wall_time, 0.042, places=4
         )
         self.assertAlmostEqual(self.scheduler._fpm_gpu_time_acc, 0.0)
+
+    def test_verify_counts_requests_as_decode_not_prefill(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        batch = self._make_batch(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            reqs=[_FakeReq(16384, output_len=3), _FakeReq(32768, output_len=3)],
+            seq_lens_cpu=[16387, 32771],
+        )
+        metrics = self.reporter._build_scheduled_request_metrics(batch)
+        self.assertEqual(metrics.num_prefill_requests, 0)
+        self.assertEqual(metrics.sum_prefill_tokens, 0)
+        self.assertEqual(metrics.num_decode_requests, 2)
+        self.assertEqual(metrics.sum_decode_kv_tokens, 49158)
 
     def test_emit_skips_when_device_timer_zero(self):
         self.scheduler._fpm_uses_device_timer = True
