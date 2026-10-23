@@ -5,7 +5,7 @@ description: "Lookahead KV prefetch for MHA/GQA, MLA, native DSA, and DeepSeek-V
 
 This branch implements the lookahead execution contract from [OasisKV v1](https://arxiv.org/pdf/2608.08097v1): run a real token and one draft token through the target, use the draft query to prepare the next working set, and commit only the real token. You need a compatible EAGLE-3 draft checkpoint; an arbitrary smaller language model is not a substitute.
 
-The generic backend is an experimental eager implementation. CPU tensor and integration tests cover its attention, ownership, configuration, and memory accounting. CUDA copies, full model generation, quality, and performance still require validation on NVIDIA GPUs. This branch does not implement the paper's remote partial fetch service or claim its reported speedups.
+The generic backend includes eager execution and a full CUDA graph decode implementation. CPU reference, Triton interpreter, and integration tests cover attention, ownership, configuration, and memory accounting. Capture/replay, full model generation, quality, and performance still require validation on NVIDIA GPUs. This branch does not implement the paper's remote partial fetch service or claim its reported speedups.
 
 ## Choose a path
 
@@ -57,7 +57,9 @@ Do not pass `--enable-hisparse` or an explicit `--speculative-algorithm` for the
 
 The target's persistent GPU KV payload is bounded by `(top_k + block_size)` tokens per local KV head and layer. Quest summaries still grow with context length; native DSA retains its growing indexer cache instead. Host history grows with live requests. The draft's full KV history remains on GPU. Memory profiling reserves the target working sets, summaries/indexer keys, draft KV, and prefill workspace. Set `--max-total-tokens`, context length, and concurrency to fit both host RAM and GPU memory.
 
-The generic implementation disables target and draft CUDA graphs. It supports full causal self-attention with unquantized FP16/BF16 KV (FP32 for tensor reference tests). Pipeline/context parallelism, DSA layer sharding, unified KV pools, radix prefix reuse, hybrid sliding-window/recurrent models, attention sinks, custom score modifiers, and PD disaggregation are outside this path. DeepSeek-V4 uses its specialization below.
+The generic implementation keeps target and draft decode CUDA graphs enabled by default. A fixed GPU request table supplies current host/device pointers, lengths, capacities, and LRU steps. Request allocation, host growth, and ownership updates run outside replay; kernels capture root KV backup, summary updates, prediction, real-query refill, and attention. Selection and transfer use captured side streams with per-layer dependencies. These streams join at the model tail, allowing overlap with later layers but requiring prefetch to finish before the graph ends. Use `--disable-cuda-graph` for an eager comparison. Variable-length dense prefill remains eager.
+
+The backend supports full causal self-attention with unquantized FP16/BF16 KV (FP32 for tensor reference tests). Pipeline/context parallelism, DSA layer sharding, unified KV pools, radix prefix reuse, hybrid sliding-window/recurrent models, attention sinks, custom score modifiers, and PD disaggregation are outside this path. DeepSeek-V4 uses its specialization below.
 
 ## Run the DeepSeek-V4 specialization
 

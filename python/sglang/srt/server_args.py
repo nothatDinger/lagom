@@ -5969,7 +5969,8 @@ class ServerArgs:
         # Torch native and flex attention backends
         attention_backend = resolved_view(self).attention_backend
         if attention_backend == "oasiskv":
-            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            # Decode/TARGET_VERIFY use the fixed-table multi-stream graph path.
+            # Variable-length dense prefill still uses the eager host-backed path.
             self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         if attention_backend == "torch_native":

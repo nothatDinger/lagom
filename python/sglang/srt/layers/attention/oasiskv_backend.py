@@ -1,4 +1,4 @@
-"""Eager OasisKV backend for MHA, GQA, absorbed MLA and native DSA.
+"""OasisKV backend for MHA, GQA, absorbed MLA and native DSA.
 
 Native DSA delegates Indexer metadata to SGLang's DSA backend. Real logical
 Top-K drives demand refill; draft logical Top-K drives lookahead prefetch.
@@ -18,6 +18,8 @@ class OasisKVAttnBackend(AttentionBackend):
         self.req_pool = model_runner.req_to_token_pool
         self.pool = model_runner.token_to_kv_pool
         self.cache = self.pool.oasiskv_cache
+        self.graph_state = None
+        self.graph_mode = False
         self.use_mha = False  # Native MLA/DSA always passes absorbed projections.
         self.dsa = None
         if self.cache.config.native_sparse:
@@ -29,6 +31,7 @@ class OasisKVAttnBackend(AttentionBackend):
             self.dsa.use_fused_topk = False
 
     def init_forward_metadata(self, forward_batch):
+        self.graph_mode = False
         if forward_batch.forward_mode.is_idle():
             self.rows = []
             return
@@ -62,6 +65,62 @@ class OasisKVAttnBackend(AttentionBackend):
             generation = int(self.req_pool.req_generation[slot])
             self.rows.append((slot, generation, int(prefix), start, int(length)))
             start += int(length)
+
+    def init_cuda_graph_state(self, max_bs, max_num_tokens):
+        from sglang.srt.mem_cache.oasiskv_graph import OasisKVGraphState
+
+        self.graph_state = OasisKVGraphState(
+            self.cache,
+            max_bs,
+            self.req_pool.max_context_len,
+            self.pool.layer_num,
+            self.pool.start_layer or 0,
+        )
+        if self.dsa is not None:
+            self.dsa.init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
+        self.graph_mode = True
+        self.graph_paired = forward_batch.forward_mode.is_target_verify()
+        if self.dsa is not None:
+            self.dsa.init_forward_metadata_out_graph(forward_batch, in_capture)
+            self.dsa.use_mha = False
+        if in_capture:
+            # Warmup/capture must never append to a live request. All kernels
+            # execute with inactive table rows, including graph padding.
+            self.graph_state.tables.zero_()
+            self.graph_state.tables[..., 7] = -1
+            return
+        actual = getattr(
+            forward_batch, "actual_forward_mode", forward_batch.forward_mode
+        )
+        if actual.is_idle():
+            slots, generations, prefixes = [], [], []
+        else:
+            raw_bs = forward_batch.batch_size - getattr(forward_batch, "num_padding", 0)
+            slots_cpu = forward_batch.req_pool_indices_cpu
+            if slots_cpu is None or forward_batch.seq_lens_cpu is None:
+                raise ValueError(
+                    "OasisKV graph replay requires scheduler CPU request/length mirrors"
+                )
+            slots = slots_cpu[:raw_bs].tolist()
+            generations = [int(self.req_pool.req_generation[slot]) for slot in slots]
+            lengths = forward_batch.seq_lens_cpu[:raw_bs].tolist()
+            prefixes = (
+                lengths if self.graph_paired else [length - 1 for length in lengths]
+            )
+        self.graph_state.prepare(slots, generations, prefixes, paired=self.graph_paired)
+
+    def init_forward_metadata_in_graph(self, forward_batch):
+        if self.dsa is not None:
+            self.dsa.init_forward_metadata_in_graph(forward_batch)
+
+    def finish_forward_in_graph(self, forward_batch):
+        if self.graph_paired:
+            self.graph_state.finish_in_graph()
+
+    def finish_cuda_graph_replay(self, forward_batch):
+        self.graph_state.finish_replay()
 
     def get_indexer_metadata(self, layer_id, forward_batch):
         if self.dsa is None:
@@ -142,6 +201,16 @@ class OasisKVAttnBackend(AttentionBackend):
         q = q.reshape(q.shape[0], layer.tp_q_head_num, -1)
         k = k.reshape(k.shape[0], layer.tp_k_head_num, -1)
         v = v.reshape(v.shape[0], layer.tp_v_head_num, -1)
+        if getattr(self, "graph_mode", False):
+            return self.graph_state.forward(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch.batch_size,
+                paired=self.graph_paired,
+                topk=topk_indices,
+            )
         if getattr(forward_batch, "is_oasiskv_dummy", False):
             return self._dummy_attention(q, k, v, layer, forward_batch.batch_size)
         paired = getattr(forward_batch, "is_oasiskv_paired", False)

@@ -169,6 +169,7 @@ def build_replay_fb_view(
         input_ids=buffers.input_ids[:num_tokens],
         positions=buffers.positions[:num_tokens],
         req_pool_indices=buffers.req_pool_indices[:bs],
+        req_pool_indices_cpu=getattr(forward_batch, "req_pool_indices_cpu", None),
         seq_lens=buffers.seq_lens[:bs],
         seq_lens_sum=(
             None
@@ -1209,6 +1210,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch,
                     **kwargs,
                 )
+                attn_backend.finish_forward_in_graph(forward_batch)
                 for capture_hook in self.model_runner.capture_tail_hooks:
                     capture_hook(self, out, forward_batch, num_tokens)
                 return out
@@ -1477,6 +1479,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._publish_read_done(in_graph=False)
 
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+            self._replay_attn_backend().finish_cuda_graph_replay(forward_batch)
             self._publish_oasiskv_graph_prefetch(forward_batch)
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:

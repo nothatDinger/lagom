@@ -197,14 +197,13 @@ def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
             or getattr(server_args, "disaggregation_mode", "null") != "null"
         ):
             raise ValueError(
-                "Generic OasisKV requires eager attention without context "
+                "Generic OasisKV requires attention without context "
                 "parallelism, layer sharding, unified KV pools, two-batch overlap, or PD disaggregation"
             )
         # Native DSA defaults to FP8 on some GPUs, but this pool stores the
         # unquantized latent K/V delivered by the absorbed attention path.
         if getattr(server_args, "kv_cache_dtype", "auto") == "auto":
             server_args.kv_cache_dtype = "bfloat16"
-        server_args.disable_cuda_graph = True
         if server_args.max_running_requests is None:
             server_args.max_running_requests = 32
     if not server_args.enable_hisparse and not generic:
@@ -238,8 +237,8 @@ def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
     # verify path below hard-commits one root token and never accepts a draft.
     server_args.speculative_num_draft_tokens = 2
     server_args.speculative_algorithm = "EAGLE3"
-    # Keep CUDA graphs enabled. OasisKV stages request identities before target
-    # replay and publishes graph-stable draft prediction tensors afterwards.
+    # Keep CUDA graphs enabled. Generic decode captures the per-layer pipeline;
+    # the V4 path publishes graph-stable predictions for post-commit prefetch.
     # Passing --disable-cuda-graph remains an explicit eager/pipelined A/B mode.
     # DeepSeek-V4 enables FlashInfer all-reduce fusion automatically on H100.
     # Its workspace performs a separate NCCL rendezvous while the internal
@@ -254,7 +253,11 @@ def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
     logger.info(
         "OasisKV LOOKAHEAD_ONLY enabled: EAGLE-3 steps=1 topk=1; "
         "only root tokens are committed; %s",
-        "generic eager execution" if generic else "target and draft graphs enabled",
+        (
+            "eager execution"
+            if getattr(server_args, "disable_cuda_graph", False)
+            else "target and draft graphs enabled"
+        ),
     )
 
 

@@ -39,11 +39,15 @@ class ProtocolTests(unittest.TestCase):
             "max_running_requests": 8,
             "is_oasiskv_lookahead": True,
             "speculative_num_draft_tokens": 2,
+            "cuda_graph_config": {"decode": {"backend": "full", "max_bs": 8}},
         }
         validate_server_info({"internal_states": [state]}, config, point)
         for key, value in (
             ("attention_backend", "fa3"),
             ("is_oasiskv_lookahead", False),
+            ("disable_cuda_graph", True),
+            ("cuda_graph_config", {"decode": {"backend": "disabled", "max_bs": 8}}),
+            ("cuda_graph_config", {"decode": {"backend": "full", "max_bs": 4}}),
         ):
             with self.assertRaises(ValueError):
                 validate_server_info(
@@ -100,6 +104,10 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn("--disable-radix-cache", cmd)
         self.assertNotIn("--enable-hisparse", cmd)
         self.assertNotIn("--max-total-tokens", cmd)
+        self.assertEqual(
+            json.loads(cmd[cmd.index("--cuda-graph-config") + 1]),
+            {"decode": {"backend": "full", "max_bs": oasis["concurrency"]}},
+        )
         dense = server_command(config, points[0], 30000, "ipc:///tmp/example")
         self.assertNotIn("--speculative-draft-model-path", dense)
         self.assertEqual(dense[dense.index("--attention-backend") + 1], "fa3")

@@ -246,15 +246,16 @@ def generic_args(**overrides):
         speculative_eagle_topk=None,
         speculative_num_draft_tokens=None,
         kv_cache_dtype="auto",
+        disable_cuda_graph=False,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
 
 
-def test_generic_cli_enables_root_only_eager_execution():
+def test_generic_cli_keeps_graphs_enabled_for_root_only_execution():
     args = generic_args()
     _handle_oasiskv_lookahead(args)
-    assert args.is_oasiskv_lookahead and args.disable_cuda_graph
+    assert args.is_oasiskv_lookahead and not args.disable_cuda_graph
     assert args.speculative_algorithm == "EAGLE3"
     assert args.speculative_num_draft_tokens == 2
     assert args.kv_cache_dtype == "bfloat16"

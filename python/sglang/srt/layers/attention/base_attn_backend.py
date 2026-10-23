@@ -160,6 +160,12 @@ class AttentionBackend(ABC):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()
 
+    def finish_forward_in_graph(self, forward_batch: ForwardBatch):
+        """Graph-recordable model-tail work, e.g. joining captured side streams."""
+
+    def finish_cuda_graph_replay(self, forward_batch: ForwardBatch):
+        """Host bookkeeping after replay is enqueued; must not launch model work."""
+
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self,
         forward_batch: ForwardBatch,

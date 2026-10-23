@@ -224,6 +224,16 @@ def validate_server_info(info, config, point):
                 raise ValueError(
                     f"Resolved server {key}={state.get(key)!r}; expected {value!r}"
                 )
+        decode_graph = state.get("cuda_graph_config", {}).get("decode", {})
+        if (
+            state.get("disable_cuda_graph", False)
+            or decode_graph.get("backend") != "full"
+            or (decode_graph.get("max_bs") or 0) < point["concurrency"]
+        ):
+            raise ValueError(
+                "Resolved decode CUDA graph must be full and cover the requested concurrency; "
+                f"observed {decode_graph!r}"
+            )
 
 
 async def wait_ready(session, url, process, timeout):

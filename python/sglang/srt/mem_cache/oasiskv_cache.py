@@ -279,13 +279,14 @@ class OasisKVLayerCache:
         plan = plan_delta(selected, self.resident, self.ages, self.step)
         try:
             self._copy_plan(plan)
+            self.resident.copy_(plan.block_ids)
+            self.ages.copy_(plan.last_selected)
         finally:
             # A forward can fail before background selection/transfer is
             # submitted. Reclamation must still wait for this UVA host reader.
             if self.pipeline.cuda:
                 self.refill_done = torch.cuda.Event()
                 self.refill_done.record(torch.cuda.current_stream(self.device))
-        self.resident, self.ages = plan.block_ids, plan.last_selected
         self.attention_blocks = selected
         self.initialized = True
 
@@ -328,16 +329,23 @@ class OasisKVLayerCache:
             # Prediction and selection may finish before current attention.
             # Only the writer must wait until that attention has read data.
             pipeline.transfer.wait_stream(torch.cuda.current_stream(self.device))
-            for tensor in (plan.sources, plan.destinations, plan.counts):
+            for tensor in (
+                plan.sources,
+                plan.destinations,
+                plan.counts,
+                plan.block_ids,
+                plan.last_selected,
+            ):
                 tensor.record_stream(pipeline.transfer)
         with pipeline.context("transfer"):
             self._copy_plan(plan)
+            self.resident.copy_(plan.block_ids)
+            self.ages.copy_(plan.last_selected)
             if pipeline.cuda:
                 self.pending = torch.cuda.Event()
                 self.pending.record(pipeline.transfer)
         # Keep current-round logical IDs unchanged until attention is enqueued.
         # The next append/attention joins pending before using these new IDs.
-        self.resident, self.ages = plan.block_ids, plan.last_selected
         self.prefetch_submissions += 1
 
     def prefetch(self, draft_query, explicit=None):

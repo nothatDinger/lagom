@@ -34,16 +34,28 @@ preflight 检查可见 H100 数量和显存，并保存 CPU、内存和 GPU 拓�
 
 | 测试方法 | Decode CUDA graph |
 | --- | --- |
-| SGLang dense / FA3 | 使用默认 `full` 配置；启动命令没有关闭 graph。实际 capture、batch 覆盖与 replay 需看运行日志。 |
-| 通用 OasisKV（本次两个 Qwen 模型） | 强制 `disabled`；target 和 EAGLE-3 draft 都走 eager。 |
+| SGLang dense / FA3 | 显式配置 decode `full`，`max_bs` 为该点并发上限。实际 capture 与 replay 需看运行日志。 |
+| 通用 OasisKV（本次两个 Qwen 模型） | 显式配置 decode `full`，`max_bs` 为该点并发上限；target paired decode 和 EAGLE-3 draft 不再被强制关闭 graph。新增通用路径尚待 GPU capture/replay 实测。 |
 
-通用路径在 `arg_groups/speculative_hook.py` 中设置 `disable_cuda_graph=True`，
-`server_args.py` 的 attention backend 兼容处理又将 decode/prefill backend 设为 `disabled`；
-draft worker 也据此跳过 graph capture。因此不能仅添加一个启用参数就视为完成 graph 支持。
-要对齐论文的 graph 配置，还需要实现并验证通用 OasisKV 的 graph 执行路径。
+通用 decode 通过固定 GPU 请求表间接访问各请求的 host KV、摘要和 device working set；
+请求身份、长度和扩容后的地址在 replay 前更新。图内执行 root KV 追加、摘要更新、预测、
+真实 Top-K 补载、attention，以及独立 stream 上的选择/传输。传输等待本层 attention，
+在模型末尾汇合所有侧流，因此可与后续层重叠，但不会跨过本轮 graph 尾部。
+host 分配/扩容和请求回收在图外，变长 dense prefill 暂时仍为 eager。
+`--disable-cuda-graph` 保留为显式 eager 对照；正式测试须确认日志中的实际 capture/replay。
+性能脚本检查服务端解析后的 decode graph 配置；若关闭 graph 或最大 batch 不覆盖该点并发，会将该点判为失败。
+
+先在目标 CUDA 环境从仓库根目录执行无需 checkpoint 的图回归测试，再进行服务 smoke：
+
+```bash
+PYTHONPATH=python python -m pytest -q test/registered/cuda_graph/test_oasiskv_cuda_graph.py
+```
+
+测试覆盖连续 replay、不同请求顺序、padding、host 扩容、请求槽复用，以及 MHA/GQA、MLA 和原生 DSA 的 KV 路径。
+它验证 attention/cache 内核及多流图依赖；原生 DSA 的实际模型 indexer 和 EAGLE-3 worker 仍需完整服务 smoke 验证。
 
 - 原论文使用 vLLM V1 v0.12.0；dense 使用 FA3/full CUDA graphs，OasisKV 使用 piecewise graphs。
-  此处是 **SGLang 移植版与同框架 dense 的对照**。当前通用 OasisKV 禁用 CUDA graphs，预测在主流、
+  此处是 **SGLang 移植版与同框架 dense 的对照**。当前通用 OasisKV 使用 full decode graphs，预测在主流、
   选择/传输在后台；论文的 C++ worker 和三条后台流水并不等同于当前实现。
 - 按本分支的既有要求，每步真实 query 都补载 miss，draft 只预测与预载、强制拒绝。
   `max_new_blocks` 仅约束后台预取，不限制真实 query 补载；不能将其等同于论文 capped resident attention。

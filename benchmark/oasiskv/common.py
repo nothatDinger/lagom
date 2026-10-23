@@ -146,6 +146,11 @@ def server_command(config, point, port, endpoint, draft_path=None):
         str(config["context_length"]),
         "--max-running-requests",
         str(point["concurrency"]),
+        "--cuda-graph-config",
+        json.dumps(
+            {"decode": {"backend": "full", "max_bs": point["concurrency"]}},
+            separators=(",", ":"),
+        ),
         "--mem-fraction-static",
         str(config["mem_fraction_static"]),
         "--chunked-prefill-size",
