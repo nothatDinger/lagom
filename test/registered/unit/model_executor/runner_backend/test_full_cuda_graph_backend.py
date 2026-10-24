@@ -20,10 +20,13 @@ profiler stepping) is pure-Python and runs on CPU.
 """
 
 import contextlib
+import gc
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
@@ -54,6 +57,7 @@ def _make_backend(runner):
     backend = FullCudaGraphBackend.__new__(FullCudaGraphBackend)
     backend._graphs = {}
     backend._outputs = {}
+    backend._capture_inputs = {}
     backend._pool = None
     backend._capture_stream = None
     backend._memory_saver_adapter = None
@@ -156,6 +160,45 @@ class TestCaptureOneWithProfiling(CustomTestCase):
         # trace naming is handled by the profiler's on_trace_ready callback.
         _, _, rf_names = self._run(size=4, num_tokens_per_bs=1, mode_name="DECODE")
         self.assertEqual(rf_names, [])
+
+
+class TestCaptureInputLifetime(CustomTestCase):
+    def test_external_pair_indices_live_until_their_graph_is_released(self):
+        runner = _make_runner(enable_profile=False, profiler=None)
+        backend = _make_backend(runner)
+
+        def capture(bs):
+            rows = torch.arange(2 * bs)
+            valid = torch.ones(bs, dtype=torch.bool)
+            batch = SimpleNamespace(
+                normal_rows=rows[::2], draft_rows=rows[1::2], draft_valid=valid
+            )
+
+            def forward():
+                # The output owns neither the external index nor its base.
+                return torch.zeros(2 * bs, 4)[batch.normal_rows]
+
+            with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
+                backend.capture_one(ShapeKey(size=bs), forward, capture_inputs=batch)
+            return weakref.ref(rows), weakref.ref(valid)
+
+        refs = {bs: capture(bs) for bs in (8, 4, 2, 1)}
+        gc.collect()  # capture-local ForwardBatch and forward closures are gone
+        for bs, (rows, valid) in refs.items():
+            self.assertIsNotNone(rows(), f"bs={bs}: paired row storage was freed")
+            self.assertIsNotNone(valid(), f"bs={bs}: draft-valid storage was freed")
+            torch.testing.assert_close(rows(), torch.arange(2 * bs))
+
+        # Replacing one graph releases only its old inputs; other buckets stay live.
+        old_rows, old_valid = refs[2]
+        refs[2] = capture(2)
+        gc.collect()
+        self.assertIsNone(old_rows())
+        self.assertIsNone(old_valid())
+        self.assertIsNotNone(refs[1][0]())
+        backend.cleanup()
+        gc.collect()
+        self.assertTrue(all(ref() is None for pair in refs.values() for ref in pair))
 
 
 if __name__ == "__main__":

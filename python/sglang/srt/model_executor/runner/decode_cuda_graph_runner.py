@@ -1246,7 +1246,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.backend.capture_one(
                     shape_key,
                     run_once,
-                    capture_inputs=None,
+                    # Paired row indices and draft validity are allocated before
+                    # capture, outside the graph pool. Keep their batch owner
+                    # alive for every shape, including the LM-head row gather.
+                    capture_inputs=(
+                        forward_batch
+                        if getattr(forward_batch, "is_oasiskv_paired", False)
+                        else None
+                    ),
                     post_warmup_hook=post_warmup_hook,
                 )
                 if getattr(forward_batch, "_oasiskv_pending_prefetch", None):

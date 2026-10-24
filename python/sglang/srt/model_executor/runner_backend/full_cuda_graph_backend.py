@@ -57,6 +57,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
+        self._capture_inputs: Dict[Any, Any] = {}
         self._pool = None
         self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
@@ -133,6 +134,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+        # External tensors allocated before capture are not owned by the graph
+        # pool. Recording their addresses does not retain their Python owners.
+        self._capture_inputs[shape_key] = capture_inputs
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -153,4 +157,5 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     def cleanup(self) -> None:
         self._graphs.clear()
         self._outputs.clear()
+        self._capture_inputs.clear()
         self._pool = None
