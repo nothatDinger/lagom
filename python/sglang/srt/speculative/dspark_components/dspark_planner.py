@@ -89,9 +89,14 @@ class DSparkVerifyPlanner:
             server_args.speculative_dspark_align_verify_tokens_to_graph_tier
         )
 
-        self._confidence_head = getattr(self.draft_model, "confidence_head", None)
+        lookahead = getattr(server_args, "is_oasiskv_lookahead", False)
+        self._confidence_head = (
+            None if lookahead else getattr(self.draft_model, "confidence_head", None)
+        )
 
-        sts_path = server_args.speculative_dspark_confidence_sts_path
+        sts_path = (
+            None if lookahead else server_args.speculative_dspark_confidence_sts_path
+        )
         if sts_path and self._confidence_head is not None:
             calibration = load_sts_calibration_from_path(sts_path)
             sts_temperatures = torch.tensor(
@@ -129,7 +134,11 @@ class DSparkVerifyPlanner:
                     sts_path,
                 )
 
-        self._ragged_verify_mode = read_ragged_verify_mode()
+        # OasisKV always executes one real row and one disposable probe. No
+        # acceptance budget or confidence gate may trim either row away.
+        self._ragged_verify_mode = (
+            RaggedVerifyMode.STATIC if lookahead else read_ragged_verify_mode()
+        )
         self._schedule_cfg = DSparkScheduleConfig(gamma=self.gamma)
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
         self._dynamic_graph_tier = False

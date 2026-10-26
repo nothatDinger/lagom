@@ -22,13 +22,14 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
 from sglang.srt.model_executor.runner_utils.buffers import DecodeInputBuffers
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
-def _runner(device, monkeypatch):
+def _runner(device, monkeypatch, algorithm):
     import sglang.srt.model_executor.runner.decode_cuda_graph_runner as module
 
     for name in (
@@ -40,6 +41,8 @@ def _runner(device, monkeypatch):
     monkeypatch.setattr(module, "enable_num_token_non_padded", lambda: False)
     runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
     runner.captured_req_width = 2
+    runner.speculative_num_draft_tokens = 2
+    runner.speculative_num_steps = 1
     runner.ragged_verify_mode = False
     runner.capture_forward_mode = ForwardMode.TARGET_VERIFY
     runner.capture_hidden_mode = CaptureHiddenMode.FULL
@@ -49,7 +52,6 @@ def _runner(device, monkeypatch):
     runner.require_mlp_tp_gather = runner.require_attn_tp_gather = False
     runner.enable_profile_cuda_graph = False
     runner.pp_size = 1
-    runner.get_spec_info = lambda _: None
     runner._record_in_graph_metadata_prep_done = lambda: None
     runner.attn_backend = SimpleNamespace(
         init_forward_metadata_out_graph=lambda *a, **k: None,
@@ -58,11 +60,17 @@ def _runner(device, monkeypatch):
     )
     runner.model_runner = SimpleNamespace(
         server_args=SimpleNamespace(
-            enable_lora=False, is_oasiskv_lookahead=True, debug_cuda_graph=False
+            enable_lora=False,
+            is_oasiskv_lookahead=True,
+            debug_cuda_graph=False,
+            speculative_eagle_topk=1,
         ),
+        device=device,
+        dtype=torch.float32,
+        model_config=SimpleNamespace(hidden_size=4),
         is_draft_worker=False,
         hisparse_coordinator=None,
-        spec_algorithm=SimpleNamespace(is_dflash_family=lambda: False),
+        spec_algorithm=algorithm,
         tp_group=SimpleNamespace(barrier=lambda: None),
         model=object(),
         attn_backend=runner.attn_backend,
@@ -118,13 +126,31 @@ def _runner(device, monkeypatch):
     return runner
 
 
+def test_dspark_draft_capture_uses_one_row_without_target_probe_metadata(monkeypatch):
+    runner = _runner("cpu", monkeypatch, SpeculativeAlgorithm.DSPARK)
+    runner.model_runner.is_draft_worker = True
+    runner.captured_req_width = (
+        SpeculativeAlgorithm.DSPARK.get_num_tokens_per_req_for_target_verify(
+            num_draft_tokens=2, is_draft_worker=True
+        )
+    )
+    assert runner.captured_req_width == 1
+    batch, _, _ = runner.capture_prepare(2, num_tokens=2)
+    assert batch.spec_info.draft_token_num == 1
+    assert not batch.is_oasiskv_paired
+    assert batch.input_ids.numel() == batch.batch_size == 2
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    "algorithm", [SpeculativeAlgorithm.EAGLE3, SpeculativeAlgorithm.DSPARK]
+)
 def test_capture_keeps_pair_indices_for_each_bucket_after_allocations_and_slot_reuse(
-    device, monkeypatch
+    device, algorithm, monkeypatch
 ):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required for actual replay")
-    runner = _runner(device, monkeypatch)
+    runner = _runner(device, monkeypatch, algorithm)
     embedding = torch.arange(4096 * 4, dtype=torch.float32, device=device).view(4096, 4)
     refs = {}
 

@@ -873,7 +873,12 @@ class ModelRunner:
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
         speculative_verify_width = get_spec().speculative_num_draft_tokens or 0
-        if self.spec_algorithm.is_dspark():
+        # OasisKV probes share the real row's attention working set. They do
+        # not need ordinary DSPARK's union of every verify row's Top-K.
+        if (
+            self.spec_algorithm.is_dspark()
+            and not self.server_args.is_oasiskv_lookahead
+        ):
             hisparse_cfg = resolve_dspark_device_buffer_size(
                 hisparse_cfg,
                 raw_hisparse_config=self.server_args.hisparse_config,
@@ -948,7 +953,10 @@ class ModelRunner:
                 "DeepSeek-V4 HiSparse + chain EAGLE target verify is eligible "
                 "for CUDA Graph with fixed transactional C4 scratch."
             )
-        if self.spec_algorithm.is_dflash_family():
+        if (
+            self.spec_algorithm.is_dflash_family()
+            and not self.server_args.is_oasiskv_lookahead
+        ):
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,
                 read_ragged_verify_mode,

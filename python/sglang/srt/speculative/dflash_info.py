@@ -60,6 +60,8 @@ class DFlashVerifyInput(SpecInput):
         self,
         batch: ScheduleBatch,
         target_worker: TpModelWorker,
+        *,
+        oasiskv_lookahead: bool = False,
     ) -> tuple[ForwardBatch, bool]:
         """Prepare a DFLASH verify forward batch for overlap scheduling.
 
@@ -100,6 +102,19 @@ class DFlashVerifyInput(SpecInput):
             capture_hidden_mode=self.capture_hidden_mode,
             return_hidden_states_before_norm=False,
         )
+
+        if oasiskv_lookahead and not batch.forward_mode.is_idle():
+            from sglang.srt.speculative.oasiskv_lookahead import (
+                configure_oasiskv_forward_batch,
+                paired_batch_from_verify,
+            )
+
+            # Install paired geometry before eager metadata or graph staging:
+            # both consume committed prefix lengths and the root/probe lanes.
+            configure_oasiskv_forward_batch(
+                verify_forward_batch,
+                paired_batch_from_verify(self, verify_forward_batch.batch_size),
+            )
 
         can_run_cuda_graph = bool(
             target_worker.model_runner.decode_cuda_graph_runner

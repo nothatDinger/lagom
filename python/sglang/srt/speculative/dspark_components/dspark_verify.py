@@ -75,6 +75,7 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    forward_batch: object = None
 
 
 class TargetVerifyExecutor:
@@ -236,6 +237,7 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        oasiskv_lookahead: bool = False,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -252,7 +254,7 @@ class TargetVerifyExecutor:
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
-        if not self._verify_backend_self_adds_seq_lens():
+        if not oasiskv_lookahead and not self._verify_backend_self_adds_seq_lens():
             if seq_lens_cpu_backup is not None:
                 batch.seq_lens_cpu = seq_lens_cpu_backup + verify_w
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
@@ -265,9 +267,10 @@ class TargetVerifyExecutor:
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            oasiskv_lookahead=oasiskv_lookahead,
         )
 
-        if sampling_info is not None:
+        if sampling_info is not None and not oasiskv_lookahead:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -283,12 +286,15 @@ class TargetVerifyExecutor:
         verify_input: DFlashVerifyInput,
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
+        oasiskv_lookahead: bool = False,
     ) -> TargetVerifyResult:
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker
-        )
-        batch.seq_lens_cpu = seq_lens_cpu_backup
-        batch.seq_lens_sum = seq_lens_sum_backup
+        try:
+            verify_forward_batch, _ = verify_input.prepare_for_verify(
+                batch, self.target_worker, oasiskv_lookahead=oasiskv_lookahead
+            )
+        finally:
+            batch.seq_lens_cpu = seq_lens_cpu_backup
+            batch.seq_lens_sum = seq_lens_sum_backup
 
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
@@ -299,6 +305,7 @@ class TargetVerifyExecutor:
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
+            forward_batch=verify_forward_batch,
         )
 
     def commit_hidden(

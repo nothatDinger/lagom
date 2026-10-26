@@ -504,12 +504,12 @@ def run_eagle_verify(
         if oasiskv_lookahead and not batch.forward_mode.is_idle():
             from sglang.srt.speculative.oasiskv_lookahead import (
                 configure_oasiskv_forward_batch,
-                paired_batch_from_eagle_verify,
+                paired_batch_from_verify,
             )
 
             configure_oasiskv_forward_batch(
                 verify_forward_batch,
-                paired_batch_from_eagle_verify(verify_input, bs),
+                paired_batch_from_verify(verify_input, bs),
             )
 
     # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.

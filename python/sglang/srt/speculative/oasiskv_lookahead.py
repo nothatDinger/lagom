@@ -43,8 +43,8 @@ def compute_oasiskv_logprobs(
 ) -> None:
     """Compute logprobs for the one committed token in each paired request.
 
-    ``run_eagle_verify`` has already compacted both ``next_token_logits`` and
-    ``predict`` to B normal rows by the time this is called.  EAGLE's usual
+    The caller has already compacted both ``next_token_logits`` and
+    ``predict`` to B normal rows by the time this is called. EAGLE's usual
     ``accept_index`` still contains indices into the original 2B verify tensor
     (``[0, 2, ...]``), so using it here would either select another request's
     row or read past the compacted tensors.  A width-one chain describes the
@@ -60,7 +60,7 @@ def build_oasiskv_commit(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the fixed-width, root-only commit used by OasisKV.
 
-    Keeping this separate from EAGLE acceptance is an important safety
+    Keeping this separate from speculative acceptance is an important safety
     boundary: the lookahead row is useful for its indexer prediction only and
     must not become committed merely because its token happens to match.
     """
@@ -169,15 +169,13 @@ def build_oasiskv_paired_batch(
     return OasisKVPairedBatch(input_ids, positions, rows[0::2], rows[1::2], draft_valid)
 
 
-def paired_batch_from_eagle_verify(
-    verify_input: Any, batch_size: int
-) -> OasisKVPairedBatch:
-    """Adopt EAGLE's real root+one-draft verify tensors as an OasisKV pair."""
+def paired_batch_from_verify(verify_input: Any, batch_size: int) -> OasisKVPairedBatch:
+    """Adopt an EAGLE or DSPARK root+one-draft window without copying it."""
     if verify_input.draft_token_num != 2:
         raise ValueError("OasisKV requires exactly one normal and one draft token")
     rows = torch.arange(2 * batch_size, device=verify_input.draft_token.device)
     if verify_input.draft_token.numel() != rows.numel():
-        raise ValueError("EAGLE verify tokens do not have request-major 2B layout")
+        raise ValueError("Verify tokens do not have request-major 2B layout")
     return OasisKVPairedBatch(
         input_ids=verify_input.draft_token,
         positions=verify_input.positions,
@@ -194,7 +192,7 @@ def configure_oasiskv_forward_batch(
 ) -> None:
     """Install paired geometry on the real :class:`ForwardBatch`.
 
-    Production decode arrives through ``eagle_prepare_for_verify`` and therefore
+    Production decode arrives through EAGLE or DSPARK verify preparation and
     carries tree/position metadata in ``spec_info`` rather than the
     ``extend_prefix_lens``/``extend_start_loc`` fields used by a plain EXTEND.
     Either representation supplies the kernel-level ``history -> normal ->

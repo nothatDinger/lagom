@@ -9,7 +9,7 @@ from sglang.srt.speculative.oasiskv_lookahead import (
     build_oasiskv_paired_batch,
     compute_oasiskv_logprobs,
     configure_oasiskv_forward_batch,
-    paired_batch_from_eagle_verify,
+    paired_batch_from_verify,
     plan_oasiskv_layer_prefetch,
     select_oasiskv_normal_rows,
     submit_oasiskv_layer_prefetch,
@@ -54,7 +54,7 @@ def test_oasiskv_requires_draft_path_and_rejects_spec_verification():
     with pytest.raises(ValueError, match="draft-model-path"):
         _handle_oasiskv_lookahead(_args(speculative_draft_model_path=None))
     with pytest.raises(ValueError, match="LOOKAHEAD_ONLY"):
-        _handle_oasiskv_lookahead(_args(speculative_algorithm="EAGLE3"))
+        _handle_oasiskv_lookahead(_args(speculative_algorithm="EAGLE"))
     with pytest.raises(ValueError, match="num-steps=1"):
         _handle_oasiskv_lookahead(_args(speculative_num_steps=2))
 
@@ -105,7 +105,7 @@ def test_real_forward_batch_receives_two_token_extend_geometry():
 def test_eagle_verify_tensors_are_adopted_without_copy_or_reprojection():
     tokens = torch.tensor([10, 11, 20, 21])
     positions = torch.tensor([7, 8, 13, 14])
-    paired = paired_batch_from_eagle_verify(
+    paired = paired_batch_from_verify(
         SimpleNamespace(draft_token_num=2, draft_token=tokens, positions=positions),
         2,
     )
@@ -119,7 +119,7 @@ def test_eagle_verify_forward_batch_does_not_require_extend_only_metadata():
     tokens = torch.tensor([10, 11, 20, 21])
     positions = torch.tensor([7, 8, 13, 14])
     verify = SimpleNamespace(draft_token_num=2, draft_token=tokens, positions=positions)
-    paired = paired_batch_from_eagle_verify(verify, 2)
+    paired = paired_batch_from_verify(verify, 2)
     forward_batch = SimpleNamespace(
         batch_size=2,
         input_ids=tokens,

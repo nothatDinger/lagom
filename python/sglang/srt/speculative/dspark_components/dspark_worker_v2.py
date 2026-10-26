@@ -85,6 +85,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         super().__init__()
 
         self.server_args = server_args
+        self._oasiskv_lookahead = server_args.is_oasiskv_lookahead
         self.gpu_id = gpu_id
         self.ps = ps
         self.nccl_port = nccl_port
@@ -252,7 +253,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._verify_epilogue.capture_hook
             )
 
-        self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
+        self._simulate_acc_len = (
+            0.0
+            if self._oasiskv_lookahead
+            else float(envs.SGLANG_SIMULATE_ACC_LEN.get())
+        )
         if (
             self._simulate_acc_len > 0
             and self._simulate_acc_len != 1.0
@@ -576,6 +581,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
         )
+        if self._oasiskv_lookahead:
+            return self._forward_oasiskv_decode(
+                batch, draft_input, on_publish, grammar_barrier
+            )
         bs = len(batch.seq_lens)
         device = self.device
         prefix_lens = batch.seq_lens
@@ -823,6 +832,150 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+        )
+
+    def _forward_oasiskv_decode(
+        self, batch, draft_input, on_publish, grammar_barrier
+    ) -> GenerationBatchResult:
+        """Use DSPARK only to propose the disposable target-model probe.
+
+        Prediction/selection/transfer remain in the target attention backend.
+        Neither the speculative acceptor nor its graph epilogue runs here,
+        including when the candidate happens to match the sampled token.
+        """
+        from sglang.srt.speculative.oasiskv_lookahead import (
+            build_oasiskv_commit,
+            compute_oasiskv_logprobs,
+            submit_oasiskv_pending_prefetches,
+        )
+
+        bs = len(batch.seq_lens)
+        prefix_lens = batch.seq_lens
+        window = alloc_verify_window(
+            batch=batch,
+            bs=bs,
+            device=self.device,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            block_pos_offsets=self._block_pos_offsets,
+            model_runner=self.model_runner,
+        )
+        with self._draft_context():
+            proposal = self._proposer.propose(
+                batch=batch,
+                draft_input=draft_input,
+                verify_window=window,
+                bs=bs,
+                device=self.device,
+                target_model=self.model_runner.model,
+                sampling_info=batch.sampling_info,
+            )
+        verify_ids = torch.cat(
+            [draft_input.bonus_tokens.view(bs, 1), proposal.draft_block.draft_tokens],
+            dim=1,
+        )
+        if verify_ids.shape != (bs, 2):
+            raise RuntimeError(
+                "OasisKV DSPARK requires exactly one candidate per request"
+            )
+
+        coordinator = self.model_runner.hisparse_coordinator
+        transaction = None
+        if coordinator is not None and coordinator.is_dsv4_hisparse:
+            if batch.has_grammar:
+                raise RuntimeError(
+                    "DeepSeek-V4 HiSparse OasisKV does not support grammar "
+                    "or constrained decoding"
+                )
+            transaction = coordinator.prepare_dspark_verify_window(
+                req_pool_indices=batch.req_pool_indices,
+                prefix_lens=prefix_lens,
+                verify_width=2,
+                req_pool_indices_cpu=batch.req_pool_indices_cpu,
+                prefix_lens_cpu=batch.seq_lens_cpu,
+            )
+        committed = False
+        try:
+            target = self._verify_executor.run_non_compact(
+                batch=batch,
+                draft_input=draft_input,
+                verify_ids_2d=verify_ids,
+                verify_window=window,
+                sampling_info=batch.sampling_info,
+                oasiskv_lookahead=True,
+            )
+            forward_batch = target.forward_batch
+            logits_output = target.logits_output
+            if logits_output.next_token_logits.shape[0] != bs:
+                raise RuntimeError(
+                    "OasisKV LM head must return one normal row per request"
+                )
+            if batch.has_grammar and grammar_barrier is not None:
+                grammar_barrier()
+            # sample() applies the real request's penalties, grammar and
+            # sampling policy once, to B root logits (never to probe logits).
+            next_tokens = self.model_runner.sample(
+                logits_output, forward_batch
+            ).reshape(-1)
+            commit_lens, _ = build_oasiskv_commit(
+                forward_batch.oasiskv_normal_rows, bs, self.device
+            )
+            if transaction is not None:
+                coordinator.commit_dspark_verify_window(transaction, commit_lens)
+                committed = True
+            submit_oasiskv_pending_prefetches(forward_batch)
+        finally:
+            if transaction is not None and not committed:
+                coordinator.rollback_dspark_verify_window(transaction)
+
+        clear_c128 = getattr(
+            self.model_runner.token_to_kv_pool,
+            "clear_unaccepted_c128_draft_states",
+            None,
+        )
+        if clear_c128 is not None:
+            clear_c128(batch.req_pool_indices, prefix_lens, commit_lens, 2)
+        new_seq_lens = prefix_lens + commit_lens
+        self._commit_target_mamba_states_after_verify(
+            batch=batch,
+            seq_lens_pre_verify=prefix_lens,
+            seq_lens_post_verify=new_seq_lens,
+            commit_lens=commit_lens,
+        )
+        # Update DSPARK's context only from completed real target rows. The
+        # injector's commit mask excludes the probe and overwrites the temporary
+        # draft-model KV at the anchor with the authoritative target features.
+        self._verify_executor.commit_hidden(
+            batch=batch,
+            layout=None,
+            hidden_strided=None,
+            verify_window=window,
+            logits_output=logits_output,
+            commit_lens=commit_lens,
+            bs=bs,
+            run_compact=False,
+        )
+        logits_output.hidden_states = None
+        if batch.return_logprob:
+            compute_oasiskv_logprobs(batch, logits_output, next_tokens)
+        if on_publish is not None:
+            on_publish(new_seq_lens)
+
+        # Scheduler results retain the two-column speculative transport layout,
+        # but accept_lens=1 makes only the first column observable as output.
+        out_tokens = torch.full_like(verify_ids, -1)
+        out_tokens[:, 0].copy_(next_tokens)
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=out_tokens.reshape(-1),
+            accept_lens=commit_lens,
+            block_accept_lens=commit_lens,
+            can_run_cuda_graph=target.can_run_cuda_graph,
+            next_draft_input=make_next_draft_input(
+                bonus_tokens=next_tokens, new_seq_lens=new_seq_lens
+            ),
+            speculative_num_draft_tokens=2,
+            new_seq_lens=new_seq_lens,
+            extra_keep_alive_refs=[forward_batch],
         )
 
     def _commit_target_mamba_states_after_verify(

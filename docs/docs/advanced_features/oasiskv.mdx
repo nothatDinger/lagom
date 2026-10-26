@@ -3,7 +3,7 @@ title: "OasisKV reproduction"
 description: "Lookahead KV prefetch for MHA/GQA, MLA, native DSA, and DeepSeek-V4 on the oasiskv branch."
 ---
 
-This branch implements the lookahead execution contract from [OasisKV v1](https://arxiv.org/pdf/2608.08097v1): run a real token and one draft token through the target, use the draft query to prepare the next working set, and commit only the real token. You need a compatible EAGLE-3 draft checkpoint; an arbitrary smaller language model is not a substitute.
+This branch implements the lookahead execution contract from [OasisKV v1](https://arxiv.org/pdf/2608.08097v1): run a real token and one draft token through the target, use the draft query to prepare the next working set, and commit only the real token. You need a compatible EAGLE-3 or DSPARK draft checkpoint trained for your target's feature interface; an arbitrary smaller language model is not a substitute.
 
 The generic backend and DeepSeek-V4 specialization include full CUDA graph decode paths with captured selection and transfer streams. CPU reference, Triton interpreter, and integration tests cover attention, ownership, configuration, and memory accounting. Capture/replay, full model generation, quality, and performance still require validation on NVIDIA GPUs. This branch does not implement the paper's remote partial fetch service or claim its reported speedups.
 
@@ -46,7 +46,7 @@ Use this template for full causal MHA/GQA models such as Llama/Qwen and for ordi
 
 Native DSA requires `block_size=1`. If you omit `top_k`, it uses the model's `index_topk`. The native indexer still determines candidates; setting a smaller budget truncates those candidates. Native DSA shared-index layers consume the carried logical Top-K through the same backend.
 
-Do not pass `--enable-hisparse` or an explicit `--speculative-algorithm` for the generic path. OasisKV configures EAGLE-3 internally with one draft step, top-k one, and two target rows. Draft tokens are always discarded. The draft runner uses its own ordinary Triton or native DSA backend and its own KV pool.
+Do not pass `--enable-hisparse` for the generic path. OasisKV defaults to EAGLE-3; you can select `--speculative-algorithm EAGLE3` or `--speculative-algorithm DSPARK` explicitly. Both use one candidate and two target rows. In OasisKV mode this flag selects the proposal worker only: draft tokens are always discarded. The draft runner uses its own attention backend and KV pool.
 
 | JSON field | Default | Meaning |
 | --- | --- | --- |
@@ -94,6 +94,31 @@ It covers two layers and multiple graph buckets, real-query misses, byte-exact V
 
 See [HiSparse](/docs/advanced_features/hisparse_guide) for the underlying C4 pool configuration.
 
+## Use DSPARK proposals
+
+For NVIDIA CUDA on Linux, use a DSPARK checkpoint compatible with your target's vocabulary, embedding dimensions, auxiliary feature layers, and feature normalization. Set `MODEL_PATH` and `DSPARK_MODEL_PATH` to local checkpoint directories or Hugging Face model IDs. For a full causal MHA/GQA target such as Qwen, a single-GPU example is:
+
+```bash
+python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path "$DSPARK_MODEL_PATH" \
+  --attention-backend oasiskv \
+  --disable-radix-cache --tp 1 --max-running-requests 8 \
+  --cuda-graph-config '{"decode":{"backend":"full","max_bs":8}}' \
+  --hisparse-config '{"top_k":2048,"block_size":16}'
+```
+
+For DeepSeek-V4, add `--speculative-algorithm DSPARK` to the HiSparse specialization command above and point its draft path to the matching DSPARK checkpoint. If the target checkpoint bundles DSPARK weights and configuration, you may omit the draft path; DSPARK then loads its weights from the target checkpoint.
+
+OasisKV fixes the runtime DSPARK block size to one (`gamma=1`) and the target window to two rows. You do not need to edit the checkpoint config or remove trained layers. Explicit block sizes greater than one are rejected. DSPARK proposes the next token; the target's probe row produces the per-layer Quest or native indexer Top-K used for prefetch. Real queries still determine attention's working set and refill every miss. Even an exactly matching proposal is never accepted.
+
+Only real target rows update DSPARK's context KV. V4 also promotes only real C4 entries and clears uncommitted C128 draft state. The candidate's temporary target KV does not extend the committed history. Eager and full-graph paths use the same ownership rules.
+
+Target decode graphs retain the fixed two-row layout; DSPARK draft decode graphs use one row per request and can retain their existing folded proposal sampler. OasisKV bypasses DSPARK confidence scheduling, compact/ragged verification, and speculative acceptance, even if `SGLANG_RAGGED_VERIFY_MODE=compact` is set. Target feature injection and V4 C4 commit remain outside the target graph, as in the existing workers.
+
+The DSPARK adapter has checkpoint-free CPU tests for metadata preparation, request reordering/reuse, root-only output and feature commit, and C4 rollback. CUDA capture/replay regressions include DSPARK metadata but skip without a GPU. Validate full-model generation and prefetch hit rate with your actual checkpoint before comparing TPOT or TPS; single-candidate lookahead does not exercise DSPARK's usual multi-token acceptance benefit.
+
 ## Branch provenance
 
 `oasiskv` branches from `c5653f90d`, immediately before the first OasisKV change. This is its common ancestor with the reviewed `heykon_main` tip, `aaff55ab608ebecb09887ac4d293edc7700acb69`. The base retains the HiSparse/EAGLE infrastructure that the implementation depends on.
@@ -118,6 +143,7 @@ PYTHONPATH=python python -m pytest -q \
   test/registered/unit/mem_cache/test_oasiskv_backend.py \
   test/registered/unit/mem_cache/test_oasiskv_pool.py \
   test/registered/unit/spec/test_oasiskv_lookahead.py \
+  test/registered/unit/spec/test_oasiskv_dspark.py \
   test/registered/unit/test_hisparse_prefetcher.py
 ```
 

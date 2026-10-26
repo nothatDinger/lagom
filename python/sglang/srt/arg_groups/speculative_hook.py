@@ -148,9 +148,8 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
     """Resolve OasisKV without enabling speculative verification.
 
-    The internal EAGLE-3 worker supplies model loading, feature relay and
-    scratch allocation.  Its verify forward is replaced by root-only OasisKV
-    sampling, so no draft token can be accepted.
+    EAGLE-3 (default) or DSPARK supplies the next-token proposal. Both workers
+    use root-only OasisKV sampling, so no draft token can be accepted.
     """
     generic = getattr(server_args, "attention_backend", None) == "oasiskv"
     if not generic and any(
@@ -208,15 +207,16 @@ def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
             server_args.max_running_requests = 32
     if not server_args.enable_hisparse and not generic:
         raise ValueError('HiSparse prefetcher "oasiskv" requires --enable-hisparse.')
-    if not server_args.speculative_draft_model_path:
+    algorithm = (server_args.speculative_algorithm or "EAGLE3").upper()
+    if algorithm not in ("EAGLE3", "DSPARK"):
+        raise ValueError(
+            "OasisKV LOOKAHEAD_ONLY supports EAGLE3 or DSPARK proposal workers; "
+            "speculative acceptance is disabled."
+        )
+    if not server_args.speculative_draft_model_path and algorithm != "DSPARK":
         raise ValueError(
             'HiSparse prefetcher "oasiskv" requires '
             "--speculative-draft-model-path pointing to a compatible EAGLE-3 checkpoint."
-        )
-    if server_args.speculative_algorithm is not None:
-        raise ValueError(
-            'HiSparse prefetcher "oasiskv" is LOOKAHEAD_ONLY and conflicts with '
-            "--speculative-algorithm; speculative acceptance/verification is disabled."
         )
     conflicts = {
         "--speculative-num-steps": (server_args.speculative_num_steps, 1),
@@ -226,6 +226,11 @@ def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
             2,
         ),
     }
+    if algorithm == "DSPARK":
+        conflicts["--speculative-dspark-block-size"] = (
+            getattr(server_args, "speculative_dspark_block_size", None),
+            1,
+        )
     for flag, (value, required) in conflicts.items():
         if value is not None and int(value) != required:
             raise ValueError(
@@ -233,12 +238,16 @@ def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
             )
     server_args.speculative_num_steps = 1
     server_args.speculative_eagle_topk = 1
-    # Internally use EAGLE's allocation/metadata machinery, but the OasisKV
-    # verify path below hard-commits one root token and never accepts a draft.
+    # Both workers use a fixed root/probe pair and only commit the root.
     server_args.speculative_num_draft_tokens = 2
-    server_args.speculative_algorithm = "EAGLE3"
+    server_args.speculative_algorithm = algorithm
+    if algorithm == "DSPARK":
+        # Override the checkpoint's multi-token proposal width, not its layers
+        # or trained weights. This also prevents _handle_dspark from restoring
+        # a larger verify window from the checkpoint config.
+        server_args.speculative_dspark_block_size = 1
     # Keep CUDA graphs enabled. Generic decode captures the per-layer pipeline;
-    # the V4 path publishes graph-stable predictions for post-commit prefetch.
+    # V4 also captures selection/transfer, joining before root-only C4 commit.
     # Passing --disable-cuda-graph remains an explicit eager/pipelined A/B mode.
     # DeepSeek-V4 enables FlashInfer all-reduce fusion automatically on H100.
     # Its workspace performs a separate NCCL rendezvous while the internal
@@ -251,8 +260,9 @@ def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
         server_args.enforce_disable_flashinfer_allreduce_fusion = True
     server_args.is_oasiskv_lookahead = True
     logger.info(
-        "OasisKV LOOKAHEAD_ONLY enabled: EAGLE-3 steps=1 topk=1; "
+        "OasisKV LOOKAHEAD_ONLY enabled: %s steps=1 topk=1; "
         "only root tokens are committed; %s",
+        algorithm,
         (
             "eager execution"
             if getattr(server_args, "disable_cuda_graph", False)
@@ -415,7 +425,10 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 read_ragged_verify_mode,
             )
 
-            if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+            if (
+                not server_args.is_oasiskv_lookahead
+                and read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+            ):
                 raise ValueError(
                     "DSpark with dp attention + "
                     f"moe_a2a_backend={server_args.moe_a2a_backend!r} requires "
@@ -545,7 +558,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         read_ragged_verify_mode,
     )
 
-    ragged_mode = read_ragged_verify_mode()
+    ragged_mode = (
+        RaggedVerifyMode.STATIC
+        if server_args.is_oasiskv_lookahead
+        else read_ragged_verify_mode()
+    )
     if (
         server_args.speculative_dspark_align_verify_tokens_to_graph_tier
         and ragged_mode is not RaggedVerifyMode.COMPACT
