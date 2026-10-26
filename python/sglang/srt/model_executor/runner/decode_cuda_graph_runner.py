@@ -1265,7 +1265,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     raise RuntimeError("OasisKV graph left a layer prefetch unsubmitted")
 
     def _prepare_oasiskv_graph_replay(self, forward_batch: ForwardBatch) -> None:
-        """Join prior H2D writers before the target graph reads C4 mappings."""
+        """Prepare per-layer fences before the target graph reads C4 mappings."""
         coordinator = self.model_runner.hisparse_coordinator
         if (
             coordinator is None
@@ -1278,6 +1278,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return
         if (state := getattr(coordinator, "oasiskv_graph_state", None)) is not None:
             state.prepare_replay()
+            return  # Captured per-layer external waits consume prior writers.
         for layer_id in range(coordinator.mem_pool_device.layer_num):
             coordinator.consume_oasiskv_prefetch(
                 req_pool_indices=forward_batch.req_pool_indices,

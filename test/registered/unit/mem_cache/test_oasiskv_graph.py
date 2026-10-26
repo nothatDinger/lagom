@@ -139,7 +139,8 @@ def test_replay_tables_keep_addresses_across_reorder_padding_and_growth():
     old_host = states[1].host  # Keep old allocation alive to prove the pointer changes.
     graph.prepare([2, 1], [0, 0], [8, 3], paired=True)
     assert graph.tables[0, :, PREFIX].tolist() == [8, 3, -1]
-    assert graph.tables[0, 0, HOST] == states[1].host.data_ptr() != old_host.data_ptr()
+    assert old_host is None  # Dense requests have no host KV replica yet.
+    assert graph.tables[0, 0, HOST] == states[1].host.data_ptr() != 0
     assert graph.tables[0, 0, CAPACITY] == states[1].capacity
     assert graph.tables[0, 0, RESIDENT] == resident_addresses[1]
     graph.finish_replay()
@@ -174,7 +175,7 @@ def test_recycled_request_is_not_bound_to_previous_generations_storage():
     for layer in range(2):
         cache.get(1, 1, layer, key, value).append(key[:2], value[:2], 0)
     graph.prepare([1], [1], [2], paired=True)
-    assert graph.tables[0, 0, HOST] != old.host.data_ptr()
+    assert graph.tables[0, 0, HOST] == 0  # Recycled request starts dense.
     assert graph.tables[0, 0, RESIDENT] != old.resident.data_ptr()
     graph.finish_replay()
     assert old.length == 3 and cache.layers[(1, 1, 0)].length == 3
@@ -201,7 +202,7 @@ def test_eager_refill_and_prefetch_update_resident_tables_in_place():
     assert addresses == (state.resident.data_ptr(), state.ages.data_ptr())
 
 
-def test_replay_joins_a_shared_completion_event_once(monkeypatch):
+def test_replay_gates_each_layer_independently(monkeypatch):
     cache, graph, _ = setup_graph()
     event = object()
     waits = []
@@ -215,7 +216,7 @@ def test_replay_joins_a_shared_completion_event_once(monkeypatch):
         lambda *args: SimpleNamespace(wait_event=waits.append),
     )
     graph.prepare([1], [0], [3], paired=True)
-    assert waits == [event]
+    assert waits == [event, event]
 
 
 def test_backend_replay_uses_live_cpu_slots_and_only_unpadded_lengths():

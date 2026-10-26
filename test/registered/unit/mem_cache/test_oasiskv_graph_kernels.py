@@ -173,7 +173,7 @@ def test_token_append_refill_attention_and_prefetch_match_eager_across_boundarie
             table, layout.draft, cap=config.max_new_blocks, background=True
         )
         output = torch.empty((4, heads * group, vd), device=DEVICE)
-        kernels.attention_partial[(4, heads * group, w.splits)](
+        kernels.attention_partial[(2, heads * group, w.splits)](
             table,
             q,
             k,
@@ -207,7 +207,9 @@ def test_token_append_refill_attention_and_prefetch_match_eager_across_boundarie
         )
         torch.testing.assert_close(output[:2], expected, atol=3e-5, rtol=3e-5)
         assert not output[2:].any()
-        layout.plan.transfer(table, config, layout.storage_dim, k.dtype, background=True)
+        layout.plan.transfer(
+            table, config, layout.storage_dim, k.dtype, background=True
+        )
         reference.prefetch(q[1], draft)
         reference.join()
         graph.finish_replay()
@@ -216,6 +218,73 @@ def test_token_append_refill_attention_and_prefetch_match_eager_across_boundarie
         # Padding bytes/tail tokens are intentionally unspecified. Compare all
         # committed tokens and summaries, including the new active block.
         torch.testing.assert_close(
-            state.host[:, : state.capacity].flatten(1, 2)[:, : pos + 1, : kd + vd],
-            reference.host.flatten(1, 2)[:, : pos + 1, : kd + vd],
+            state.materialize_history()[:, : pos + 1, : kd + vd],
+            reference.materialize_history()[:, : pos + 1, : kd + vd],
         )
+
+
+@pytest.mark.parametrize(
+    "kd,vd,group,cap", [(32, 32, 1, 0), (64, 32, 4, 2), (192, 128, 2, 0)]
+)
+def test_dense_prefill_reuses_paged_extend_without_materializing_history(
+    kd, vd, group, cap, monkeypatch
+):
+    torch.manual_seed(203)
+    cache = OasisKVCache(OasisKVConfig(token_budget=128, block_size=4), DEVICE)
+    k, v = torch.randn(69, 2, kd, device=DEVICE), torch.randn(69, 2, vd, device=DEVICE)
+    q = torch.randn(6, 2 * group, kd, device=DEVICE)
+    state = cache.get(0, 0, 0, k, v)
+    state.append(k[:63], v[:63], 0)
+    state.append(k[63:], v[63:], 63)
+    assert len(state.page_table.pool.slabs) >= 2  # cross a slab boundary
+    expected = (
+        state.dense_prefill(q, 63, kd**-0.5, logit_cap=cap) if INTERPRET else None
+    )
+    if expected is None:
+        reference = OasisKVCache(cache.config, "cpu").get(0, 0, 0, k.cpu(), v.cpu())
+        reference.append(k.cpu(), v.cpu(), 0)
+        expected = reference.dense_prefill(q.cpu(), 63, kd**-0.5, logit_cap=cap).to(
+            DEVICE
+        )
+    monkeypatch.setattr(state.pipeline, "cuda", True)
+    monkeypatch.setattr(
+        state, "materialize_history", lambda: pytest.fail("dense KV was gathered")
+    )
+    actual = state.dense_prefill(q, 63, kd**-0.5, logit_cap=cap)
+    torch.testing.assert_close(actual, expected, atol=3e-3, rtol=3e-3)
+
+
+def test_dense_and_sparse_rows_share_one_paged_decode_launch():
+    from types import SimpleNamespace
+
+    torch.manual_seed(17)
+    config = OasisKVConfig(token_budget=8, block_size=2)
+    cache, reference = OasisKVCache(config, DEVICE), OasisKVCache(config, "cpu")
+    graph = OasisKVGraphState(cache, 3, 64, 1)
+    q = torch.randn(3, 4, 16, device=DEVICE)
+    k, v = torch.randn(3, 2, 16, device=DEVICE), torch.randn(3, 2, 8, device=DEVICE)
+    graph.get_layer(0, q, k, v)
+    expected = []
+    for slot, prefix in enumerate((5, 21)):
+        oldk, oldv = torch.randn(prefix, 2, 16), torch.randn(prefix, 2, 8)
+        state = cache.get(slot, 0, 0, k, v)
+        state.append(oldk.to(DEVICE), oldv.to(DEVICE), 0)
+        ref = reference.get(slot, 0, 0, oldk, oldv)
+        ref.append(oldk, oldv, 0)
+        ref.append(k[slot : slot + 1].cpu(), v[slot : slot + 1].cpu(), prefix)
+        ref.prepare_attention(q[slot].cpu())
+        expected.append(ref.attend(q[slot : slot + 1].cpu(), 0.25))
+    assert (
+        cache.layers[(0, 0, 0)].page_table.pool
+        is cache.layers[(1, 0, 0)].page_table.pool
+    )
+    graph.prepare([0, 1], [0, 0], [5, 21], paired=False)
+    assert graph.tables[0, :, kernels.DENSE].tolist() == [1, 0, 0]
+    output = graph.forward(
+        q, k, v, SimpleNamespace(layer_id=0, scaling=0.25, logit_cap=0), 3, paired=False
+    )
+    graph.finish_replay()
+    torch.testing.assert_close(
+        output[:2].cpu(), torch.cat(expected).flatten(1), atol=3e-5, rtol=3e-5
+    )
+    assert not output[2].any()

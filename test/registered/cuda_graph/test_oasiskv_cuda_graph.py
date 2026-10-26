@@ -91,7 +91,7 @@ def test_capture_repeated_replay_reorder_padding_growth_and_reuse(
             )
 
     prefill(1, 0, 15)
-    prefill(2, 0, 16)
+    prefill(2, 0, 32)  # crosses dense -> sparse in the first replay
     schedules = [
         ([1, 2], [0, 0]),
         ([2], [0]),

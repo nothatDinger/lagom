@@ -101,7 +101,9 @@ def test_runtime_pool_is_host_backed_and_release_follows_request_ownership(
         state = pool.oasiskv_cache.get(
             slot, int(req_pool.req_generation[slot]), 0, key, key
         )
+        before_bytes = pool.get_kv_size_bytes()
         state.append(key, key, 0)
+        assert pool.get_kv_size_bytes() > before_bytes
         req_pool.free(req)
         assert not pool.oasiskv_cache.layers
         assert req.req_pool_idx is None

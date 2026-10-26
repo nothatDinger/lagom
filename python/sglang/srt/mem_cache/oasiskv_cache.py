@@ -1,7 +1,8 @@
 """Host-backed, head-wise OasisKV working sets.
 
-This module has a CPU reference path and a CUDA path using the existing UVA
-copy kernel. No full KV history is retained on the GPU. Native DSA may supply
+Dense and sparse requests use a common physical page pool. Full history stays
+on the GPU until the sparse threshold; longer requests use pinned host backing.
+This module also retains a CPU reference path. Native DSA may supply
 logical candidates instead of using Quest summaries; ordinary MLA uses one
 latent KV head, with its absorbed query and latent value dimensions.
 """
@@ -12,6 +13,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from sglang.srt.mem_cache.oasiskv_config import OasisKVConfig
+from sglang.srt.mem_cache.oasiskv_pages import OasisKVPagePool, OasisKVPageTable
 
 
 def quest_scores(query, key_min, key_max):
@@ -86,7 +88,9 @@ class OasisKVPipeline:
 class OasisKVLayerCache:
     """One request, one layer. Host storage is [head, block, token, K+V]."""
 
-    def __init__(self, config, heads, key_dim, value_dim, dtype, device, pipeline):
+    def __init__(
+        self, config, heads, key_dim, value_dim, dtype, device, pipeline, page_pool=None
+    ):
         self.config = config
         self.heads, self.key_dim, self.value_dim = heads, key_dim, value_dim
         self.dtype, self.device = dtype, torch.device(device)
@@ -106,18 +110,96 @@ class OasisKVLayerCache:
         self.pending = None
         self.backup_done = None
         self.refill_done = None
+        self.read_done = None
         self.initialized = False
         self.attention_blocks = None
         slots = config.history_blocks
         self.resident = torch.full((heads, slots), -1, dtype=torch.int64, device=device)
         self.ages = torch.full_like(self.resident, -1)
-        self.data = torch.zeros(
-            (heads, slots + 1, config.block_size, self.storage_dim),
-            dtype=dtype,
-            device=device,
+        self.page_table = OasisKVPageTable(page_pool, slots) if page_pool else None
+        self.sparse = page_pool is None or config.native_sparse
+        self._data = (
+            None
+            if page_pool
+            else torch.zeros(
+                (heads, slots + 1, config.block_size, self.storage_dim),
+                dtype=dtype,
+                device=device,
+            )
         )
         self.real_heads = torch.tensor([heads], dtype=torch.int32, device=device)
         self.prefetch_submissions = 0
+
+    @property
+    def data(self):
+        # Tensor reference/legacy attention only. CUDA kernels dereference
+        # the stable page table and never materialize a contiguous working set.
+        return self.page_table.materialize() if self.page_table else self._data
+
+    def block(self, slot):
+        return self.page_table.block(slot) if self.page_table else self._data[:, slot]
+
+    def graph_row(self, prefix):
+        return [
+            0 if self.host is None else self.host.data_ptr(),
+            0 if self.page_table else self._data.data_ptr(),
+            0 if self.key_min is None else self.key_min.data_ptr(),
+            0 if self.key_max is None else self.key_max.data_ptr(),
+            self.resident.data_ptr(),
+            self.ages.data_ptr(),
+            self.capacity,
+            prefix,
+            self.step,
+            self.page_table.pointers.data_ptr() if self.page_table else 0,
+            int(not self.sparse),
+        ]
+
+    def prepare_append(self, end):
+        was_dense = not self.sparse
+        transition = was_dense and end > self.config.token_budget
+        if transition:
+            self.join()
+            self.sparse = True
+        self._grow((end + self.config.block_size - 1) // self.config.block_size)
+        if self.page_table is None:
+            return
+        if transition and self.host is None:
+            self.host = torch.empty(
+                (self.heads, self.capacity, self.config.block_size, self.storage_dim),
+                dtype=self.dtype,
+                pin_memory=self.pipeline.cuda,
+            )
+        old_active = self.page_table.active
+        if transition and self.length:
+            for block in range(
+                (self.length + self.config.block_size - 1) // self.config.block_size
+            ):
+                slot = self.config.history_blocks if block == old_active else block
+                self.host[:, block].copy_(
+                    self.block(slot), non_blocking=self.pipeline.cuda
+                )
+        active = max(0, (end - 1) // self.config.block_size)
+        if transition or active != old_active:
+            if self.page_table.needs_update(end, sparse=self.sparse):
+                self.join()
+            self.page_table.ensure(end, sparse=self.sparse)
+            if was_dense:
+                complete = min(
+                    active if not transition else self.length // self.config.block_size,
+                    self.config.history_blocks,
+                )
+                ids = torch.arange(self.config.history_blocks, device=self.device)
+                self.resident.copy_(
+                    torch.where(ids < complete, ids, -1).expand(self.heads, -1)
+                )
+        if transition and self.pipeline.cuda:
+            self.backup_done = torch.cuda.Event()
+            self.backup_done.record()
+
+    def release(self):
+        self.join(reclaim=True)
+        if self.page_table:
+            self.page_table.release()
 
     def join(self, *, reclaim=False):
         # A forward may fail after selection but before transfer. Reclamation
@@ -127,6 +209,7 @@ class OasisKVLayerCache:
             self.pending,
             self.backup_done,
             self.refill_done,
+            self.read_done,
         ):
             if event is not None:
                 if reclaim:
@@ -137,6 +220,7 @@ class OasisKVLayerCache:
             self.selection_done = None
             self.pending = self.backup_done = None
             self.refill_done = None
+            self.read_done = None
         elif self.pipeline.cuda:
             self.resident.record_stream(torch.cuda.current_stream(self.device))
             self.ages.record_stream(torch.cuda.current_stream(self.device))
@@ -148,8 +232,12 @@ class OasisKVLayerCache:
         self.join(reclaim=True)
         capacity = max(blocks, max(4, self.capacity * 2))
         shape = (self.heads, capacity, self.config.block_size, self.storage_dim)
-        host = torch.empty(
-            shape, dtype=self.dtype, device="cpu", pin_memory=self.pipeline.cuda
+        host = (
+            None
+            if not self.sparse
+            else torch.empty(
+                shape, dtype=self.dtype, device="cpu", pin_memory=self.pipeline.cuda
+            )
         )
         lo = hi = None
         if not self.config.native_sparse:
@@ -161,7 +249,8 @@ class OasisKVLayerCache:
             )
             hi = torch.full_like(lo, -float("inf"))
         if self.capacity:
-            host[:, : self.capacity].copy_(self.host)
+            if self.host is not None:
+                host[:, : self.capacity].copy_(self.host)
             if lo is not None:
                 lo[:, : self.capacity].copy_(self.key_min)
                 hi[:, : self.capacity].copy_(self.key_max)
@@ -180,7 +269,7 @@ class OasisKVLayerCache:
         self.join()
         end = prefix + key.shape[0]
         block_size = self.config.block_size
-        self._grow((end + block_size - 1) // block_size)
+        self.prepare_append(end)
         packed = torch.cat((key, value), dim=-1).transpose(0, 1).contiguous()
         packed = F.pad(packed, (0, self.storage_dim - self.key_dim - self.value_dim))
         offset = 0
@@ -189,7 +278,10 @@ class OasisKVLayerCache:
             block, within = divmod(pos, block_size)
             count = min(block_size - within, end - pos)
             chunk = packed[:, offset : offset + count]
-            self.host[:, block, within : within + count].copy_(chunk, non_blocking=True)
+            if self.host is not None:
+                self.host[:, block, within : within + count].copy_(
+                    chunk, non_blocking=True
+                )
             if self.key_min is not None:
                 k = chunk[..., : self.key_dim].float()
                 self.key_min[:, block] = torch.minimum(
@@ -201,8 +293,12 @@ class OasisKVLayerCache:
             # The last slot always contains the active block, outside historical LRU.
             if block == (end - 1) // block_size:
                 if within == 0:
-                    self.data[:, -1].zero_()
-                self.data[:, -1, within : within + count].copy_(chunk)
+                    self.block(self.config.history_blocks).zero_()
+                self.block(self.config.history_blocks)[
+                    :, within : within + count
+                ].copy_(chunk)
+            elif not self.sparse:
+                self.block(block)[:, within : within + count].copy_(chunk)
             offset += count
         self.length = end
         if self.pipeline.cuda:
@@ -234,6 +330,37 @@ class OasisKVLayerCache:
 
     def _copy_plan(self, plan):
         slots = self.config.history_blocks
+        if self.page_table and self.pipeline.cuda:
+            import triton
+            import triton.language as tl
+            from sglang.srt.layers.attention.triton_ops import oasiskv as kernels
+
+            table = torch.tensor(
+                [self.graph_row(self.length - 1)], dtype=torch.int64, device=self.device
+            )
+            kernels.copy_misses[(self.heads, 4)](
+                table,
+                plan.sources,
+                plan.destinations,
+                plan.counts,
+                GROUPS=self.heads,
+                HEADS=self.heads,
+                SLOTS=slots,
+                BLOCK=self.config.block_size,
+                STORAGE=self.storage_dim,
+                DTYPE={
+                    torch.float16: tl.float16,
+                    torch.bfloat16: tl.bfloat16,
+                    torch.float32: tl.float32,
+                }[self.dtype],
+                TILE=min(
+                    triton.next_power_of_2(self.config.block_size * self.storage_dim),
+                    1024,
+                ),
+                WORKERS=4,
+                num_warps=4,
+            )
+            return
         if self.pipeline.cuda:
             # This existing kernel reads pinned host pointers through CUDA UVA.
             # Treat one block-head K+V record as one opaque MLA copy item.
@@ -257,7 +384,7 @@ class OasisKVLayerCache:
         else:
             for head, count in enumerate(plan.counts.tolist()):
                 for i in range(count):
-                    self.data[head, plan.destinations[head, i]].copy_(
+                    self.block(int(plan.destinations[head, i]))[head].copy_(
                         self.host[head, plan.sources[head, i]]
                     )
 
@@ -275,6 +402,10 @@ class OasisKVLayerCache:
         prediction misses, using the UVA copy kernel for missing payloads only.
         """
         self.join()
+        if not self.sparse:
+            self.attention_blocks = self.resident.clone()
+            self.initialized = True
+            return
         selected = self.candidates(query, explicit)
         plan = plan_delta(selected, self.resident, self.ages, self.step)
         try:
@@ -292,6 +423,8 @@ class OasisKVLayerCache:
 
     def predict_prefetch(self, draft_query, explicit=None):
         """Predict next-step candidates on the same stream as real attention."""
+        if not self.sparse:
+            return torch.full_like(self.resident, -1)
         return self.candidates(draft_query, explicit, next_step=True)
 
     def plan_prefetch(self, candidates):
@@ -355,6 +488,10 @@ class OasisKVLayerCache:
 
     def attend(self, query, scale, *, draft_key=None, draft_value=None, logit_cap=0):
         """Both queries see the same resident history; only draft sees draft KV."""
+        if self.page_table and self.pipeline.cuda:
+            return self._finish_attention(
+                self._attend_paged(query, scale, draft_key, draft_value, logit_cap)
+            )
         count, q_heads, _ = query.shape
         group = q_heads // self.heads
         active = (self.length - 1) // self.config.block_size
@@ -398,14 +535,155 @@ class OasisKVLayerCache:
             out = F.scaled_dot_product_attention(
                 q, key, value, attn_mask=mask[:, None], scale=scale
             )
-        return out.reshape(q_heads, count, self.value_dim).transpose(0, 1).contiguous()
+        return self._finish_attention(
+            out.reshape(q_heads, count, self.value_dim).transpose(0, 1).contiguous()
+        )
 
-    def dense_prefill(self, query, prefix, scale, *, indices=None, logit_cap=0):
-        """Chunked causal prefill; full KV is transient on GPU for this layer only."""
+    def _finish_attention(self, output):
+        # Page reclamation must cover readers too, including dense prefill and
+        # unpaired eager decode where no subsequent prefetch records a fence.
+        if self.device.type == "cuda":
+            self.read_done = torch.cuda.Event()
+            self.read_done.record(torch.cuda.current_stream(self.device))
+        return output
+
+    def _attend_paged(self, query, scale, draft_key, draft_value, logit_cap):
+        """Eager decode uses the same paged, paired kernel as full graph decode."""
+        import triton
+        from sglang.srt.layers.attention.triton_ops import oasiskv as kernels
+
+        width, qheads, _ = query.shape
+        if width not in (1, 2) or (width == 2) != (draft_key is not None):
+            raise ValueError("Paged decode expects one real query or a real/draft pair")
+        slots, block = self.config.history_blocks, self.config.block_size
+        table = torch.tensor(
+            [self.graph_row(self.length - 1)], dtype=torch.int64, device=self.device
+        )
+        selected = self.resident >= 0
+        if self.attention_blocks is not None:
+            selected &= (
+                self.resident[:, :, None] == self.attention_blocks[:, None, :]
+            ).any(-1)
+        key = torch.empty(
+            (width, self.heads, self.key_dim), dtype=self.dtype, device=self.device
+        )
+        value = torch.empty(
+            (width, self.heads, self.value_dim), dtype=self.dtype, device=self.device
+        )
+        if width == 2:
+            key[1].copy_(draft_key)
+            value[1].copy_(draft_value)
+        tokens = (slots + 1) * block + 1
+        splits = min(8, triton.cdiv(tokens, 256))
+        partial = torch.empty(
+            (width, qheads, splits, self.value_dim + 2),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        output = query.new_empty((width, qheads, self.value_dim))
+        kernels.attention_partial[(1, qheads, splits)](
+            table,
+            query.contiguous(),
+            key,
+            value,
+            selected,
+            partial,
+            HEADS=self.heads,
+            GROUP=qheads // self.heads,
+            KD=self.key_dim,
+            VD=self.value_dim,
+            STORAGE=self.storage_dim,
+            SLOTS=slots,
+            BLOCK=block,
+            WIDTH=width,
+            SCALE=scale,
+            CAP=logit_cap,
+            SPLITS=splits,
+            PER_SPLIT=triton.cdiv(tokens, splits * 32) * 32,
+            DK=triton.next_power_of_2(self.key_dim),
+            DV=triton.next_power_of_2(self.value_dim),
+            TILE=32,
+        )
+        kernels.attention_reduce[(width, qheads)](
+            partial,
+            output,
+            QHEADS=qheads,
+            VD=self.value_dim,
+            SPLITS=splits,
+            NS=triton.next_power_of_2(splits),
+            DV=triton.next_power_of_2(self.value_dim),
+        )
+        return output
+
+    def materialize_history(self):
         if self.backup_done is not None:
             self.backup_done.synchronize()
         n = self.length
-        packed = self.host.flatten(1, 2)[:, :n].to(self.device, non_blocking=True)
+        if n == 0:
+            return torch.empty(
+                (self.heads, 0, self.storage_dim), dtype=self.dtype, device=self.device
+            )
+        if self.host is None:
+            active = (n - 1) // self.config.block_size
+            packed = torch.cat(
+                [
+                    self.block(i if i < active else self.config.history_blocks)
+                    for i in range(active + 1)
+                ],
+                1,
+            )[:, :n]
+        else:
+            packed = self.host.flatten(1, 2)[:, :n].to(self.device, non_blocking=True)
+        return packed
+
+    def dense_prefill(self, query, prefix, scale, *, indices=None, logit_cap=0):
+        """Dense and sparse requests retain the same logical history order."""
+        if (
+            self.page_table
+            and not self.sparse
+            and self.pipeline.cuda
+            and indices is None
+        ):
+            from sglang.kernels.ops.attention.extend_attention import (
+                extend_attention_fwd_unified,
+            )
+
+            # Reuse SGLang's dense paged extend kernel directly. Logical token
+            # indices address the same head-wise table as sparse decode; no
+            # contiguous KV gather or duplicate dense cache is required.
+            view = self.page_table.pool.slabs[0].permute(0, 2, 1, 3)
+            locs = torch.arange(self.length, dtype=torch.int64, device=self.device)
+            active = (self.length - 1) // self.config.block_size
+            locs = torch.where(
+                locs // self.config.block_size == active,
+                self.config.history_blocks * self.config.block_size
+                + locs % self.config.block_size,
+                locs,
+            )
+            output = query.new_empty((query.shape[0], query.shape[1], self.value_dim))
+            extend_attention_fwd_unified(
+                query,
+                output,
+                view[..., : self.key_dim],
+                view[..., self.key_dim : self.key_dim + self.value_dim],
+                1.0,
+                1.0,
+                torch.tensor(
+                    [0, query.shape[0]], dtype=torch.int32, device=self.device
+                ),
+                torch.tensor([0, self.length], dtype=torch.int32, device=self.device),
+                locs,
+                torch.tensor([prefix], dtype=torch.int32, device=self.device),
+                query.shape[0],
+                sm_scale=scale,
+                logit_cap=logit_cap,
+                page_size=self.config.block_size,
+                kv_page_table=self.page_table.pointers,
+                packed_value_offset=self.key_dim,
+            )
+            return self._finish_attention(output)
+        n = self.length
+        packed = self.materialize_history()
         key, value = (
             packed[..., : self.key_dim],
             packed[..., self.key_dim : self.key_dim + self.value_dim],
@@ -445,40 +723,68 @@ class OasisKVLayerCache:
                     0, 1
                 )
             )
-        return torch.cat(results, 0)
+        return self._finish_attention(torch.cat(results, 0))
 
 
 class OasisKVCache:
     """Request generation ownership shared by all target layers and backends."""
 
-    def __init__(self, config: OasisKVConfig, device):
+    def __init__(self, config: OasisKVConfig, device, max_requests=None):
         self.config = config
         self.pipeline = OasisKVPipeline(device)
         self.layers = {}
+        self.page_pools = {}
+        self.max_requests = max_requests
+
+    def new_layer(self, layer_id, heads, kd, vd, dtype, device):
+        geometry = (layer_id, heads, kd, vd, dtype)
+        if geometry not in self.page_pools:
+            storage = ((kd + vd) * dtype.itemsize + 15) // 16 * 16 // dtype.itemsize
+            self.page_pools[geometry] = OasisKVPagePool(
+                heads,
+                self.config.block_size,
+                storage,
+                dtype,
+                device,
+                (
+                    None
+                    if self.max_requests is None
+                    else self.max_requests * (self.config.history_blocks + 1)
+                ),
+            )
+        return OasisKVLayerCache(
+            self.config,
+            heads,
+            kd,
+            vd,
+            dtype,
+            device,
+            self.pipeline,
+            self.page_pools[geometry],
+        )
 
     def get(self, slot, generation, layer_id, key, value):
         identity = (slot, generation, layer_id)
         if identity not in self.layers:
             for old in list(self.layers):
                 if old[0] == slot and old[1] != generation:
-                    self.layers.pop(old).join(reclaim=True)
-            self.layers[identity] = OasisKVLayerCache(
-                self.config,
+                    self.layers.pop(old).release()
+            self.layers[identity] = self.new_layer(
+                layer_id,
                 key.shape[1],
                 key.shape[2],
                 value.shape[2],
                 key.dtype,
                 key.device,
-                self.pipeline,
             )
         return self.layers[identity]
 
     def release(self, slot):
         for identity in list(self.layers):
             if identity[0] == slot:
-                self.layers.pop(identity).join(reclaim=True)
+                self.layers.pop(identity).release()
 
     def clear(self):
         for layer in self.layers.values():
-            layer.join(reclaim=True)
+            layer.release()
         self.layers.clear()

@@ -18,7 +18,32 @@ AGES = 5
 CAPACITY = 6
 PREFIX = 7
 STEP = 8
-FIELDS = 9
+PAGES = 9
+DENSE = 10
+FIELDS = 11
+
+
+@triton.jit
+def _slot_pointer(
+    row,
+    h,
+    slot,
+    SLOTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    STORAGE: tl.constexpr,
+    DTYPE: tl.constexpr,
+):
+    pages = tl.load(row + 9)
+    if pages != 0:
+        table = pages.to(tl.pointer_type(tl.int64))
+        address = tl.load(table + h * (SLOTS + 1) + slot, slot <= SLOTS, 0)
+        pointer = address.to(tl.pointer_type(DTYPE))
+    else:
+        pointer = (
+            tl.load(row + 1).to(tl.pointer_type(DTYPE))
+            + (h * (SLOTS + 1) + slot) * BLOCK * STORAGE
+        )
+    return tl.multiple_of(pointer, 16)
 
 
 @triton.jit
@@ -37,12 +62,11 @@ def append_token(
     D: tl.constexpr,
 ):
     b, h = tl.program_id(0), tl.program_id(1)
-    row = Table + b * 9
+    row = Table + b * 11
     pos = tl.load(row + 7)
     if pos >= 0:
         dtype = Key.dtype.element_ty
         host = tl.load(row + 0).to(tl.pointer_type(dtype))
-        data = tl.load(row + 1).to(tl.pointer_type(dtype))
         capacity = tl.load(row + 6)
         d = tl.arange(0, D)
         k = tl.load(Key + (b * WIDTH * HEADS + h) * KD + d, d < KD, 0)
@@ -51,9 +75,13 @@ def append_token(
         )
         packed = tl.where(d < KD, k, v)
         offset = pos % BLOCK
-        tl.store(host + (h * capacity * BLOCK + pos) * STORAGE + d, packed, d < STORAGE)
+        if tl.load(row + 10) == 0:
+            tl.store(
+                host + (h * capacity * BLOCK + pos) * STORAGE + d, packed, d < STORAGE
+            )
+        active = _slot_pointer(row, h, SLOTS, SLOTS, BLOCK, STORAGE, dtype)
         tl.store(
-            data + ((h * (SLOTS + 1) + SLOTS) * BLOCK + offset) * STORAGE + d,
+            active + offset * STORAGE + d,
             packed,
             d < STORAGE,
         )
@@ -83,7 +111,7 @@ def score_blocks(
 ):
     bh, lane, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     b, h = bh // HEADS, bh % HEADS
-    row = Table + b * 9
+    row = Table + b * 11
     pos = tl.load(row + 7)
     blocks = tile * TILE + tl.arange(0, TILE)
     scores = tl.full((TILE,), -float("inf"), tl.float32)
@@ -129,7 +157,7 @@ def native_candidates(
     N: tl.constexpr,
 ):
     b, h = tl.program_id(0), tl.program_id(1)
-    pos = tl.load(Table + b * 9 + 7)
+    pos = tl.load(Table + b * 11 + 7)
     i = tl.arange(0, N)
     real = tl.load(TopK + b * WIDTH * TOPK + i, i < TOPK, -1)
     real = tl.where((real >= 0) & (real < pos) & (pos >= 0), real, -1)
@@ -172,7 +200,7 @@ def plan_delta(
     SEARCH_STEPS: tl.constexpr,
 ):
     b, h = tl.program_id(0), tl.program_id(1)
-    row = Table + b * 9
+    row = Table + b * 11
     pos = tl.load(row + 7)
     i = tl.arange(0, N)
     out = (b * HEADS + h) * SLOTS
@@ -182,40 +210,48 @@ def plan_delta(
         ids = tl.load(resident + h * SLOTS + i, i < SLOTS, -1)
         ages = tl.load(ages_ptr + h * SLOTS + i, i < SLOTS, -1)
         candidates = tl.load(Candidates + out + i, i < SLOTS, -1).to(tl.int64)
-        sorted_ids = tl.sort(
-            tl.where((i < SLOTS) & (ids >= 0), ids, 2147483647), descending=False
-        )
-        sorted_candidates = tl.sort(
-            tl.where(candidates >= 0, candidates, 2147483647), descending=False
-        )
-        hit = _contains(sorted_candidates, ids, N, SEARCH_STEPS)
-        missing = (candidates >= 0) & ~_contains(
-            sorted_ids, candidates, N, SEARCH_STEPS
-        )
-        count = tl.minimum(tl.sum(missing.to(tl.int32), 0), CAP)
-        # Encode the slot in the low bits for deterministic, stable LRU ties.
-        priority = tl.where(ids < 0, -1, ages)
-        priority = tl.where(hit | (i >= SLOTS), 2147483647, priority)
-        targets = (tl.sort((priority + 1) * N + i, descending=False) % N).to(tl.int32)
-        compact = (tl.sort(tl.where(missing, i, i + N), descending=False) % N).to(
-            tl.int32
-        )
-        sources = tl.gather(candidates, compact, 0)
-        admitted = i < count
-        step = tl.load(row + 8) + BACKGROUND
-        updated_ages = tl.where(hit, step, ages)
-        new_ids = tl.where(admitted, sources, tl.gather(ids, targets, 0))
-        new_ages = tl.where(admitted, step, tl.gather(updated_ages, targets, 0))
-        tl.store(Ids + out + targets, new_ids, targets < SLOTS)
-        tl.store(Ages + out + targets, new_ages, targets < SLOTS)
-        tl.store(
-            Selected + out + targets,
-            admitted | tl.gather(hit, targets, 0),
-            targets < SLOTS,
-        )
-        tl.store(Sources + out + i, sources, i < SLOTS)
-        tl.store(Destinations + out + i, targets, i < SLOTS)
-        tl.store(Counts + b * HEADS + h, count)
+        if tl.load(row + 10) != 0:
+            tl.store(Ids + out + i, ids, i < SLOTS)
+            tl.store(Ages + out + i, ages, i < SLOTS)
+            tl.store(Selected + out + i, ids >= 0, i < SLOTS)
+            tl.store(Counts + b * HEADS + h, 0)
+        else:
+            sorted_ids = tl.sort(
+                tl.where((i < SLOTS) & (ids >= 0), ids, 2147483647), descending=False
+            )
+            sorted_candidates = tl.sort(
+                tl.where(candidates >= 0, candidates, 2147483647), descending=False
+            )
+            hit = _contains(sorted_candidates, ids, N, SEARCH_STEPS)
+            missing = (candidates >= 0) & ~_contains(
+                sorted_ids, candidates, N, SEARCH_STEPS
+            )
+            count = tl.minimum(tl.sum(missing.to(tl.int32), 0), CAP)
+            # Encode the slot in the low bits for deterministic, stable LRU ties.
+            priority = tl.where(ids < 0, -1, ages)
+            priority = tl.where(hit | (i >= SLOTS), 2147483647, priority)
+            targets = (tl.sort((priority + 1) * N + i, descending=False) % N).to(
+                tl.int32
+            )
+            compact = (tl.sort(tl.where(missing, i, i + N), descending=False) % N).to(
+                tl.int32
+            )
+            sources = tl.gather(candidates, compact, 0)
+            admitted = i < count
+            step = tl.load(row + 8) + BACKGROUND
+            updated_ages = tl.where(hit, step, ages)
+            new_ids = tl.where(admitted, sources, tl.gather(ids, targets, 0))
+            new_ages = tl.where(admitted, step, tl.gather(updated_ages, targets, 0))
+            tl.store(Ids + out + targets, new_ids, targets < SLOTS)
+            tl.store(Ages + out + targets, new_ages, targets < SLOTS)
+            tl.store(
+                Selected + out + targets,
+                admitted | tl.gather(hit, targets, 0),
+                targets < SLOTS,
+            )
+            tl.store(Sources + out + i, sources, i < SLOTS)
+            tl.store(Destinations + out + i, targets, i < SLOTS)
+            tl.store(Counts + b * HEADS + h, count)
     else:
         tl.store(Counts + b * HEADS + h, 0)
         tl.store(Selected + out + i, False, i < SLOTS)
@@ -236,10 +272,9 @@ def copy_misses_legacy(
     WORKERS: tl.constexpr,
 ):
     b, h, worker = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    row = Table + b * 9
+    row = Table + b * 11
     if tl.load(row + 7) >= 0:
         host = tl.load(row + 0).to(tl.pointer_type(DTYPE))
-        data = tl.load(row + 1).to(tl.pointer_type(DTYPE))
         capacity = tl.load(row + 6)
         count = tl.load(Counts + b * HEADS + h)
         i = tl.arange(0, TILE)
@@ -253,8 +288,9 @@ def copy_misses_legacy(
                     d < BLOCK * STORAGE,
                     0,
                 )
+                destination = _slot_pointer(row, h, dst, SLOTS, BLOCK, STORAGE, DTYPE)
                 tl.store(
-                    data + (h * (SLOTS + 1) + dst) * BLOCK * STORAGE + d,
+                    destination + d,
                     value,
                     d < BLOCK * STORAGE,
                 )
@@ -286,11 +322,10 @@ def copy_misses(
     worker = tl.program_id(1)
     for group in range(tl.program_id(0), GROUPS, tl.num_programs(0)):
         b, h = group // HEADS, group % HEADS
-        row = Table + b * 9
+        row = Table + b * 11
         count = tl.load(Counts + group)
         if (tl.load(row + 7) >= 0) & (worker < count * TILES):
             host = tl.multiple_of(tl.load(row + 0).to(tl.pointer_type(DTYPE)), 16)
-            data = tl.multiple_of(tl.load(row + 1).to(tl.pointer_type(DTYPE)), 16)
             capacity = tl.load(row + 6)
             i = tl.arange(0, TILE)
             for job in range(worker, count * TILES, WORKERS):
@@ -306,8 +341,9 @@ def copy_misses(
                     # foreground computation's L1 working set.
                     cache_modifier=".cg",
                 )
+                destination = _slot_pointer(row, h, dst, SLOTS, BLOCK, STORAGE, DTYPE)
                 tl.store(
-                    data + (h * (SLOTS + 1) + dst) * BLOCK * STORAGE + d,
+                    destination + d,
                     value,
                     d < BLOCK * STORAGE,
                 )
@@ -318,7 +354,7 @@ def publish_plan(
     Table, Ids, Ages, HEADS: tl.constexpr, SLOTS: tl.constexpr, N: tl.constexpr
 ):
     b, h = tl.program_id(0), tl.program_id(1)
-    row = Table + b * 9
+    row = Table + b * 11
     if tl.load(row + 7) >= 0:
         resident = tl.load(row + 4).to(tl.pointer_type(tl.int64))
         ages = tl.load(row + 5).to(tl.pointer_type(tl.int64))
@@ -353,21 +389,29 @@ def attention_partial(
     DV: tl.constexpr,
     TILE: tl.constexpr,
 ):
-    bq, qh, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    b, lane = bq // WIDTH, bq % WIDTH
+    # One CTA owns both query rows. K/V tiles are loaded once into registers
+    # and used by two independent online-softmax accumulators.
+    b, qh, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    bq = b * WIDTH
     h = qh // GROUP
-    row = Table + b * 9
+    row = Table + b * 11
     pos = tl.load(row + 7)
     dk, dv = tl.arange(0, DK), tl.arange(0, DV)
     acc = tl.full((DV,), 0, tl.float32)
     m, z = tl.full((), -float("inf"), tl.float32), tl.full((), 0, tl.float32)
+    if WIDTH == 2:
+        acc1 = tl.full((DV,), 0, tl.float32)
+        m1, z1 = tl.full((), -float("inf"), tl.float32), tl.full((), 0, tl.float32)
     if pos >= 0:
         dtype = Key.dtype.element_ty
-        data = tl.load(row + 1).to(tl.pointer_type(dtype))
         resident = tl.load(row + 4).to(tl.pointer_type(tl.int64))
         q = tl.load(Query + (bq * HEADS * GROUP + qh) * KD + dk, dk < KD, 0).to(
             tl.float32
         )
+        if WIDTH == 2:
+            q1 = tl.load(
+                Query + ((bq + 1) * HEADS * GROUP + qh) * KD + dk, dk < KD, 0
+            ).to(tl.float32)
         for tile in range(triton.cdiv(PER_SPLIT, TILE)):
             token = split * PER_SPLIT + tile * TILE + tl.arange(0, TILE)
             slot, within = token // BLOCK, token % BLOCK
@@ -383,15 +427,16 @@ def attention_partial(
                 & (block_id * BLOCK + within <= pos)
                 & (selected | (slot == SLOTS))
             )
-            draft = (WIDTH == 2) & (lane == 1) & (token == (SLOTS + 1) * BLOCK)
-            offset = (h * (SLOTS + 1) * BLOCK + token) * STORAGE
+            draft = (WIDTH == 2) & (token == (SLOTS + 1) * BLOCK)
+            page = _slot_pointer(row, h, slot, SLOTS, BLOCK, STORAGE, dtype)
+            offset = within * STORAGE
             k = tl.load(
-                data + offset[:, None] + dk[None, :],
+                page[:, None] + offset[:, None] + dk[None, :],
                 valid[:, None] & (dk[None, :] < KD),
                 0,
             ).to(tl.float32)
             v = tl.load(
-                data + offset[:, None] + KD + dv[None, :],
+                page[:, None] + offset[:, None] + KD + dv[None, :],
                 valid[:, None] & (dv[None, :] < VD),
                 0,
             ).to(tl.float32)
@@ -407,7 +452,7 @@ def attention_partial(
             logits = tl.sum(k * q[None, :], 1) * SCALE
             if CAP > 0:
                 logits = CAP * (2 / (1 + tl.exp(2 * (-logits / CAP))) - 1)
-            logits = tl.where(valid | draft, logits, -float("inf"))
+            logits = tl.where(valid, logits, -float("inf"))
             new_m = tl.maximum(m, tl.max(logits, 0))
             safe_m = tl.where(new_m == -float("inf"), 0, new_m)
             alpha = tl.exp(m - safe_m)
@@ -415,10 +460,27 @@ def attention_partial(
             acc = acc * alpha + tl.sum(p[:, None] * v, 0)
             z = z * alpha + tl.sum(p, 0)
             m = new_m
+            if WIDTH == 2:
+                logits1 = tl.sum(k * q1[None, :], 1) * SCALE
+                if CAP > 0:
+                    logits1 = CAP * (2 / (1 + tl.exp(2 * (-logits1 / CAP))) - 1)
+                logits1 = tl.where(valid | draft, logits1, -float("inf"))
+                new_m1 = tl.maximum(m1, tl.max(logits1, 0))
+                safe_m1 = tl.where(new_m1 == -float("inf"), 0, new_m1)
+                alpha1 = tl.exp(m1 - safe_m1)
+                p1 = tl.exp(logits1 - safe_m1)
+                acc1 = acc1 * alpha1 + tl.sum(p1[:, None] * v, 0)
+                z1 = z1 * alpha1 + tl.sum(p1, 0)
+                m1 = new_m1
     out = ((bq * HEADS * GROUP + qh) * SPLITS + split) * (VD + 2)
     tl.store(Partial + out + dv, acc, dv < VD)
     tl.store(Partial + out + VD, m)
     tl.store(Partial + out + VD + 1, z)
+    if WIDTH == 2:
+        out1 = (((bq + 1) * HEADS * GROUP + qh) * SPLITS + split) * (VD + 2)
+        tl.store(Partial + out1 + dv, acc1, dv < VD)
+        tl.store(Partial + out1 + VD, m1)
+        tl.store(Partial + out1 + VD + 1, z1)
 
 
 @triton.jit

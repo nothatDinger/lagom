@@ -70,3 +70,30 @@ def test_publish_never_touches_padding_newest_slot_or_other_layers(real_count):
         before_lru[1, req] = planned_lru[b]
     torch.testing.assert_close(tokens, before_tokens)
     torch.testing.assert_close(lru, before_lru)
+
+
+def test_background_publication_preserves_concurrent_short_context_c4_promotion():
+    hot = 4
+    tokens = torch.arange(3 * (hot + 1), dtype=torch.int32, device=DEVICE).view(
+        3, hot + 1
+    )
+    lru = torch.zeros(3, hot, dtype=torch.int16, device=DEVICE)
+    before = tokens.clone()
+    planned = torch.full((3, hot), 99, dtype=torch.int32, device=DEVICE)
+    publish_hot_metadata[(3,)](
+        torch.tensor([0, 1, 2], device=DEVICE),
+        torch.tensor([3], device=DEVICE),
+        planned,
+        planned.to(torch.int16),
+        tokens,
+        lru,
+        hot,
+        hot + 1,
+        hot,
+        lengths=torch.tensor([hot - 1, hot, hot + 1], device=DEVICE),
+        SKIP_SHORT=True,
+    )
+    torch.testing.assert_close(tokens[:2], before[:2])
+    assert (tokens[2, :hot] == 99).all()
+    assert tokens[2, hot] == before[2, hot]
+    assert not lru[:2].any()

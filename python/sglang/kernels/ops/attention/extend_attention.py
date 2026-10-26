@@ -1009,6 +1009,9 @@ def _fwd_kernel_unified(
     aux0_stride_t=0,
     aux0_stride_h=0,
     aux0_len=0,
+    KVPageTable=None,
+    PAGE_TABLE_HEAD_STRIDE: tl.constexpr = 0,
+    PACKED_VALUE_OFFSET: tl.constexpr = 0,
 ):
     """
     Unified 1-stage kernel for deterministic extend attention.
@@ -1149,7 +1152,17 @@ def _fwd_kernel_unified(
             )
 
             # Page-aware KV address math (see _fwd_kernel_stage1).
-            if PAGE_SIZE == 1:
+            if PAGE_TABLE_HEAD_STRIDE > 0:
+                page_id = offs_kv_loc // PAGE_SIZE
+                tok_in_p = offs_kv_loc % PAGE_SIZE
+                page_address = tl.load(
+                    KVPageTable + cur_kv_head * PAGE_TABLE_HEAD_STRIDE + page_id,
+                    mask_n,
+                    0,
+                )
+                k_base = page_address.to(K_Buffer.dtype)
+                offs_buf_k = tok_in_p[None, :] * stride_buf_ktok + offs_d[:, None]
+            elif PAGE_SIZE == 1:
                 # Load K
                 offs_buf_k = (
                     offs_kv_loc[None, :] * stride_buf_kbs
@@ -1165,15 +1178,21 @@ def _fwd_kernel_unified(
                     + cur_kv_head * stride_buf_kh
                     + offs_d[:, None]
                 )
+            if PAGE_TABLE_HEAD_STRIDE > 0:
+                k_ptr = k_base[None, :] + offs_buf_k
+            else:
+                k_ptr = K_Buffer + offs_buf_k
             k = tl.load(
-                K_Buffer + offs_buf_k,
+                k_ptr,
                 mask=(mask_n[None, :]) & (mask_d[:, None]),
                 other=0.0,
             )
 
             qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
-                if PAGE_SIZE == 1:
+                if PAGE_TABLE_HEAD_STRIDE > 0:
+                    offs_kpe = tok_in_p[None, :] * stride_buf_ktok + offs_dpe[:, None]
+                elif PAGE_SIZE == 1:
                     offs_kpe = (
                         offs_kv_loc[None, :] * stride_buf_kbs
                         + cur_kv_head * stride_buf_kh
@@ -1186,8 +1205,12 @@ def _fwd_kernel_unified(
                         + cur_kv_head * stride_buf_kh
                         + offs_dpe[:, None]
                     )
+                if PAGE_TABLE_HEAD_STRIDE > 0:
+                    kpe_ptr = k_base[None, :] + offs_kpe
+                else:
+                    kpe_ptr = K_Buffer + offs_kpe
                 kpe = tl.load(
-                    K_Buffer + offs_kpe,
+                    kpe_ptr,
                     mask=mask_n[None, :],
                     other=0.0,
                 )
@@ -1227,7 +1250,9 @@ def _fwd_kernel_unified(
             deno = deno * re_scale + tl.sum(p, 1)
 
             # Load V
-            if PAGE_SIZE == 1:
+            if PAGE_TABLE_HEAD_STRIDE > 0:
+                offs_buf_v = tok_in_p[:, None] * stride_buf_vtok + offs_dv[None, :]
+            elif PAGE_SIZE == 1:
                 offs_buf_v = (
                     offs_kv_loc[:, None] * stride_buf_vbs
                     + cur_kv_head * stride_buf_vh
@@ -1240,8 +1265,16 @@ def _fwd_kernel_unified(
                     + cur_kv_head * stride_buf_vh
                     + offs_dv[None, :]
                 )
+            if PAGE_TABLE_HEAD_STRIDE > 0:
+                v_ptr = (
+                    page_address.to(V_Buffer.dtype)[:, None]
+                    + PACKED_VALUE_OFFSET
+                    + offs_buf_v
+                )
+            else:
+                v_ptr = V_Buffer + offs_buf_v
             v = tl.load(
-                V_Buffer + offs_buf_v,
+                v_ptr,
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
@@ -1292,6 +1325,8 @@ def extend_attention_fwd_unified(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    kv_page_table=None,
+    packed_value_offset=0,
 ):
     """
     Unified 1-stage extend attention for deterministic inference.
@@ -1299,6 +1334,9 @@ def extend_attention_fwd_unified(
     Args:
         q: Query tensor [num_tokens, num_heads, head_dim]
         o: Output tensor [num_tokens, num_heads, head_dim]
+        kv_page_table: Optional head-wise page addresses [KV heads, logical pages].
+            Keeps the dense kernel usable with non-moving multi-slab KV pools.
+        packed_value_offset: V offset in elements from each page address.
         k_buffer: Key cache buffer
         v_buffer: Value cache buffer
         qo_indptr: Query offsets [batch_size + 1]
@@ -1404,6 +1442,9 @@ def extend_attention_fwd_unified(
         aux0_stride_t=aux0_stride_t,
         aux0_stride_h=aux0_stride_h,
         aux0_len=aux0_len,
+        KVPageTable=kv_page_table,
+        PAGE_TABLE_HEAD_STRIDE=0 if kv_page_table is None else kv_page_table.stride(0),
+        PACKED_VALUE_OFFSET=packed_value_offset,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,

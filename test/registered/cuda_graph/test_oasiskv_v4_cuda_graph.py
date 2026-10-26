@@ -171,6 +171,7 @@ def test_v4_graph_refill_pipeline_padding_reorder_c4_commit_and_recycle(
             normal_lens = (fb.seq_lens + 1) // 4
             reads = []
             for layer in range(layers):
+                state.consume_layer(layer)
                 # The native indexer supplies real/predicted logical C4 indices.
                 swapped = c.swap_in_selected_pages_spec(
                     fb.req_pool_indices,

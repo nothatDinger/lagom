@@ -1437,7 +1437,7 @@ class HiSparseCoordinator:
     ) -> None:
         if self.prefetcher_name == "oasiskv":
             if (state := getattr(self, "oasiskv_graph_state", None)) is not None:
-                state.wait()
+                state.wait(layer_id)
             if self._oasiskv_ring is None:
                 return
             valid_tasks = [
@@ -1605,7 +1605,7 @@ class HiSparseCoordinator:
         if self.prefetcher_name != "oasiskv" or self.prefetcher is None:
             raise RuntimeError("plan_oasiskv_prefetch requires OasisKV mode")
         if (state := getattr(self, "oasiskv_graph_state", None)) is not None:
-            state.wait()
+            state.wait(layer_id)
         if (
             req_pool_indices_cpu.device.type != "cpu"
             or source_committed_lens_cpu.device.type != "cpu"
@@ -1998,8 +1998,6 @@ class HiSparseCoordinator:
         """
         if not self.is_dsv4_hisparse:
             raise RuntimeError("DSPARK HiSparse windows require DeepSeek-V4 C4")
-        if (state := getattr(self, "oasiskv_graph_state", None)) is not None:
-            state.wait()
         if self._has_pending_dspark_commit:
             # Commit copies may have been issued by another producer stream.
             # A stream dependency preserves overlap without a CPU-wide barrier.
@@ -2148,6 +2146,8 @@ class HiSparseCoordinator:
             window, commit_cpu, self.compress_ratio
         )
         if accepted:
+            if (state := getattr(self, "oasiskv_graph_state", None)) is not None:
+                state.wait_selection_for_commit()
             accepted_idx = torch.tensor(accepted, dtype=torch.int64, device=self.device)
             host_locs = []
             for i in accepted:

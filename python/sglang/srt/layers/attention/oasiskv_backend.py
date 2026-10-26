@@ -109,7 +109,15 @@ class OasisKVAttnBackend(AttentionBackend):
             prefixes = (
                 lengths if self.graph_paired else [length - 1 for length in lengths]
             )
-        self.graph_state.prepare(slots, generations, prefixes, paired=self.graph_paired)
+        self.graph_state.prepare(
+            slots,
+            generations,
+            prefixes,
+            paired=self.graph_paired,
+            graph_batch_size=getattr(
+                forward_batch, "batch_size", self.graph_state.max_bs
+            ),
+        )
 
     def init_forward_metadata_in_graph(self, forward_batch):
         if self.dsa is not None:

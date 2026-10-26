@@ -39,16 +39,22 @@ preflight 检查可见 H100 数量和显存，并保存 CPU、内存和 GPU 拓�
 
 通用 decode 通过固定 GPU 请求表间接访问各请求的 host KV、摘要和 device working set；
 请求身份、长度和扩容后的地址在 replay 前更新。图内执行 root KV 追加、摘要更新、预测、
-真实 Top-K 补载、attention，以及独立 stream 上的选择/传输。传输等待本层 attention，
-在模型末尾汇合所有侧流，因此可与后续层重叠，但不会跨过本轮 graph 尾部。
-host 分配/扩容和请求回收在图外，变长 dense prefill 暂时仍为 eager。
+真实 Top-K 补载和成对 attention。每层的选择/传输使用独立捕获的 CUDA graph，
+由 external event 连接：选择等预测及真实补载，传输再等本层 attention；前台图尾不汇合后台。
+提交前台图后立即提交各层后台图，下一步到达对应层才等待该层上次传输，允许末层传输跨过模型边界。
+后台保存独立元数据快照，避免下一批请求换序或 padding 更新覆盖正在执行的任务。
+host 分配/扩容、dense→sparse 转换和请求回收仍在图外，必要时等待相关页的使用者。
+变长 prefill 保持 eager；短请求直接使用原有 paged extend attention 读取共享页池。
 `--disable-cuda-graph` 保留为显式 eager 对照；正式测试须确认日志中的实际 capture/replay。
 性能脚本检查服务端解析后的 decode graph 配置；若关闭 graph 或最大 batch 不覆盖该点并发，会将该点判为失败。
 
 先在目标 CUDA 环境从仓库根目录执行无需 checkpoint 的图回归测试，再进行服务 smoke：
 
 ```bash
-PYTHONPATH=python python -m pytest -q test/registered/cuda_graph/test_oasiskv_cuda_graph.py
+PYTHONPATH=python python -m pytest -q \
+  test/registered/cuda_graph/test_oasiskv_async_graph.py \
+  test/registered/cuda_graph/test_oasiskv_cuda_graph.py \
+  test/registered/cuda_graph/test_oasiskv_v4_cuda_graph.py
 ```
 
 测试覆盖连续 replay、不同请求顺序、padding、host 扩容、请求槽复用，以及 MHA/GQA、MLA 和原生 DSA 的 KV 路径。
@@ -68,8 +74,18 @@ PYTHONPATH=python python -m pytest -q test/registered/cuda_graph/test_oasiskv_cu
   后续加入它们时需要各自独立环境、同一 token 数据与相同指标定义，不应把 dense 曲线标成 vLLM。
 - GPU 上的正确性、启动兼容性、显存与 pinned host 内存容量均须通过 smoke 验证；CPU 测试通过不代表可达到论文速度。
   高并发容量不足或 OOM 应保留为失败点，不自动调低并发、长度或预算。
-  当前通用路径会按 `max-running-requests` 预留 device working set，因此高档并发也可能在启动阶段容量不足；
+  当前通用路径按需从共享物理页池分配 KV 页，但容量估算仍按 `max-running-requests` 预留最坏 working set，因此高档并发也可能在启动阶段容量不足；
   不能假定它一定像论文曲线那样自动维持较低的 running batch。服务端报告的实际请求上限和 KV 容量会留存。
+
+
+### 本轮补齐的机制
+
+- **跨步 graph 流水**：通用与 V4 路径都移除了模型尾部的侧流汇合。V4 的 C4 提交只等元数据选择读完，短序列后台不回写旧映射，历史传输不写 reserved newest slot。
+- **成对 KV 复用**：通用 CUDA decode 一个 CTA 同时处理真实行和 draft 行，每个历史 K/V tile 只加载一次，分别累计 softmax；真实行仍屏蔽 draft KV。eager 和 full graph 使用同一个内核。
+- **统一分页及阈值切换**：通用模型的 dense/sparse 请求共享每层物理页池和 head-wise 页表。长度不超过 `top_k` 时按需分配 dense 页，无 host history；超过阈值时将完整历史写入 pinned host，已有 GPU 页原地转为 sparse 槽位。不同请求可处于不同模式，同一 decode graph 处理两种行。页回收后可供其它请求复用。
+
+这套页池服务于 OasisKV target；它没有启用 SGLang 的独立 `--enable-unified-memory` 选项，也不与 draft 权重或 KV 共用物理页。长请求的 sparse prefill 仍临时恢复完整 KV 进行 causal attention，调度容量估算仍保留最坏情况预算。
+本轮已做 CPU/Triton 数值回归和 SM90 离线编译；新增 external-event 跨步依赖尚待真实 CUDA capture/replay 验证。不能据此宣称 TPOT/TPS 已改善。
 
 ## 准备与执行
 
@@ -221,6 +237,6 @@ GEMM 只用于对比资源干扰，不能替代真实 attention/MLP trace、TPS 
 
 将 `copy_kernel` 设为 `legacy`，可恢复原 copy 算法和固定 4 workers/request/head，
 此时两项 CTA 预算不生效。修改预算或 kernel 后重启服务以重新捕获 CUDA graph。
-本开关只作用于通用 full-graph UVA copy；通用 eager 与 DeepSeek-V4 的 C++ 搬运实现未改动。
+本开关只作用于通用 full-graph UVA copy；通用 eager 暂不读取这些调优项，DeepSeek-V4 仍采用其 C++ 搬运实现。
 真实补取仍在 attention 前完成，预取写入仍依赖本层 attention 读取结束，未改变 stream/event 依赖。
 优先按真实主流耗时、联合耗时与最终 TPS/TPOT 选择预算，不能只按 copy 单独运行的带宽选择。

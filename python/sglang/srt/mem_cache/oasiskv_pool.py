@@ -7,7 +7,9 @@ from sglang.srt.mem_cache.oasiskv_cache import OasisKVCache
 
 class OasisKVPoolMixin:
     def init_oasiskv(self, config, req_to_token_pool):
-        self.oasiskv_cache = OasisKVCache(config, self.device)
+        self.oasiskv_cache = OasisKVCache(
+            config, self.device, max_requests=req_to_token_pool.size
+        )
         req_to_token_pool.oasiskv_cache = self.oasiskv_cache
 
     def set_kv_buffer(self, *args, **kwargs):
@@ -55,13 +57,23 @@ class OasisKVTokenToKVPool(OasisKVPoolMixin, KVCache):
 
     def get_kv_size_bytes(self):
         return sum(
-            layer.data.numel() * layer.data.element_size()
-            + (0 if layer.key_min is None else layer.key_min.numel() * 8)
+            pool.nbytes for pool in self.oasiskv_cache.page_pools.values()
+        ) + sum(
+            (0 if layer.key_min is None else layer.key_min.numel() * 8)
             for layer in self.oasiskv_cache.layers.values()
         )
 
 
 class OasisKVDSATokenToKVPool(OasisKVPoolMixin, DSATokenToKVPool):
+    def get_kv_size_bytes(self):
+        # The native parent counts index keys and its placeholder latent buffer.
+        # Add shared pages once, including free pages retained by the allocator.
+        return super().get_kv_size_bytes() + (
+            OasisKVTokenToKVPool.get_kv_size_bytes(self)
+            if hasattr(self, "oasiskv_cache")
+            else 0
+        )
+
     def _create_buffers(self):
         # Keep the native index-key pool on GPU, without allocating the latent
         # full-KV pool. The inherited pointer table is never used for attention.

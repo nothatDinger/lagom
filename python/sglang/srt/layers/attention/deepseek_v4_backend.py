@@ -1145,7 +1145,7 @@ class DeepseekV4AttnBackend(
             )
             is not None
         ):
-            state.wait()
+            state.replay_batch_size = forward_batch.batch_size
         bucket = _GraphBucket.of(forward_batch.forward_mode)
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices

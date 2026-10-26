@@ -21,7 +21,7 @@ def filter_history_candidates(
     active = b < tl.load(num_real_reqs)
     valid = tl.load(valid_drafts + b) & active
     # Neither the root's newly completed C4 nor a draft-only C4 is authoritative
-    # host KV yet. The root is promoted to its fixed slot after the graph joins.
+    # host KV yet. The root is promoted after the foreground graph completes.
     history = tl.load(prefixes + b) // COMPRESS
     candidate = tl.load(predicted + b * INPUT_STRIDE + i, i < K, other=-1)
     candidate = tl.where(
@@ -41,10 +41,16 @@ def publish_hot_metadata(
     HOT: tl.constexpr,
     TOKEN_STRIDE: tl.constexpr,
     BLOCK: tl.constexpr,
+    lengths=None,
+    SKIP_SHORT: tl.constexpr = False,
 ):
     b = tl.program_id(0)
-    # Padding may repeat a live request ID; a masked index_copy_ is insufficient.
-    if b < tl.load(num_real_reqs):
+    active = b < tl.load(num_real_reqs)
+    if SKIP_SHORT:
+        active = active & (tl.load(lengths + b) > HOT)
+    # Short contexts already use fixed slots. Do not publish their old
+    # snapshots over a concurrently promoted C4 entry.
+    if active:
         req = tl.load(req_indices + b)
         i = tl.arange(0, BLOCK)
         token = tl.load(planned_tokens + b * HOT + i, i < HOT, other=-1)

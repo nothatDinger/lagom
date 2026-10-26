@@ -931,6 +931,10 @@ class C4IndexerBackendMixin:
             # mappings on the prefetch stream.  Join every writer event before
             # planning fallback misses or exposing those slots to attention.
             graph_capture = getattr(forward_batch, "is_oasiskv_graph_capture", False)
+            if graph_capture:
+                hisparse_coordinator.oasiskv_graph_state.consume_layer(
+                    compress_layer_id
+                )
             if not graph_capture:
                 hisparse_coordinator.consume_oasiskv_prefetch(
                     req_pool_indices=forward_batch.req_pool_indices,
