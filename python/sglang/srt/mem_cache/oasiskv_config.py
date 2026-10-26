@@ -14,9 +14,21 @@ class OasisKVConfig:
     max_new_blocks: int | None = None
     prefill_chunk_size: int = 256
     native_sparse: bool = False
+    # Generic full-graph UVA copy implementation. Keep legacy for server A/B.
+    copy_kernel: str = "tiled"
+    refill_ctas_per_sm: int = 8
+    prefetch_ctas_per_sm: int = 1
 
     def __post_init__(self):
-        for name in ("token_budget", "block_size", "prefill_chunk_size"):
+        if self.copy_kernel not in ("tiled", "legacy"):
+            raise ValueError("OasisKV copy_kernel must be 'tiled' or 'legacy'")
+        for name in (
+            "token_budget",
+            "block_size",
+            "prefill_chunk_size",
+            "refill_ctas_per_sm",
+            "prefetch_ctas_per_sm",
+        ):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"OasisKV {name} must be a positive integer")
@@ -44,6 +56,9 @@ class OasisKVConfig:
             "max_new_blocks",
             "prefill_chunk_size",
             "prefetcher",
+            "copy_kernel",
+            "refill_ctas_per_sm",
+            "prefetch_ctas_per_sm",
         }
         if unknown:
             raise ValueError(
@@ -62,6 +77,9 @@ class OasisKVConfig:
             max_new_blocks=config.get("max_new_blocks"),
             prefill_chunk_size=config.get("prefill_chunk_size", 256),
             native_sparse=native_sparse,
+            copy_kernel=config.get("copy_kernel", "tiled"),
+            refill_ctas_per_sm=config.get("refill_ctas_per_sm", 8),
+            prefetch_ctas_per_sm=config.get("prefetch_ctas_per_sm", 1),
         )
 
 

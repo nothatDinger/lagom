@@ -222,7 +222,7 @@ def plan_delta(
 
 
 @triton.jit
-def copy_misses(
+def copy_misses_legacy(
     Table,
     Sources,
     Destinations,
@@ -252,6 +252,59 @@ def copy_misses(
                     host + (h * capacity + src) * BLOCK * STORAGE + d,
                     d < BLOCK * STORAGE,
                     0,
+                )
+                tl.store(
+                    data + (h * (SLOTS + 1) + dst) * BLOCK * STORAGE + d,
+                    value,
+                    d < BLOCK * STORAGE,
+                )
+
+
+@triton.jit
+def copy_misses(
+    Table,
+    Sources,
+    Destinations,
+    Counts,
+    GROUPS: tl.constexpr,
+    HEADS: tl.constexpr,
+    SLOTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    STORAGE: tl.constexpr,
+    DTYPE: tl.constexpr,
+    TILE: tl.constexpr,
+    WORKERS: tl.constexpr,
+):
+    """Distribute (miss, payload tile) jobs instead of serializing each miss.
+
+    Host/data bases are allocator-aligned; storage records are padded to 16
+    bytes by OasisKVLayerCache. Explicit alignment survives table indirection
+    and permits 128-bit accesses. Each job has a unique destination tile; the
+    following publish_plan launch is the barrier for all copy CTAs.
+    """
+    TILES: tl.constexpr = triton.cdiv(BLOCK * STORAGE, TILE)
+    worker = tl.program_id(1)
+    for group in range(tl.program_id(0), GROUPS, tl.num_programs(0)):
+        b, h = group // HEADS, group % HEADS
+        row = Table + b * 9
+        count = tl.load(Counts + group)
+        if (tl.load(row + 7) >= 0) & (worker < count * TILES):
+            host = tl.multiple_of(tl.load(row + 0).to(tl.pointer_type(DTYPE)), 16)
+            data = tl.multiple_of(tl.load(row + 1).to(tl.pointer_type(DTYPE)), 16)
+            capacity = tl.load(row + 6)
+            i = tl.arange(0, TILE)
+            for job in range(worker, count * TILES, WORKERS):
+                miss, tile = job // TILES, job % TILES
+                src = tl.load(Sources + group * SLOTS + miss)
+                dst = tl.load(Destinations + group * SLOTS + miss)
+                d = tile * TILE + i
+                value = tl.load(
+                    host + (h * capacity + src) * BLOCK * STORAGE + d,
+                    d < BLOCK * STORAGE,
+                    0,
+                    # Bypass L1 so streaming host payload does not displace
+                    # foreground computation's L1 working set.
+                    cache_modifier=".cg",
                 )
                 tl.store(
                     data + (h * (SLOTS + 1) + dst) * BLOCK * STORAGE + d,

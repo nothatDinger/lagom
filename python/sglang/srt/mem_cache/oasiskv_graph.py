@@ -14,6 +14,25 @@ from sglang.srt.layers.attention.triton_ops import oasiskv as kernels
 from sglang.srt.mem_cache.oasiskv_cache import OasisKVLayerCache
 
 
+def copy_launch_geometry(
+    *, batch, heads, slots, block, storage, element_size, sm_count, ctas_per_sm
+):
+    """Static capture-safe geometry; no readback of per-step miss counts.
+
+    2 KiB tiles issue one aligned 16-byte vector per thread with four warps.
+    Cap the entire grid, including at large batches. CTAs iterate over groups
+    when there are more request/head groups than the budget. This limits
+    background concurrency without truncating its admission plan. It does not
+    reserve SMs or guarantee a bound on shared memory-system interference.
+    """
+    tile = min(triton.next_power_of_2(block * storage), 2048 // element_size)
+    tiles = triton.cdiv(block * storage, tile)
+    budget = sm_count * ctas_per_sm
+    groups = min(batch * heads, budget)
+    workers = min(slots * tiles, max(1, budget // groups))
+    return tile, (groups, workers)
+
+
 class GraphPlan:
     def __init__(self, batch, heads, slots, device):
         shape = (batch, heads, slots)
@@ -23,6 +42,12 @@ class GraphPlan:
         self.destinations = torch.empty_like(self.ids)
         self.counts = torch.empty((batch, heads), dtype=torch.int32, device=device)
         self.selected = torch.empty(shape, dtype=torch.bool, device=device)
+        # Query hardware before graph capture, not during replay or a fork.
+        self.sm_count = (
+            torch.cuda.get_device_properties(device).multi_processor_count
+            if torch.device(device).type == "cuda"
+            else 1
+        )
 
     def select(self, table, candidates, *, cap, background):
         batch = table.shape[0]
@@ -44,10 +69,30 @@ class GraphPlan:
             SEARCH_STEPS=triton.next_power_of_2(slots).bit_length(),
         )
 
-    def transfer(self, table, config, storage, dtype):
+    def transfer(self, table, config, storage, dtype, *, background):
         heads, slots = self.ids.shape[1:]
         batch = table.shape[0]
-        kernels.copy_misses[(batch, heads, 4)](
+        if config.copy_kernel == "legacy":
+            kernel, tile, workers = kernels.copy_misses_legacy, 1024, 4
+            grid, extra = (batch, heads, workers), {}
+        else:
+            kernel = kernels.copy_misses
+            tile, grid = copy_launch_geometry(
+                batch=batch,
+                heads=heads,
+                slots=slots,
+                block=config.block_size,
+                storage=storage,
+                element_size=dtype.itemsize,
+                sm_count=self.sm_count,
+                ctas_per_sm=(
+                    config.prefetch_ctas_per_sm
+                    if background
+                    else config.refill_ctas_per_sm
+                ),
+            )
+            workers, extra = grid[1], {"GROUPS": batch * heads}
+        kernel[grid](
             table,
             self.sources,
             self.destinations,
@@ -61,8 +106,10 @@ class GraphPlan:
                 torch.bfloat16: tl.bfloat16,
                 torch.float32: tl.float32,
             }[dtype],
-            TILE=1024,
-            WORKERS=4,
+            TILE=tile,
+            WORKERS=workers,
+            num_warps=4,
+            **extra,
         )
         # Publish only after all block-copy CTAs finish. On the side stream this
         # also follows attention, so neither bytes nor residency race its reads.
@@ -371,7 +418,7 @@ class OasisKVGraphState:
                 layout.draft[:batch_size].fill_(-1)
                 layout.draft[:batch_size, :, :count].copy_(ids[:, 1])
         w.real.select(table, w.candidates, cap=None, background=False)
-        w.real.transfer(table, self.config, storage, key.dtype)
+        w.real.transfer(table, self.config, storage, key.dtype, background=False)
 
         pipeline = self.cache.pipeline
         main = torch.cuda.current_stream(self.device)
@@ -423,5 +470,7 @@ class OasisKVGraphState:
             pipeline.transfer.wait_stream(pipeline.select)
             pipeline.transfer.wait_stream(main)
             with pipeline.context("transfer"):
-                layout.plan.transfer(table, self.config, storage, key.dtype)
+                layout.plan.transfer(
+                    table, self.config, storage, key.dtype, background=True
+                )
         return output.reshape(batch_size * width, -1)

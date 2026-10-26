@@ -54,6 +54,16 @@ Do not pass `--enable-hisparse` for the generic path. OasisKV defaults to EAGLE-
 | `block_size` | 16; native DSA 1 | Tokens per logical Quest block. Must divide `top_k`. |
 | `max_new_blocks` | `null` | Maximum background admissions per KV head and step. `null` admits all predicted misses; zero disables predicted miss transfers. Real-query miss refill is always uncapped. |
 | `prefill_chunk_size` | 256 | Query rows per dense prefill chunk. Smaller values reduce transient prefill workspace. |
+| `copy_kernel` | `tiled` | Generic full-graph UVA copy implementation. `legacy` restores the original fixed four workers per request/head for A/B testing. Does not change eager or DeepSeek-V4 copies. |
+| `refill_ctas_per_sm` | 8 | Positive integer multiplier of GPU SM count for the full-graph tiled real-query copy CTA budget. |
+| `prefetch_ctas_per_sm` | 1 | Separate CTA budget multiplier for tiled background copies, to limit competition with foreground computation. |
+
+The tiled copy grid stays within its total CTA budget even when the captured
+batch has more request/head groups than that budget. CTAs iterate over remaining
+groups and payload tiles; this does not drop selected misses. A CTA budget does
+not reserve SMs or isolate memory bandwidth. Tune background copies using both
+foreground latency and end-to-end throughput. Restart the server to recapture
+graphs after changing these options; `legacy` ignores both budget options.
 
 The target's persistent GPU KV payload is bounded by `(top_k + block_size)` tokens per local KV head and layer. Quest summaries still grow with context length; native DSA retains its growing indexer cache instead. Host history grows with live requests. The draft's full KV history remains on GPU. Memory profiling reserves the target working sets, summaries/indexer keys, draft KV, and prefill workspace. Set `--max-total-tokens`, context length, and concurrency to fit both host RAM and GPU memory.
 

@@ -13,11 +13,105 @@ from sglang.srt.layers.attention.triton_ops.oasiskv import (
 )
 from sglang.srt.mem_cache.oasiskv_cache import OasisKVCache
 from sglang.srt.mem_cache.oasiskv_config import OasisKVConfig
-from sglang.srt.mem_cache.oasiskv_graph import OasisKVGraphState
+from sglang.srt.mem_cache.oasiskv_graph import (
+    GraphPlan,
+    OasisKVGraphState,
+    copy_launch_geometry,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+@pytest.mark.parametrize("batch", [1, 8, 32, 256])
+@pytest.mark.parametrize("storage", [256, 960])
+@pytest.mark.parametrize("ctas_per_sm", [1, 8])
+def test_copy_grid_caps_total_ctas_even_when_batch_exceeds_budget(
+    batch, storage, ctas_per_sm
+):
+    tile, grid = copy_launch_geometry(
+        batch=batch,
+        heads=8,
+        slots=128,
+        block=16,
+        storage=storage,
+        element_size=2,
+        sm_count=132,
+        ctas_per_sm=ctas_per_sm,
+    )
+    assert tile == 1024
+    assert 0 < grid[0] * grid[1] <= 132 * ctas_per_sm
+    if batch == 8:
+        assert grid == (64, 16 if ctas_per_sm == 8 else 2)
+    if batch == 256:
+        assert grid == (132 * ctas_per_sm, 1)
+
+
+def test_copy_geometry_caps_workers_for_tiny_records():
+    assert copy_launch_geometry(
+        batch=1,
+        heads=1,
+        slots=3,
+        block=1,
+        storage=8,
+        element_size=4,
+        sm_count=132,
+        ctas_per_sm=8,
+    ) == (8, (1, 3))
+
+
+def test_copy_kernel_can_be_switched_for_full_server_ab():
+    assert OasisKVConfig.from_json("{}").copy_kernel == "tiled"
+    assert OasisKVConfig.from_json('{"copy_kernel":"legacy"}').copy_kernel == "legacy"
+    with pytest.raises(ValueError, match="copy_kernel"):
+        OasisKVConfig.from_json('{"copy_kernel":"unknown"}')
+
+
+@pytest.mark.parametrize("name", ["refill_ctas_per_sm", "prefetch_ctas_per_sm"])
+@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+def test_copy_budget_requires_positive_integer(name, value):
+    import json
+
+    with pytest.raises(ValueError, match=name):
+        OasisKVConfig.from_json(json.dumps({name: value}))
+
+
+def test_refill_and_prefetch_dispatch_separate_budgets_and_publish_after_copy(
+    monkeypatch,
+):
+    from sglang.srt.mem_cache import oasiskv_graph
+
+    launches = []
+
+    class Kernel:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: launches.append((self.name, grid, kwargs))
+
+    monkeypatch.setattr(oasiskv_graph.kernels, "copy_misses", Kernel("copy"))
+    monkeypatch.setattr(oasiskv_graph.kernels, "copy_misses_legacy", Kernel("legacy"))
+    monkeypatch.setattr(oasiskv_graph.kernels, "publish_plan", Kernel("publish"))
+    plan = GraphPlan(8, 8, 128, "cpu")
+    plan.sm_count = 132
+    table = torch.empty((8, 9), dtype=torch.int64)
+    for background in (False, True):
+        plan.transfer(
+            table, OasisKVConfig(), 256, torch.bfloat16, background=background
+        )
+    assert [(name, grid) for name, grid, _ in launches] == [
+        ("copy", (64, 16)),
+        ("publish", (8, 8)),
+        ("copy", (64, 2)),
+        ("publish", (8, 8)),
+    ]
+    launches.clear()
+    plan.transfer(
+        table, OasisKVConfig(copy_kernel="legacy"), 256, torch.bfloat16, background=True
+    )
+    assert launches[0][:2] == ("legacy", (8, 8, 4))
 
 
 def setup_graph():

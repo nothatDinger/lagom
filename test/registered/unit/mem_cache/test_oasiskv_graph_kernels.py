@@ -168,7 +168,7 @@ def test_token_append_refill_attention_and_prefetch_match_eager_across_boundarie
             q[:2], kd**-0.5, draft_key=k[1], draft_value=v[1], logit_cap=softcap
         )
         w.real.select(table, w.candidates, cap=None, background=False)
-        w.real.transfer(table, config, layout.storage_dim, k.dtype)
+        w.real.transfer(table, config, layout.storage_dim, k.dtype, background=False)
         layout.plan.select(
             table, layout.draft, cap=config.max_new_blocks, background=True
         )
@@ -207,7 +207,7 @@ def test_token_append_refill_attention_and_prefetch_match_eager_across_boundarie
         )
         torch.testing.assert_close(output[:2], expected, atol=3e-5, rtol=3e-5)
         assert not output[2:].any()
-        layout.plan.transfer(table, config, layout.storage_dim, k.dtype)
+        layout.plan.transfer(table, config, layout.storage_dim, k.dtype, background=True)
         reference.prefetch(q[1], draft)
         reference.join()
         graph.finish_replay()

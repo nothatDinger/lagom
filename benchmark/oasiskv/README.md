@@ -170,3 +170,57 @@ PYTHONPATH=python SGLANG_USE_CPU_ENGINE=0 python -m pytest -q \
 正式接受性能点前，应确认：两个模型两方法 smoke 均通过；输出严格 2,048；
 服务端实际 backend/TP/graph 配置符合预期；OasisKV 没有接受 draft；遥测完整性检查通过；
 每点至少三次成功重复且没有其他 GPU 作业干扰。运行器保留证据，不自动宣称这些检查已在 GPU 上完成。
+
+## UVA copy kernel 对比
+
+通用 OasisKV full graph 的真实 query 补取与预测预取共用 tiled copy kernel，
+但 launch 预算独立：`refill_ctas_per_sm=8`、`prefetch_ctas_per_sm=1`。
+两项都是整个 grid 的 CTA 总预算除以 SM 数，不表示每个 SM 必定驻留多少 CTA，
+也不隔离 PCIe、HBM 或 L2 带宽。batch 增大时，CTA 循环处理多个 request/head，
+不会因为组数增多而突破预算；所有已选 miss 都会搬完。
+H100（132 SM）、捕获 batch=8、8 KV heads 时，默认补取 1,024 CTA、预取 128 CTA；
+原实现两者都是 256 CTA。每 CTA 为 128 threads，payload 按约 2 KiB tile 分配。
+实际活跃 CTA 还取决于 miss 数和 padding，不能由 grid 推导搬运量。
+
+以下在 NVIDIA CUDA GPU 上执行，不需要加载模型。源数据是真实 pinned host memory，
+目的地是 GPU residency buffer；稳定地址的 graph 在不同 Counts 下重复重放。
+默认验证结果逐字节相同，包含空闲槽位与未覆盖区域，并输出实际 miss 数、payload 字节数、
+copy 延迟 p50/p95 和 GB/s。每个计时样本前用 128 MiB working set 驱逐 L2，
+驱逐不计入 copy 时间；可按 GPU L2 容量调整 `--flush-mib`。
+在与服务相同的 GPU、CPU/NUMA 绑定下运行，避免改变 host memory 的物理位置。
+
+```bash
+# 标准 Qwen3-8B：K/V head_dim 各 128，storage=256；7 live、捕获 batch=8。
+# 扫描真实每 head miss 数；同时比较原 kernel、新补取与新预取预算。
+PYTHONPATH=python python benchmark/oasiskv/bench_copy.py \
+  --batch 8 --live-batch 7 --heads 8 --storage 256 \
+  --misses-per-head 0,1,8,32,128 --output /tmp/oasiskv-copy-256.json
+
+# 复核「总共 64 次 miss、storage=960」的假设，不把 64 个 grid 组当成 64 次 miss。
+PYTHONPATH=python python benchmark/oasiskv/bench_copy.py \
+  --storage 960 --total-misses 64 --output /tmp/oasiskv-copy-960.json
+
+# 预取与合成 GEMM 并发，扫描预取预算，观察 compute_slowdown 与 joint.p50_ms。
+# 调整 matmul-size，让 compute_alone.p50_ms 接近所关心的主流计算窗口。
+PYTHONPATH=python python benchmark/oasiskv/bench_copy.py \
+  --misses-per-head 1,8,32 --matmul-size 2048 \
+  --prefetch-ctas-per-sm 1,2,4 --output /tmp/oasiskv-copy-overlap.json
+```
+
+`payload_bytes = sum(有效 Counts) × block_size × storage × dtype 字节数`。
+BF16、block=16、storage=256 时每 miss 为 8 KiB，storage=960 时为 30 KiB。
+`compute_slowdown` 是并发 GEMM 相对单独执行的耗时比；`joint` 包含两条流完成的总时间。
+GEMM 只用于对比资源干扰，不能替代真实 attention/MLP trace、TPS 或 TPOT。
+脚本只计 copy，不包含 plan selection、publish 或整模型的等待。
+
+整服务 A/B 可在原 `--hisparse-config` JSON 中加入以下字段（保留原 top_k 等配置）：
+
+```json
+{"copy_kernel":"tiled","refill_ctas_per_sm":8,"prefetch_ctas_per_sm":1}
+```
+
+将 `copy_kernel` 设为 `legacy`，可恢复原 copy 算法和固定 4 workers/request/head，
+此时两项 CTA 预算不生效。修改预算或 kernel 后重启服务以重新捕获 CUDA graph。
+本开关只作用于通用 full-graph UVA copy；通用 eager 与 DeepSeek-V4 的 C++ 搬运实现未改动。
+真实补取仍在 attention 前完成，预取写入仍依赖本层 attention 读取结束，未改变 stream/event 依赖。
+优先按真实主流耗时、联合耗时与最终 TPS/TPOT 选择预算，不能只按 copy 单独运行的带宽选择。
