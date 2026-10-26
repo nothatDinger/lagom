@@ -87,6 +87,30 @@ PYTHONPATH=python python -m pytest -q \
 这套页池服务于 OasisKV target；它没有启用 SGLang 的独立 `--enable-unified-memory` 选项，也不与 draft 权重或 KV 共用物理页。长请求的 sparse prefill 仍临时恢复完整 KV 进行 causal attention，调度容量估算仍保留最坏情况预算。
 本轮已做 CPU/Triton 数值回归和 SM90 离线编译；新增 external-event 跨步依赖尚待真实 CUDA capture/replay 验证。不能据此宣称 TPOT/TPS 已改善。
 
+### 补传与预传的去重判据
+
+同一步、同一请求代次、同一层、同一 KV head 内，预取应计算：
+
+```text
+预取 miss = draft 预测块集合 − 本步真实 query 补载后的完整驻留集合
+```
+
+通用 full graph 在补载后的 `publish_plan` 内，把完整驻留 ID/age 写入本层后台计划的既有缓冲区；后台等 `prediction_ready` 后，用这份基线计算 miss。基线不引用后续层会复用的前台 workspace，也不增加 kernel launch。eager 同样保留真实补载结果作为该步预取基线。命中块保留在候选集合中以保护其驻留槽；只从有效搬运列表排除，避免去重后反而被 LRU 淘汰。V4 的 PlanOnly 仍在真实 swap-in 完成后读取 hot table，并新增完全重叠预测的 CUDA 回归。
+
+**copy kernel 的调用次数不等于实际搬运次数。** full graph 即使 `miss_count=0` 也会重放 copy 节点，但不访问 host KV payload。通用路径的实际搬运字节应分别按补载/预取的 `sum(miss_count) * block_size * storage_dim * dtype_bytes` 统计；比较 block ID 时还必须匹配请求、层、head 和 step。预取与真实集合不同导致的跨步驱逐/再补载，需要单独统计，不能由同一步去重保证消除。
+
+无需 checkpoint 的去重验证：
+
+```bash
+# CPU 数值与实际 Triton planner/copy 内核解释执行
+TRITON_INTERPRET=1 SGLANG_USE_CPU_ENGINE=0 PYTHONPATH=python python -m pytest -q \
+  test/registered/unit/mem_cache/test_oasiskv_dedup.py
+# NVIDIA CUDA：真实双图/侧流依赖及 V4 hot-table 去重
+PYTHONPATH=python python -m pytest -q \
+  test/registered/cuda_graph/test_oasiskv_cuda_graph.py \
+  test/registered/cuda_graph/test_oasiskv_v4_cuda_graph.py
+```
+
 ## 准备与执行
 
 在安装了本分支 SGLang、CUDA、FA3 和 sgl-kernel 的目标机器执行。额外客户端依赖：

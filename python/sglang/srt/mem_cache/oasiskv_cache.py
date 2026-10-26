@@ -113,6 +113,7 @@ class OasisKVLayerCache:
         self.read_done = None
         self.initialized = False
         self.attention_blocks = None
+        self._prefetch_base = None
         slots = config.history_blocks
         self.resident = torch.full((heads, slots), -1, dtype=torch.int64, device=device)
         self.ages = torch.full_like(self.resident, -1)
@@ -268,6 +269,7 @@ class OasisKVLayerCache:
             raise ValueError("Invalid OasisKV append geometry")
         self.join()
         end = prefix + key.shape[0]
+        self._prefetch_base = None
         block_size = self.config.block_size
         self.prepare_append(end)
         packed = torch.cat((key, value), dim=-1).transpose(0, 1).contiguous()
@@ -402,6 +404,7 @@ class OasisKVLayerCache:
         prediction misses, using the UVA copy kernel for missing payloads only.
         """
         self.join()
+        self._prefetch_base = None
         if not self.sparse:
             self.attention_blocks = self.resident.clone()
             self.initialized = True
@@ -419,6 +422,9 @@ class OasisKVLayerCache:
                 self.refill_done = torch.cuda.Event()
                 self.refill_done.record(torch.cuda.current_stream(self.device))
         self.attention_blocks = selected
+        # Keep the completed real-query working set as this step's prefetch
+        # base. In particular, freshly refilled blocks are hits, not new I/O.
+        self._prefetch_base = (plan.block_ids, plan.last_selected)
         self.initialized = True
 
     def predict_prefetch(self, draft_query, explicit=None):
@@ -435,17 +441,19 @@ class OasisKVLayerCache:
         """
         self.step += 1
         pipeline = self.pipeline
+        resident, ages = self._prefetch_base or (self.resident, self.ages)
+        self._prefetch_base = None
         if pipeline.cuda:
             # Observe prediction and real-query refill, but not attention.
             pipeline.select.wait_stream(torch.cuda.current_stream(self.device))
             candidates.record_stream(pipeline.select)
-            self.resident.record_stream(pipeline.select)
-            self.ages.record_stream(pipeline.select)
+            resident.record_stream(pipeline.select)
+            ages.record_stream(pipeline.select)
         with pipeline.context("select"):
             plan = plan_delta(
                 candidates,
-                self.resident,
-                self.ages,
+                resident,
+                ages,
                 self.step,
                 self.config.max_new_blocks,
             )

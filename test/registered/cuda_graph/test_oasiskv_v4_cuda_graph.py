@@ -267,6 +267,7 @@ def test_v4_graph_refill_pipeline_padding_reorder_c4_commit_and_recycle(
             prefill(0)
         state.prepare_replay()
         graph, fb, real, predicted, reads = captures[bucket]
+        state.replay_batch_size = bucket
         bs = len(slots)
         c.num_real_reqs.fill_(bs)
         fb.req_pool_indices.fill_(slots[0] if slots else 0)  # padding aliases a live ID
@@ -284,6 +285,10 @@ def test_v4_graph_refill_pipeline_padding_reorder_c4_commit_and_recycle(
             prediction = (torch.arange(min(k, draft)) + max(0, draft - k // 2)) % max(
                 1, draft
             )
+            if step == 1:
+                # Selection must see this same step's real refill. A perfect
+                # overlapping prediction cannot schedule those H2D copies again.
+                prediction = selected.clone()
             real[row, : len(selected)] = selected.to("cuda", torch.int32)
             predicted[row, : len(prediction)] = prediction.to("cuda", torch.int32)
             for layer in range(layers):
@@ -335,6 +340,8 @@ def test_v4_graph_refill_pipeline_padding_reorder_c4_commit_and_recycle(
             assert not reads[layer][bs:].any()
             task = c._oasiskv_ring[layer][0]
             saw_miss |= bool(task.miss_count[:bs].any())
+            if step == 1:
+                assert not task.miss_count[:bs].any()
             assert not task.miss_count[bs:bucket].any()
             for row, req in enumerate(slots):
                 assert (task.predicted_entries[row] < prefixes[req] // 4).all()

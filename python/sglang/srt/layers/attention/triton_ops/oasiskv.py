@@ -198,6 +198,7 @@ def plan_delta(
     BACKGROUND: tl.constexpr,
     N: tl.constexpr,
     SEARCH_STEPS: tl.constexpr,
+    USE_REFILL_BASE: tl.constexpr = False,
 ):
     b, h = tl.program_id(0), tl.program_id(1)
     row = Table + b * 11
@@ -207,8 +208,15 @@ def plan_delta(
     if pos >= 0:
         resident = tl.load(row + 4).to(tl.pointer_type(tl.int64))
         ages_ptr = tl.load(row + 5).to(tl.pointer_type(tl.int64))
-        ids = tl.load(resident + h * SLOTS + i, i < SLOTS, -1)
-        ages = tl.load(ages_ptr + h * SLOTS + i, i < SLOTS, -1)
+        if USE_REFILL_BASE:
+            # Foreground publication seeded these layer-owned arrays with the
+            # complete post-refill set. Keep hits in candidates: they protect
+            # their slots from eviction even though they require no H2D copy.
+            ids = tl.load(Ids + out + i, i < SLOTS, -1)
+            ages = tl.load(Ages + out + i, i < SLOTS, -1)
+        else:
+            ids = tl.load(resident + h * SLOTS + i, i < SLOTS, -1)
+            ages = tl.load(ages_ptr + h * SLOTS + i, i < SLOTS, -1)
         candidates = tl.load(Candidates + out + i, i < SLOTS, -1).to(tl.int64)
         if tl.load(row + 10) != 0:
             tl.store(Ids + out + i, ids, i < SLOTS)
@@ -351,7 +359,15 @@ def copy_misses(
 
 @triton.jit
 def publish_plan(
-    Table, Ids, Ages, HEADS: tl.constexpr, SLOTS: tl.constexpr, N: tl.constexpr
+    Table,
+    Ids,
+    Ages,
+    HEADS: tl.constexpr,
+    SLOTS: tl.constexpr,
+    N: tl.constexpr,
+    NextIds=None,
+    NextAges=None,
+    SEED_NEXT: tl.constexpr = False,
 ):
     b, h = tl.program_id(0), tl.program_id(1)
     row = Table + b * 11
@@ -363,6 +379,9 @@ def publish_plan(
         times = tl.load(Ages + (b * HEADS + h) * SLOTS + i, i < SLOTS, -1)
         tl.store(resident + h * SLOTS + i, ids, i < SLOTS)
         tl.store(ages + h * SLOTS + i, times, i < SLOTS)
+        if SEED_NEXT:
+            tl.store(NextIds + (b * HEADS + h) * SLOTS + i, ids, i < SLOTS)
+            tl.store(NextAges + (b * HEADS + h) * SLOTS + i, times, i < SLOTS)
 
 
 @triton.jit

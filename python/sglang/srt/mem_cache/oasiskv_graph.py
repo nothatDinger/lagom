@@ -49,7 +49,7 @@ class GraphPlan:
             else 1
         )
 
-    def select(self, table, candidates, *, cap, background):
+    def select(self, table, candidates, *, cap, background, use_refill_base=False):
         batch = table.shape[0]
         heads, slots = self.ids.shape[1:]
         kernels.plan_delta[(batch, heads)](
@@ -67,9 +67,10 @@ class GraphPlan:
             BACKGROUND=background,
             N=triton.next_power_of_2(slots),
             SEARCH_STEPS=triton.next_power_of_2(slots).bit_length(),
+            USE_REFILL_BASE=use_refill_base,
         )
 
-    def transfer(self, table, config, storage, dtype, *, background):
+    def transfer(self, table, config, storage, dtype, *, background, next_plan=None):
         heads, slots = self.ids.shape[1:]
         batch = table.shape[0]
         if config.copy_kernel == "legacy":
@@ -120,6 +121,9 @@ class GraphPlan:
             HEADS=heads,
             SLOTS=slots,
             N=triton.next_power_of_2(slots),
+            NextIds=None if next_plan is None else next_plan.ids,
+            NextAges=None if next_plan is None else next_plan.ages,
+            SEED_NEXT=next_plan is not None,
         )
 
 
@@ -438,7 +442,14 @@ class OasisKVGraphState:
                 layout.draft[:batch_size].fill_(-1)
                 layout.draft[:batch_size, :, :count].copy_(ids[:, 1])
         w.real.select(table, w.candidates, cap=None, background=False)
-        w.real.transfer(table, self.config, storage, key.dtype, background=False)
+        w.real.transfer(
+            table,
+            self.config,
+            storage,
+            key.dtype,
+            background=False,
+            next_plan=layout.plan if paired else None,
+        )
 
         if paired:
             snapshot = layout.background_table[:batch_size]
@@ -454,6 +465,7 @@ class OasisKVGraphState:
                     layout.draft,
                     cap=self.config.max_new_blocks,
                     background=True,
+                    use_refill_base=True,
                 )
 
             def transfer():

@@ -159,5 +159,63 @@ def test_capture_repeated_replay_reorder_padding_growth_and_reuse(
         assert table_address == graph_state.tables.data_ptr()
 
 
+def test_same_step_refill_prefetch_dedup_across_independent_graphs():
+    config = OasisKVConfig(token_budget=4, block_size=1, native_sparse=True)
+    cache = OasisKVCache(config, "cuda")
+    state = OasisKVGraphState(cache, 2, 64, 2)
+    layers = [SimpleNamespace(layer_id=i, scaling=0.125, logit_cap=0) for i in range(2)]
+    q = torch.randn(4, 2, 64, device="cuda")
+    k, v = torch.randn(4, 1, 64, device="cuda"), torch.randn(4, 1, 32, device="cuda")
+    topk = torch.zeros(4, 4, dtype=torch.int32, device="cuda")
+    refill_counts = torch.empty(2, 2, 1, dtype=torch.int32, device="cuda")
+    refill_sources = torch.empty(2, 2, 1, 4, dtype=torch.int64, device="cuda")
+
+    def run():
+        for layer in layers:
+            state.forward(q, k, v, layer, 2, paired=True, topk=topk)
+            real = state.layers[layer.layer_id].workspace.real
+            refill_counts[layer.layer_id].copy_(real.counts)
+            refill_sources[layer.layer_id].copy_(real.sources)
+
+    for _ in range(2):
+        run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    oldk, oldv = torch.randn(32, 1, 64, device="cuda"), torch.randn(
+        32, 1, 32, device="cuda"
+    )
+    for layer in layers:
+        cache.get(7, 0, layer.layer_id, oldk, oldv).append(oldk, oldv, 0)
+    for step, (root, draft, expected) in enumerate(
+        [
+            ([4, 5, 6, 7], [4, 5, 6, 7], set()),
+            ([8, 9, 10, 11], [8, 9, 12, 13], {12, 13}),
+        ]
+    ):
+        topk[0].copy_(torch.tensor(root, dtype=torch.int32, device="cuda"))
+        topk[1].copy_(torch.tensor(draft, dtype=torch.int32, device="cuda"))
+        topk[2:].fill_(20)  # inactive rows must generate no copies
+        state.prepare([7], [0], [32 + step], paired=True, graph_batch_size=2)
+        graph.replay()
+        state.finish_replay()
+        torch.cuda.synchronize()
+        for layer in layers:
+            i = layer.layer_id
+            prefetch = state.layers[i].plan
+            real_count, next_count = int(refill_counts[i, 0, 0]), int(
+                prefetch.counts[0, 0]
+            )
+            real_sources = set(refill_sources[i, 0, 0, :real_count].tolist())
+            next_sources = set(prefetch.sources[0, 0, :next_count].tolist())
+            assert real_sources == set(root)
+            assert next_sources == expected
+            assert real_sources.isdisjoint(next_sources)
+            assert not prefetch.counts[1].any()
+            resident = set(cache.layers[(7, 0, i)].resident[0].tolist())
+            assert (set(root) & set(draft)) <= resident
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
