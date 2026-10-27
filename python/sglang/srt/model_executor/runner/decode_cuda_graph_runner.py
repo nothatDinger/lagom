@@ -1000,11 +1000,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             # These request-major row tensors are graph inputs by address.  The
             # batch bucket is fixed for capture; num_real_reqs masks padding.
-            rows = torch.arange(num_tokens, device=input_ids.device)
+            from sglang.srt.speculative.oasiskv_lookahead import build_oasiskv_pair_rows
+
+            if num_tokens != 2 * bs:
+                raise ValueError("OasisKV capture requires two rows per request")
+            normal_rows, draft_rows = build_oasiskv_pair_rows(bs, input_ids.device)
             forward_batch.is_oasiskv_paired = True
             forward_batch.is_oasiskv_graph_capture = True
-            forward_batch.oasiskv_normal_rows = rows[0::2]
-            forward_batch.oasiskv_draft_rows = rows[1::2]
+            forward_batch.oasiskv_normal_rows = normal_rows
+            forward_batch.oasiskv_draft_rows = draft_rows
             forward_batch.oasiskv_draft_valid = torch.ones(
                 bs, dtype=torch.bool, device=input_ids.device
             )

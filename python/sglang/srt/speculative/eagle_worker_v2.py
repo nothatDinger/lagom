@@ -909,6 +909,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 original_out_cache_loc, self.speculative_num_draft_tokens
             )
         try:
+            if oasiskv and self.plan_stream is not None:
+                # Target sampling, root-feature compaction and dtype conversions
+                # are still running on the main stream. Plan-stream staging must
+                # wait for these producers, not rely on a host-side commit check
+                # having synchronized the target earlier in the step.
+                self.plan_stream.wait_stream(
+                    torch.get_device_module(self.device).current_stream()
+                )
             with self.plan_stream_ctx:
                 forward_batch = prepare_for_draft_extend(
                     draft_extend_input,

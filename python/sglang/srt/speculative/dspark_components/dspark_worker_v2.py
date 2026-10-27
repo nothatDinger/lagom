@@ -917,10 +917,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 logits_output, forward_batch
             ).reshape(-1)
             commit_lens, _ = build_oasiskv_commit(
-                forward_batch.oasiskv_normal_rows, bs, self.device
+                forward_batch.oasiskv_normal_rows,
+                bs,
+                self.device,
+                buffers=self.model_runner.oasiskv_commit_buffers,
             )
             if transaction is not None:
-                coordinator.commit_dspark_verify_window(transaction, commit_lens)
+                coordinator.commit_dspark_verify_window(
+                    transaction, commit_lens, commit_lens_cpu=[1] * bs
+                )
                 committed = True
             submit_oasiskv_pending_prefetches(forward_batch)
         finally:

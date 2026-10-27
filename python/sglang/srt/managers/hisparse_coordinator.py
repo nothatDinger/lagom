@@ -2136,14 +2136,26 @@ class HiSparseCoordinator:
         self._has_pending_dspark_commit = True
 
     def commit_dspark_verify_window(
-        self, window: HiSparseDSparkWindow, commit_lens: torch.Tensor
+        self,
+        window: HiSparseDSparkWindow,
+        commit_lens: torch.Tensor,
+        *,
+        commit_lens_cpu: Optional[List[int]] = None,
     ) -> None:
-        """Back up accepted C4 entries, then reset fixed scratch metadata."""
+        """Back up accepted C4 entries, then reset fixed scratch metadata.
+
+        OasisKV supplies its known root-only lengths on the CPU. Reading the
+        device ones back would unnecessarily wait for target compute/sampling.
+        Dynamic speculative acceptance still reads the actual GPU result.
+        Copies remain ordered after the target on the current stream; graph
+        selection readers and rollback retain their explicit event fences.
+        """
         if window.compressed_locs.numel() == 0:
             return
-        commit_cpu = commit_lens.to("cpu").tolist()
+        if commit_lens_cpu is None:
+            commit_lens_cpu = commit_lens.to("cpu").tolist()
         accepted = speculative_accepted_c4_indices(
-            window, commit_cpu, self.compress_ratio
+            window, commit_lens_cpu, self.compress_ratio
         )
         if accepted:
             if (state := getattr(self, "oasiskv_graph_state", None)) is not None:

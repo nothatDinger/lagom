@@ -111,6 +111,39 @@ PYTHONPATH=python python -m pytest -q \
   test/registered/cuda_graph/test_oasiskv_v4_cuda_graph.py
 ```
 
+### Decode 提交元数据与同步
+
+`build_oasiskv_commit` 只构造固定的 root-only 提交；token 仍由此前的 target
+`sample()` 决定。target runner 在初始化时预分配只读的 `[0, 2, ...]` 根行索引和
+全 1 的 `accept_lens`，decode 按实际请求数取视图，不将 graph padding 提交给调度器。
+eager/verify/capture 共用 request-major 索引构造函数；生产 CUDA 路径仅检查形状、
+dtype、device 和容量，不执行 `torch.equal`、标量回读或每步 `ones/arange` 分配。
+
+CPU 路径继续检查行索引内容；设置 `SGLANG_DEBUG_OASISKV_COMMIT=1` 可在 GPU 上用
+`torch._assert_async` 检查内容。它不会让 CPU 等待，但会增加检查 kernel；异常在后续
+同步点报告，不能当作可恢复的 Python `ValueError`。正式性能测量保持默认关闭。
+
+EAGLE draft-extend 的 plan stream 显式等待主流生成采样 token、根行特征和输入转换，
+不依赖提交检查的隐式 CPU 同步。V4 C4 提交使用 CPU 已知的 `[1] * B`，保留 selection
+和 rollback 的 event 依赖；普通 speculative decoding 仍读取实际接受长度。
+此优化不改变采样、随机数调用或 draft 永不接受的语义，也不代表整个 decode 已无其它同步。
+
+无需 checkpoint 的回归（CUDA 环境额外执行跨流初始化、无主机同步检查及 graph replay）：
+
+```bash
+SGLANG_USE_CPU_ENGINE=0 PYTHONPATH=python python -m pytest -q \
+  test/registered/unit/spec/test_oasiskv_commit.py \
+  test/registered/unit/spec/test_oasiskv_lookahead.py \
+  test/registered/unit/spec/test_oasiskv_dspark.py \
+  test/registered/unit/managers/test_hisparse_dspark.py \
+  test/registered/unit/managers/test_hisparse_eagle.py \
+  test/registered/unit/model_executor/runner/test_oasiskv_graph_inputs.py
+```
+
+性能验证应同时检查 CPU 同步、target 到 draft-extend 的 GPU 空档和稳态 TPOT/TPS。
+`torch.equal` 的 CPU 耗时包含此前排队的 GPU 工作，不能直接视为可节省的 TPOT。
+本地无 CUDA GPU，尚未验证 GPU 输出逐 token 一致性或实际加速幅度。
+
 ## 准备与执行
 
 在安装了本分支 SGLang、CUDA、FA3 和 sgl-kernel 的目标机器执行。额外客户端依赖：

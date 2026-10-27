@@ -13,6 +13,52 @@ from typing import Any, Optional
 
 import torch
 
+from sglang.srt.environ import envs
+
+
+def build_oasiskv_pair_rows(
+    batch_size: int, device: Any
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Construct root/probe indices by geometry, never by GPU token values."""
+    if batch_size < 0:
+        raise ValueError("OasisKV batch size must be nonnegative")
+    rows = torch.arange(2 * batch_size, dtype=torch.int64, device=device)
+    return rows[0::2], rows[1::2]
+
+
+class OasisKVCommitBuffers:
+    """Runner-owned, read-only metadata for the fixed one-root commit.
+
+    Allocate outside decode/capture. Consumers must not mutate the returned
+    views: multiple in-flight batches can share these constants. The one-time
+    initialization event handles callers on a different CUDA stream without
+    introducing a host wait or a dependency on another decode step.
+    """
+
+    def __init__(self, capacity: int, device: Any):
+        self.normal_rows, self.draft_rows = build_oasiskv_pair_rows(capacity, device)
+        self.accept_lens = torch.ones(capacity, dtype=torch.int32, device=device)
+        self._ready = None
+        self._ready_streams = set()
+        if self.normal_rows.is_cuda:
+            stream = torch.cuda.current_stream(self.normal_rows.device)
+            self._ready = torch.cuda.Event()
+            self._ready.record(stream)
+            self._ready_streams.add(stream.cuda_stream)
+
+    def views(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if not 0 <= batch_size <= self.accept_lens.numel():
+            raise ValueError("OasisKV commit batch exceeds preallocated capacity")
+        if self._ready is not None:
+            stream = torch.cuda.current_stream(self.normal_rows.device)
+            if stream.cuda_stream not in self._ready_streams:
+                stream.wait_event(self._ready)
+                # A wait recorded into a graph has not executed yet. Do not
+                # let that capture suppress a later eager stream dependency.
+                if not torch.cuda.is_current_stream_capturing():
+                    self._ready_streams.add(stream.cuda_stream)
+        return self.accept_lens[:batch_size], self.normal_rows[:batch_size]
+
 
 @dataclass(frozen=True)
 class OasisKVPairedBatch:
@@ -56,23 +102,46 @@ def compute_oasiskv_logprobs(
 
 
 def build_oasiskv_commit(
-    normal_rows: torch.Tensor, batch_size: int, device: Any
+    normal_rows: torch.Tensor,
+    batch_size: int,
+    device: Any,
+    *,
+    buffers: Optional[OasisKVCommitBuffers] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the fixed-width, root-only commit used by OasisKV.
 
     Keeping this separate from speculative acceptance is an important safety
     boundary: the lookahead row is useful for its indexer prediction only and
     must not become committed merely because its token happens to match.
+    Production callers supply runner-owned constants. Shape/type checks use
+    CPU metadata; GPU content checks are debug-only and never return a Python
+    bool. Returning canonical roots also avoids trusting arbitrary row values
+    for commit indices. LM-head row ownership is established by the paired
+    batch constructors, before sampling.
     """
     if normal_rows.ndim != 1 or normal_rows.numel() != batch_size:
         raise ValueError("OasisKV requires exactly one normal row per request")
-    expected = torch.arange(
-        0, 2 * batch_size, 2, dtype=normal_rows.dtype, device=normal_rows.device
-    )
-    if not torch.equal(normal_rows, expected):
-        raise ValueError("OasisKV normal rows must be request-major pair roots")
-    accept_lens = torch.ones(batch_size, dtype=torch.int32, device=device)
-    return accept_lens, normal_rows.reshape(batch_size, 1)
+    if normal_rows.dtype != torch.int64:
+        raise ValueError("OasisKV normal rows must be int64 indices")
+    requested_device = torch.device(device)
+    if normal_rows.device.type != requested_device.type or (
+        requested_device.index is not None
+        and normal_rows.device.index != requested_device.index
+    ):
+        raise ValueError("OasisKV normal rows and commit must use the same device")
+    if buffers is None:
+        # Standalone/reference callers; serving allocates once at pool setup.
+        buffers = OasisKVCommitBuffers(batch_size, normal_rows.device)
+    if buffers.normal_rows.device != normal_rows.device:
+        raise ValueError("OasisKV commit buffers and rows must use the same device")
+    accept_lens, expected = buffers.views(batch_size)
+    message = "OasisKV normal rows must be request-major pair roots"
+    if normal_rows.device.type == "cpu":
+        if not torch.equal(normal_rows, expected):
+            raise ValueError(message)
+    elif envs.SGLANG_DEBUG_OASISKV_COMMIT.get():
+        torch._assert_async((normal_rows == expected).all(), message)
+    return accept_lens, expected.reshape(batch_size, 1)
 
 
 def submit_oasiskv_pending_prefetches(forward_batch: Any) -> None:
@@ -157,7 +226,7 @@ def build_oasiskv_paired_batch(
     if committed_lens.shape != normal_tokens.shape:
         raise ValueError("committed_lens must have one entry per request")
     bsz = normal_tokens.numel()
-    rows = torch.arange(2 * bsz, device=normal_tokens.device)
+    normal_rows, draft_rows = build_oasiskv_pair_rows(bsz, normal_tokens.device)
     input_ids = torch.stack((normal_tokens, draft_tokens), dim=1).reshape(-1)
     # The normal token is the current committed position.  The draft is the
     # following position and is never reflected back into committed_lens.
@@ -166,21 +235,25 @@ def build_oasiskv_paired_batch(
         draft_valid = torch.ones(bsz, dtype=torch.bool, device=normal_tokens.device)
     if draft_valid.shape != normal_tokens.shape:
         raise ValueError("draft_valid must have one entry per request")
-    return OasisKVPairedBatch(input_ids, positions, rows[0::2], rows[1::2], draft_valid)
+    return OasisKVPairedBatch(
+        input_ids, positions, normal_rows, draft_rows, draft_valid
+    )
 
 
 def paired_batch_from_verify(verify_input: Any, batch_size: int) -> OasisKVPairedBatch:
     """Adopt an EAGLE or DSPARK root+one-draft window without copying it."""
     if verify_input.draft_token_num != 2:
         raise ValueError("OasisKV requires exactly one normal and one draft token")
-    rows = torch.arange(2 * batch_size, device=verify_input.draft_token.device)
-    if verify_input.draft_token.numel() != rows.numel():
+    if verify_input.draft_token.numel() != 2 * batch_size:
         raise ValueError("Verify tokens do not have request-major 2B layout")
+    normal_rows, draft_rows = build_oasiskv_pair_rows(
+        batch_size, verify_input.draft_token.device
+    )
     return OasisKVPairedBatch(
         input_ids=verify_input.draft_token,
         positions=verify_input.positions,
-        normal_rows=rows[0::2],
-        draft_rows=rows[1::2],
+        normal_rows=normal_rows,
+        draft_rows=draft_rows,
         draft_valid=torch.ones(
             batch_size, dtype=torch.bool, device=verify_input.draft_token.device
         ),

@@ -34,6 +34,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import TargetVerifyExecutor
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
+from sglang.srt.speculative.oasiskv_lookahead import OasisKVCommitBuffers
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -272,7 +273,7 @@ def _worker(monkeypatch, *, graph=False, v4=False, candidate_matches=False, fail
                 side_effect=lambda **kw: events.append("prepare-c4") or object()
             ),
             commit_dspark_verify_window=Mock(
-                side_effect=lambda *a: events.append("commit-c4")
+                side_effect=lambda *a, **kw: events.append("commit-c4")
             ),
             rollback_dspark_verify_window=Mock(
                 side_effect=lambda *a: events.append("rollback-c4")
@@ -283,6 +284,7 @@ def _worker(monkeypatch, *, graph=False, v4=False, candidate_matches=False, fail
         )
     runner = NS(
         device="cpu",
+        oasiskv_commit_buffers=OasisKVCommitBuffers(8, "cpu"),
         model=object(),
         hisparse_coordinator=coordinator,
         attn_backend=NS(init_forward_metadata=plan),
@@ -379,7 +381,10 @@ def test_proposals_only_prefetch_and_never_commit(
         worker._verify_executor.accept_and_finalize.assert_not_called()
         if v4:
             assert events.index("commit-c4") < events.index("prefetch")
-            worker.model_runner.hisparse_coordinator.rollback_dspark_verify_window.assert_not_called()
+            coordinator = worker.model_runner.hisparse_coordinator
+            commit_kwargs = coordinator.commit_dspark_verify_window.call_args.kwargs
+            assert commit_kwargs["commit_lens_cpu"] == [1] * len(slots)
+            coordinator.rollback_dspark_verify_window.assert_not_called()
         events.clear()
         features.clear()
 

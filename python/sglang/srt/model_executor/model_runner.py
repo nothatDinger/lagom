@@ -837,6 +837,13 @@ class ModelRunner:
     def _init_post_memory_pool_components(self):
         """Post-pool component wiring, split out of alloc_memory_pool so forks
         that build bespoke memory pools can reuse it after allocating them."""
+        self.oasiskv_commit_buffers = None
+        if self.server_args.is_oasiskv_lookahead and not self.is_draft_worker:
+            from sglang.srt.speculative.oasiskv_lookahead import OasisKVCommitBuffers
+
+            self.oasiskv_commit_buffers = OasisKVCommitBuffers(
+                self.max_running_requests, self.device
+            )
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
         # forwards captured into the graph see the patched pool methods.

@@ -43,7 +43,8 @@ def test_dspark_spec_reservation_allocates_logical_kv_only(monkeypatch):
     allocator.alloc_extend.assert_not_called()
 
 
-def test_dspark_page_multiple_commit_stays_token_granular(monkeypatch):
+@pytest.mark.parametrize("root_only", [False, True])
+def test_dspark_page_multiple_commit_stays_token_granular(monkeypatch, root_only):
     """Sixteen scattered accepts must not be mistaken for one whole C4 page."""
     count = 16
     transfer = MagicMock()
@@ -84,6 +85,9 @@ def test_dspark_page_multiple_commit_stays_token_granular(monkeypatch):
     coordinator._has_pending_dspark_commit = False
     coordinator._dspark_scratch_compressed_locs = torch.arange(count)
     coordinator._dspark_scratch_valid_mapping = torch.ones(count, dtype=torch.bool)
+    coordinator.oasiskv_graph_state = SimpleNamespace(
+        wait_selection_for_commit=MagicMock()
+    )
     window = HiSparseDSparkWindow(
         compressed_locs=torch.arange(count),
         device_locs=torch.arange(100, 100 + count),
@@ -91,13 +95,22 @@ def test_dspark_page_multiple_commit_stays_token_granular(monkeypatch):
         req_offsets=list(range(count)),
         req_pool_indices_cpu=list(range(count)),
         c4_positions=[0] * count,
-        prefix_lens_cpu=[0] * count,
+        prefix_lens_cpu=[3 if root_only else 0] * count,
     )
     coordinator._active_dspark_window = window
 
-    coordinator.commit_dspark_verify_window(
-        window, torch.full((count,), 4, dtype=torch.int64)
-    )
+    if root_only:
+        # A meta tensor cannot be copied to the CPU. Known root-only lengths
+        # must bypass the device readback, while retaining the same C4 copies.
+        coordinator.commit_dspark_verify_window(
+            window,
+            torch.ones(count, device="meta", dtype=torch.int32),
+            commit_lens_cpu=[1] * count,
+        )
+    else:
+        coordinator.commit_dspark_verify_window(
+            window, torch.full((count,), 4, dtype=torch.int64)
+        )
 
     host.backup_from_device_all_layer.assert_not_called()
     first_transfer = transfer.call_args_list[0].kwargs
@@ -106,10 +119,14 @@ def test_dspark_page_multiple_commit_stays_token_granular(monkeypatch):
         first_transfer["src_indices"], torch.arange(100, 100 + count)
     )
     stream.synchronize.assert_not_called()
+    coordinator.oasiskv_graph_state.wait_selection_for_commit.assert_called_once()
     coordinator._dspark_commit_done_event.record.assert_called_once_with(stream)
 
 
-def test_dspark_all_rejected_rollback_records_cross_stream_event(monkeypatch):
+@pytest.mark.parametrize("root_only", [False, True])
+def test_dspark_all_rejected_rollback_records_cross_stream_event(
+    monkeypatch, root_only
+):
     """An all-rejected window still publishes asynchronous mapping rollback."""
     producer_stream = object()
     event = SimpleNamespace(record=MagicMock(), wait=MagicMock())
@@ -134,11 +151,18 @@ def test_dspark_all_rejected_rollback_records_cross_stream_event(monkeypatch):
         req_offsets=[0],
         req_pool_indices_cpu=[3],
         c4_positions=[2],
-        prefix_lens_cpu=[8],
+        prefix_lens_cpu=[10 if root_only else 8],
     )
     coordinator._active_dspark_window = window
 
-    coordinator.commit_dspark_verify_window(window, torch.tensor([0]))
+    if root_only:
+        # The probe reaches position 11, but the committed root only advances
+        # length 10 to 11. Do not promote the probe's completed C4 group.
+        coordinator.commit_dspark_verify_window(
+            window, torch.ones(1, device="meta"), commit_lens_cpu=[1]
+        )
+    else:
+        coordinator.commit_dspark_verify_window(window, torch.tensor([0]))
 
     assert coordinator.mem_pool_device.full_to_hisparse_device_index_mapping[1] == 7
     assert not coordinator._dspark_scratch_valid_mapping[1]

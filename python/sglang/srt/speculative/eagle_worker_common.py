@@ -640,7 +640,12 @@ def run_eagle_verify(
             predict = target_worker.model_runner.sample(
                 logits_output, verify_forward_batch
             ).reshape(-1)
-            accept_lens, accept_index = build_oasiskv_commit(normal_rows, bs, device)
+            accept_lens, accept_index = build_oasiskv_commit(
+                normal_rows,
+                bs,
+                device,
+                buffers=target_worker.model_runner.oasiskv_commit_buffers,
+            )
         else:
             (
                 predict,
@@ -651,7 +656,9 @@ def run_eagle_verify(
             # Grammar is rejected above, so accept_lens cannot subsequently be
             # shortened by the scheduler's grammar result processing.
             hisparse_coordinator.commit_dspark_verify_window(
-                hisparse_window, accept_lens
+                hisparse_window,
+                accept_lens,
+                commit_lens_cpu=[1] * bs if oasiskv_lookahead else None,
             )
             hisparse_committed = True
         if oasiskv_lookahead:
