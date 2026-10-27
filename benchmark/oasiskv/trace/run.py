@@ -1,0 +1,485 @@
+"""Run the isolated V4/DSPARK trace experiment on four local H100 GPUs."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[2]
+TARGET = "/mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-0731/"
+DRAFT = "/mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-DSpark"
+DATASET = "/home/jovyan/td69032/ShareGPT_V3_unfiltered_cleaned_split.json"
+
+
+def write_json(path, data):
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def checkpoint_gamma(path):
+    # Matches parse_dspark_draft_config: DSPARK's G is the checkpoint's
+    # block_size; target verification has G+1 rows, including the anchor.
+    config = json.loads((Path(path) / "config.json").read_text())
+    gamma = config.get("dspark_block_size")
+    if gamma is None:
+        gamma = config.get("dflash_config", {}).get(
+            "block_size", config.get("block_size")
+        )
+    if type(gamma) is not int or gamma < 1:
+        raise ValueError(
+            "Cannot resolve checkpoint proposal length; inspect draft config.json"
+        )
+    return gamma
+
+
+def checkpoint_topk(path):
+    config = json.loads((Path(path) / "config.json").read_text())
+    text_config = config.get("text_config", config)
+    # DeepSeekV4Config's default; the server uses the model index_topk rather
+    # than treating HiSparse's compatibility field as a model override.
+    value = text_config.get("index_topk", 512)
+    if type(value) is not int or value <= 0:
+        raise ValueError("Invalid target index_topk")
+    return value
+
+
+def server_command(args, gamma):
+    return [
+        sys.executable,
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        args.target,
+        "--speculative-draft-model-path",
+        args.draft,
+        "--speculative-algorithm",
+        "DSPARK",
+        "--speculative-num-draft-tokens",
+        str(gamma + 1),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(args.port),
+        "--tp",
+        "4",
+        "--attention-backend",
+        "dsv4",
+        "--enable-hisparse",
+        "--hisparse-config",
+        json.dumps(
+            {
+                "top_k": args.top_k,
+                "device_buffer_size": args.resident_units,
+                "host_to_device_ratio": 2,
+            }
+        ),
+        "--disable-radix-cache",
+        "--disable-overlap-schedule",
+        "--cuda-graph-backend-decode",
+        "disabled",
+        "--cuda-graph-backend-prefill",
+        "disabled",
+        "--max-running-requests",
+        "1",
+        "--context-length",
+        str(args.context_length),
+        "--max-total-tokens",
+        str(args.context_length),
+        "--chunked-prefill-size",
+        "4096",
+        "--mem-fraction-static",
+        str(args.mem_fraction),
+        "--random-seed",
+        str(args.seed),
+        "--watchdog-timeout",
+        str(args.request_timeout),
+    ]
+
+
+def validate_args(args, gamma):
+    v = (
+        args.verify_candidates
+        if args.verify_candidates is not None
+        else gamma - max(args.probes)
+    )
+    if not 1 <= v <= gamma or any(p < 1 or v + p > gamma for p in args.probes):
+        raise ValueError(
+            f"Need 1 <= V and V + max(P) <= checkpoint G={gamma}; got V={v}, P={args.probes}"
+        )
+    if len(set(args.probes)) != len(args.probes):
+        raise ValueError("Duplicate probe lengths")
+    if min(args.input_lengths) < 1 or len(set(args.input_lengths)) != len(
+        args.input_lengths
+    ):
+        raise ValueError("Input lengths must be positive and unique")
+    if args.context_length < max(args.input_lengths) + args.output_length + gamma + 1:
+        raise ValueError("Context length must cover prompt, output and proposal window")
+    if (
+        min(args.requests, args.output_length, args.snapshot_gib) <= 0
+        or args.max_windows < 2
+    ):
+        raise ValueError("Need positive requests/output/snapshot size and >=2 windows")
+    if args.resident_units < (gamma + 1) * args.top_k:
+        raise ValueError(
+            f"Ordinary DSPARK requires capacity >= (G+1)*index_topk = {(gamma + 1) * args.top_k} C4 units"
+        )
+    if not 0 < args.mem_fraction < 1 or args.prefetch_units < 0:
+        raise ValueError("Invalid memory fraction or prefetch cap")
+    if len(args.gpus.split(",")) != 4:
+        raise ValueError("This recipe requires four GPU IDs")
+    return v
+
+
+def preflight(args):
+    for path in (args.target, args.draft):
+        root = Path(path)
+        if not (root / "config.json").is_file():
+            raise FileNotFoundError(root / "config.json")
+        indices = list(root.glob("*.index.json"))
+        for index in indices:
+            for shard in set(
+                json.loads(index.read_text()).get("weight_map", {}).values()
+            ):
+                if not (root / shard).is_file():
+                    raise FileNotFoundError(root / shard)
+        if not indices and not (
+            list(root.glob("*.safetensors")) or list(root.glob("*.bin"))
+        ):
+            raise FileNotFoundError(f"No checkpoint weights in {root}")
+    if not Path(args.dataset).is_file():
+        raise FileNotFoundError(args.dataset)
+    # Run in a child so this controller never creates a CUDA context that
+    # consumes memory while the TP workers load their weights.
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import torch,json; print(json.dumps([{'name':torch.cuda.get_device_name(i),'memory':torch.cuda.get_device_properties(i).total_memory} for i in range(torch.cuda.device_count())]))",
+        ],
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": args.gpus},
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    devices = json.loads(probe.stdout.strip().splitlines()[-1])
+    if len(devices) != 4 or any("H100" not in d["name"] for d in devices):
+        raise ValueError(f"Expected four H100s, found {devices}")
+    return devices
+
+
+def prepare_prompts(args, output):
+    import numpy as np
+    from transformers import AutoTokenizer
+
+    # Reuse the performance harness's documented ShareGPT packing policy.
+    sys.path.insert(0, str(HERE.parent))
+    from prepare import packed_prompts, tokenizer_fingerprint
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.target, local_files_only=True, trust_remote_code=False
+    )
+    records = json.loads(Path(args.dataset).read_text())
+    if not isinstance(records, list):
+        raise TypeError("ShareGPT must contain a JSON array")
+    prompts = np.asarray(
+        list(
+            packed_prompts(
+                records, tokenizer, args.requests, max(args.input_lengths), args.seed
+            )
+        ),
+        dtype=np.int32,
+    )
+    np.save(output / "prompts.npy", prompts)
+    write_json(
+        output / "prompts.json",
+        {
+            "dataset": args.dataset,
+            "dataset_sha256": digest(args.dataset),
+            "tokenizer_files": tokenizer_fingerprint(args.target),
+            "prompts_sha256": digest(output / "prompts.npy"),
+            "seed": args.seed,
+            "construction": "packed ShareGPT all turns; shorter inputs are prefixes; no chat template or BOS",
+        },
+    )
+    return prompts
+
+
+def request(url, payload=None, timeout=10):
+    req = urllib.request.Request(
+        url,
+        data=None if payload is None else json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.load(response)
+
+
+def wait_ready(process, url, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"Server exited ({process.returncode}); see server.log")
+        try:
+            # /health may return an empty body; do not require JSON.
+            with urllib.request.urlopen(url + "/health", timeout=2) as response:
+                if response.status == 200:
+                    return
+        except (urllib.error.URLError, TimeoutError):
+            pass
+        time.sleep(1)
+    raise TimeoutError("Server startup timeout; see server.log")
+
+
+def stop(process):
+    # Only the process group created for this experiment is signalled.
+    if process.poll() is None:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=30)
+
+
+def run_one(args, directory, config, command, prompts):
+    directory.mkdir()
+    config_path = directory / "config.json"
+    write_json(config_path, config)
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(ROOT / "python")
+        + os.pathsep
+        + os.environ.get("PYTHONPATH", ""),
+        "CUDA_VISIBLE_DEVICES": args.gpus,
+        "SGLANG_OASISKV_TRACE_CONFIG": str(config_path),
+        "SGLANG_RAGGED_VERIFY_MODE": "compact",
+        "SGLANG_OPT_USE_ONLINE_COMPRESS": "0",
+        "SGLANG_SIMULATE_ACC_LEN": "0",
+        "SGLANG_DEBUG_HISPARSE_SKIP_IO": "0",
+    }
+    write_json(
+        directory / "launch.json",
+        {
+            "command": command,
+            "environment": {
+                k: env[k]
+                for k in (
+                    "CUDA_VISIBLE_DEVICES",
+                    "SGLANG_RAGGED_VERIFY_MODE",
+                    "SGLANG_OPT_USE_ONLINE_COMPRESS",
+                    "SGLANG_SIMULATE_ACC_LEN",
+                    "SGLANG_DEBUG_HISPARSE_SKIP_IO",
+                    "SGLANG_OASISKV_TRACE_CONFIG",
+                )
+            },
+        },
+    )
+    url = f"http://127.0.0.1:{args.port}"
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", args.port))  # Fail before spawning if in use.
+    print(f"Starting {directory.name}", flush=True)
+    with (directory / "server.log").open("w") as log:
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            wait_ready(process, url, args.startup_timeout)
+            with (directory / "outputs.jsonl").open("x") as stream:
+                for length in args.input_lengths:
+                    for i, prompt in enumerate(prompts):
+                        rid = f"trace-i{length}-r{i}"
+                        result = request(
+                            url + "/generate",
+                            {
+                                "rid": rid,
+                                "input_ids": prompt[:length].tolist(),
+                                "sampling_params": {
+                                    "temperature": 0,
+                                    "max_new_tokens": args.output_length,
+                                    "ignore_eos": True,
+                                },
+                            },
+                            timeout=args.request_timeout,
+                        )
+                        if (
+                            not isinstance(result.get("output_ids"), list)
+                            or not result["output_ids"]
+                        ):
+                            raise RuntimeError(
+                                f"Request {rid} has no token output: {result}"
+                            )
+                        stream.write(
+                            json.dumps(
+                                {"request_id": rid, "input_length": length, **result},
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+                        stream.flush()
+                        print(
+                            f"{directory.name}: {rid}, output={len(result['output_ids'])}",
+                            flush=True,
+                        )
+        finally:
+            stop(process)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--target", default=TARGET)
+    parser.add_argument("--draft", default=DRAFT)
+    parser.add_argument("--dataset", default=DATASET)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Otherwise print the resolved plan only (no GPU/model load)",
+    )
+    parser.add_argument(
+        "--verify-candidates",
+        type=int,
+        help="Default: G - max(P), preserving checkpoint G",
+    )
+    parser.add_argument("--probes", type=int, nargs="+", default=[1, 2, 3])
+    parser.add_argument("--input-lengths", type=int, nargs="+", default=[16384, 32768])
+    parser.add_argument("--output-length", type=int, default=256)
+    parser.add_argument("--requests", type=int, default=2)
+    parser.add_argument("--max-windows", type=int, default=32)
+    parser.add_argument(
+        "--snapshot-gib",
+        type=float,
+        default=32,
+        help="Host snapshot limit PER TP rank; four ranks allocate independently",
+    )
+    parser.add_argument(
+        "--resident-units",
+        type=int,
+        help="C4 capacity; default (G+1)*model index_topk, the ordinary DSPARK safety bound",
+    )
+    parser.add_argument(
+        "--prefetch-units",
+        type=int,
+        default=256,
+        help="Offline admission cap in C4 units, not an online setting",
+    )
+    parser.add_argument("--context-length", type=int, default=40960)
+    parser.add_argument("--mem-fraction", type=float, default=0.9)
+    parser.add_argument("--gpus", default="0,1,2,3")
+    parser.add_argument("--port", type=int, default=30000)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--startup-timeout", type=int, default=1800)
+    parser.add_argument("--request-timeout", type=int, default=21600)
+    parser.add_argument(
+        "--skip-full-control",
+        action="store_true",
+        help="Smoke runs only: omit the full-G acceptance reference",
+    )
+    args = parser.parse_args()
+    gamma = checkpoint_gamma(args.draft)
+    args.top_k = checkpoint_topk(args.target)
+    if args.resident_units is None:
+        args.resident_units = (gamma + 1) * args.top_k
+    v = validate_args(args, gamma)
+    command = server_command(args, gamma)
+    print(
+        f"G={gamma}, V={v}, P={args.probes}, index_topk={args.top_k}, resident_C4={args.resident_units}; B=1, TP=4; quality experiment, graphs disabled"
+    )
+    print(shlex.join(command))
+    if not args.execute:
+        return
+    hardware = preflight(args)
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+    ).strip()
+    diff = subprocess.check_output(["git", "diff", "HEAD"], cwd=ROOT, text=True)
+    (output / "source.diff").write_text(diff)
+    write_json(
+        output / "manifest.json",
+        {
+            "arguments": {
+                k: str(x) if isinstance(x, Path) else x for k, x in vars(args).items()
+            },
+            "commit": commit,
+            "hardware": hardware,
+            "checkpoint_config_sha256": {
+                p: digest(Path(p) / "config.json") for p in (args.target, args.draft)
+            },
+            "gamma": gamma,
+            "verify_candidates": v,
+            "timing_valid": False,
+        },
+    )
+    prompts = prepare_prompts(args, output)
+    modes = ["control", "probes"] + ([] if args.skip_full_control else ["full-control"])
+    for mode in modes:
+        directory = output / mode
+        config = {
+            "run_id": mode,
+            "output": str(directory),
+            "verify_candidates": gamma if mode == "full-control" else v,
+            "probes": args.probes if mode == "probes" else [],
+            "shadows": mode == "probes",
+            "max_windows": args.max_windows,
+            "snapshot_gib": args.snapshot_gib,
+        }
+        run_one(args, directory, config, command, prompts)
+    from audit import acceptance_summary
+
+    write_json(
+        output / "acceptance.json",
+        {mode: acceptance_summary(output / mode) for mode in modes},
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(HERE / "audit.py"),
+            str(output / "control"),
+            str(output / "probes"),
+            "--output",
+            str(output / "audit.json"),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(HERE / "analyze.py"),
+            str(output / "probes" / "trace.jsonl.gz"),
+            "--max-prefetch-units",
+            str(args.prefetch_units),
+            "--output",
+            str(output / "analysis"),
+        ],
+        check=True,
+    )
+    print(f"Completed quality experiment: {output}")
+
+
+if __name__ == "__main__":
+    main()

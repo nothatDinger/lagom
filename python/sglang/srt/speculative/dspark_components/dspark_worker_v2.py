@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import Optional
@@ -200,6 +201,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_rank=self.ps.tp_rank,
             server_args=self.server_args,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
+            offline_trace=bool(os.environ.get("SGLANG_OASISKV_TRACE_CONFIG")),
         )
         if (
             get_parallel().enable_dp_attention
@@ -285,6 +287,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_epilogue=self._verify_epilogue,
             simulate_acc_len=self._simulate_acc_len,
         )
+
+        from sglang.srt.speculative.oasiskv_trace import OasisKVTrace
+
+        self._oasiskv_trace = OasisKVTrace.from_environment(self)
 
         self._forced_budget_frac: Optional[float] = None
         self._need_mamba_verify_commit = False
@@ -650,6 +656,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
+        if self._oasiskv_trace is not None:
+            # Keep the checkpoint proposal width G. Only V candidates participate
+            # in ordinary acceptance; the suffix is reserved for offline probes.
+            layout = self._oasiskv_trace.layout(self._oasiskv_trace.v + 1)
+            run_compact = True
+
         verify_ids_2d = torch.cat(
             [draft_block_ids[:, :1], draft_tokens], dim=1
         ).contiguous()
@@ -694,7 +706,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             prepare_mamba_track_for_verify(batch)
             with self._observers.segment(InfoSegment.TARGET_VERIFY):
-                if run_compact:
+                if self._oasiskv_trace is not None:
+                    target_verify, hidden_strided = self._oasiskv_trace.run(
+                        batch=batch,
+                        draft_block_ids=draft_block_ids,
+                        draft_tokens=draft_tokens,
+                        sampling_info=sampling_info,
+                    )
+                elif run_compact:
                     target_verify, hidden_strided = self._verify_executor.run_compact(
                         batch=batch,
                         layout=layout,
@@ -743,6 +762,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
             )
+            if self._oasiskv_trace is not None:
+                self._oasiskv_trace.finish(accept)
             if batch.return_logprob:
                 compute_spec_logprobs(
                     batch,

@@ -78,6 +78,7 @@ class DSparkVerifyPlanner:
         tp_rank: int,
         server_args: ServerArgs,
         verify_num_draft_tokens: int,
+        offline_trace: bool = False,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
@@ -91,11 +92,15 @@ class DSparkVerifyPlanner:
 
         lookahead = getattr(server_args, "is_oasiskv_lookahead", False)
         self._confidence_head = (
-            None if lookahead else getattr(self.draft_model, "confidence_head", None)
+            None
+            if lookahead or offline_trace
+            else getattr(self.draft_model, "confidence_head", None)
         )
 
         sts_path = (
-            None if lookahead else server_args.speculative_dspark_confidence_sts_path
+            None
+            if lookahead or offline_trace
+            else server_args.speculative_dspark_confidence_sts_path
         )
         if sts_path and self._confidence_head is not None:
             calibration = load_sts_calibration_from_path(sts_path)
@@ -136,8 +141,13 @@ class DSparkVerifyPlanner:
 
         # OasisKV always executes one real row and one disposable probe. No
         # acceptance budget or confidence gate may trim either row away.
+        # The offline trace driver supplies fixed compact layouts itself. It
+        # needs no confidence model or budget planner, while the V4 attention
+        # backend still reads COMPACT from the process environment.
         self._ragged_verify_mode = (
-            RaggedVerifyMode.STATIC if lookahead else read_ragged_verify_mode()
+            RaggedVerifyMode.STATIC
+            if lookahead or offline_trace
+            else read_ragged_verify_mode()
         )
         self._schedule_cfg = DSparkScheduleConfig(gamma=self.gamma)
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
