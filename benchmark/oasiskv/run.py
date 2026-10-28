@@ -32,6 +32,7 @@ from common import (
     write_json,
 )
 from prepare import tokenizer_fingerprint
+from sglang_bench import bench_command, dataset_metadata, measure
 
 
 def resolve_checkpoint(reference):
@@ -100,8 +101,9 @@ def environment():
     }
 
 
-def preflight(config, models, methods, data_dir):
+def preflight(config, models, methods, data_dir, client="custom"):
     errors, warnings, resolved = [], [], {}
+    native_data = None
     for package in (
         "aiohttp",
         "numpy",
@@ -118,6 +120,17 @@ def preflight(config, models, methods, data_dir):
         source_hash = None
     else:
         source_hash = sha256(config["dataset"])
+    if client == "sglang-bench":
+        for package in ("orjson", "requests", "tqdm"):
+            if importlib.util.find_spec(package) is None:
+                errors.append(f"Missing Python module: {package}")
+        try:
+            native_data = dataset_metadata(
+                config["dataset"],
+                max(config["num_requests"], config["warmup_requests"]),
+            )
+        except (OSError, ValueError, AttributeError, TypeError) as error:
+            errors.append(f"Native bench ShareGPT source: {error}")
     for name in models:
         model = config["models"][name]
         record = {}
@@ -129,39 +142,51 @@ def preflight(config, models, methods, data_dir):
             except Exception as error:
                 errors.append(f"{name}/{key}: {error}")
         try:
-            manifest = read_json(data_dir / name / "manifest.json")
-            if (
-                manifest["dataset_sha256"] != source_hash
-                or manifest["seed"] != config["seed"]
-            ):
-                raise ValueError("Prepared data has a different source hash or seed")
-            if (
-                manifest["warmup_requests"] != config["warmup_requests"]
-                or manifest["count"]
-                < config["num_requests"] + config["warmup_requests"]
-            ):
-                raise ValueError(
-                    "Prepared data has insufficient requests or different warmup split"
-                )
-            if manifest["max_input_length"] < max(config["input_lengths"]):
-                raise ValueError("Prepared prompts are too short")
-            if manifest["tokenizer_files"] != tokenizer_fingerprint(model["path"]):
-                raise ValueError("Tokenizer changed since data preparation")
-            if manifest["prompts_sha256"] != sha256(data_dir / name / "prompts.npy"):
-                raise ValueError("Prepared prompt checksum mismatch")
-            import numpy as np
+            if client == "sglang-bench":
+                record["data_manifest"] = {
+                    **(native_data or {}),
+                    "dataset_sha256": source_hash,
+                    "seed": config["seed"],
+                    "tokenizer_files": tokenizer_fingerprint(model["path"]),
+                }
+            else:
+                manifest = read_json(data_dir / name / "manifest.json")
+                if (
+                    manifest["dataset_sha256"] != source_hash
+                    or manifest["seed"] != config["seed"]
+                ):
+                    raise ValueError(
+                        "Prepared data has a different source hash or seed"
+                    )
+                if (
+                    manifest["warmup_requests"] != config["warmup_requests"]
+                    or manifest["count"]
+                    < config["num_requests"] + config["warmup_requests"]
+                ):
+                    raise ValueError(
+                        "Prepared data has insufficient requests or different warmup split"
+                    )
+                if manifest["max_input_length"] < max(config["input_lengths"]):
+                    raise ValueError("Prepared prompts are too short")
+                if manifest["tokenizer_files"] != tokenizer_fingerprint(model["path"]):
+                    raise ValueError("Tokenizer changed since data preparation")
+                if manifest["prompts_sha256"] != sha256(
+                    data_dir / name / "prompts.npy"
+                ):
+                    raise ValueError("Prepared prompt checksum mismatch")
+                import numpy as np
 
-            prompts = np.load(
-                data_dir / name / "prompts.npy", mmap_mode="r", allow_pickle=False
-            )
-            if prompts.dtype != np.int32 or prompts.shape != (
-                manifest["count"],
-                manifest["max_input_length"],
-            ):
-                raise ValueError("Prepared prompt shape/dtype mismatch")
-            record["data_manifest"] = manifest
+                prompts = np.load(
+                    data_dir / name / "prompts.npy", mmap_mode="r", allow_pickle=False
+                )
+                if prompts.dtype != np.int32 or prompts.shape != (
+                    manifest["count"],
+                    manifest["max_input_length"],
+                ):
+                    raise ValueError("Prepared prompt shape/dtype mismatch")
+                record["data_manifest"] = manifest
         except Exception as error:
-            errors.append(f"{name}/prepared data: {error}")
+            errors.append(f"{name}/benchmark data: {error}")
         probe = subprocess.run(
             [
                 sys.executable,
@@ -278,8 +303,13 @@ async def run_point(config, point, folder, data_dir, resolved, port, fingerprint
     process = collector = None
     model = config["models"][point["model"]]
     local = resolved[point["model"]]
-    prompts = np.load(
-        data_dir / point["model"] / "prompts.npy", mmap_mode="r", allow_pickle=False
+    native = point.get("client") == "sglang-bench"
+    prompts = (
+        None
+        if native
+        else np.load(
+            data_dir / point["model"] / "prompts.npy", mmap_mode="r", allow_pickle=False
+        )
     )
     # Short IPC names avoid the Unix-domain socket path limit.
     with (
@@ -330,71 +360,76 @@ async def run_point(config, point, folder, data_dir, resolved, port, fingerprint
                     info = await response.json()
                     write_json(folder / "server_info.json", info)
                     validate_server_info(info, config, point)
-                warmups = []
-                for i in range(config["warmup_requests"]):
-                    row = await generate(
-                        session,
-                        url,
-                        prompts[i, : point["input_length"]].tolist(),
-                        config["warmup_output_length"],
-                        f"warmup-{i}",
+                if native:
+                    result.update(
+                        await measure(config, point, folder, port, env, collector)
                     )
-                    warmups.append(row)
-                    if not row["success"]:
-                        raise RuntimeError(f"Warmup failed: {row.get('error')}")
-                write_json(folder / "warmup.json", warmups)
-                await collector.wait_idle()
-                collector.phase = "measurement"
-                offset = config["warmup_requests"]
-                requests, start, end = await asyncio.wait_for(
-                    workload(
-                        session,
-                        url,
-                        prompts[offset : offset + point["num_requests"]],
-                        point["input_length"],
-                        point["output_length"],
-                        point["concurrency"],
-                        folder / "requests.jsonl",
-                    ),
-                    timeout=config["point_timeout_s"],
-                )
-                await collector.wait_idle()
-                collector.phase = "done"
-                metrics = summarize(requests, collector.rows, start, end)
-                result.update(metrics)
-                reasons = []
-                if metrics["failed_requests"]:
-                    reasons.append("request failures or token-length mismatch")
-                if (
-                    metrics["decode_forward_samples"] == 0
-                    or metrics["fpm_sequence_gaps"]
-                    or collector.errors
-                ):
-                    reasons.append("missing/invalid forward telemetry")
-                if metrics["tpot_samples"] != point["num_requests"]:
-                    reasons.append(
-                        "first stream chunk is not exactly one token; TPOT not comparable"
+                else:
+                    warmups = []
+                    for i in range(config["warmup_requests"]):
+                        row = await generate(
+                            session,
+                            url,
+                            prompts[i, : point["input_length"]].tolist(),
+                            config["warmup_output_length"],
+                            f"warmup-{i}",
+                        )
+                        warmups.append(row)
+                        if not row["success"]:
+                            raise RuntimeError(f"Warmup failed: {row.get('error')}")
+                    write_json(folder / "warmup.json", warmups)
+                    await collector.wait_idle()
+                    collector.phase = "measurement"
+                    offset = config["warmup_requests"]
+                    requests, start, end = await asyncio.wait_for(
+                        workload(
+                            session,
+                            url,
+                            prompts[offset : offset + point["num_requests"]],
+                            point["input_length"],
+                            point["output_length"],
+                            point["concurrency"],
+                            folder / "requests.jsonl",
+                        ),
+                        timeout=config["point_timeout_s"],
                     )
-                if (
-                    metrics["running_batch_max"]
-                    and metrics["running_batch_max"] > point["concurrency"]
-                ):
-                    reasons.append(
-                        "server running batch exceeds configured concurrency"
+                    await collector.wait_idle()
+                    collector.phase = "done"
+                    metrics = summarize(requests, collector.rows, start, end)
+                    result.update(metrics)
+                    reasons = []
+                    if metrics["failed_requests"]:
+                        reasons.append("request failures or token-length mismatch")
+                    if (
+                        metrics["decode_forward_samples"] == 0
+                        or metrics["fpm_sequence_gaps"]
+                        or collector.errors
+                    ):
+                        reasons.append("missing/invalid forward telemetry")
+                    if metrics["tpot_samples"] != point["num_requests"]:
+                        reasons.append(
+                            "first stream chunk is not exactly one token; TPOT not comparable"
+                        )
+                    if (
+                        metrics["running_batch_max"]
+                        and metrics["running_batch_max"] > point["concurrency"]
+                    ):
+                        reasons.append(
+                            "server running batch exceeds configured concurrency"
+                        )
+                    if point["method"] == "oasiskv" and any(
+                        r.get("spec_accept_length") is not None
+                        and r["spec_accept_length"] > 1.001
+                        for r in requests
+                    ):
+                        reasons.append(
+                            "draft acceptance observed; lookahead must force rejection"
+                        )
+                    result.update(
+                        status="invalid" if reasons else "ok",
+                        invalid_reasons=reasons,
+                        telemetry_errors=collector.errors,
                     )
-                if point["method"] == "oasiskv" and any(
-                    r.get("spec_accept_length") is not None
-                    and r["spec_accept_length"] > 1.001
-                    for r in requests
-                ):
-                    reasons.append(
-                        "draft acceptance observed; lookahead must force rejection"
-                    )
-                result.update(
-                    status="invalid" if reasons else "ok",
-                    invalid_reasons=reasons,
-                    telemetry_errors=collector.errors,
-                )
         except Exception as error:
             result["error"] = f"{type(error).__name__}: {error}"
         finally:
@@ -415,7 +450,8 @@ async def run_sweep(args, config, points, checked):
     identity = {
         "config": config,
         "points": points,
-        "protocol": "smoke" if args.smoke else "fig11-sglang-port",
+        "protocol": points[0]["protocol"],
+        "client": args.client,
         "resolved": checked["resolved"],
         "git_head": command_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"]),
         "git_diff": command_output(["git", "-C", str(ROOT), "diff", "HEAD"]),
@@ -485,6 +521,12 @@ def main():
     parser.add_argument("--models", nargs="+")
     parser.add_argument("--methods", nargs="+", choices=["dense", "oasiskv"])
     parser.add_argument(
+        "--client",
+        choices=["custom", "sglang-bench"],
+        default="custom",
+        help="sglang-bench runs the native serving CLI with fixed-length ShareGPT-derived token IDs; no prepare.py required",
+    )
+    parser.add_argument(
         "--concurrencies",
         type=int,
         nargs="+",
@@ -514,6 +556,12 @@ def main():
     models = args.models or list(config["models"])
     methods = args.methods or config["methods"]
     points = list(matrix(config, models, methods, args.smoke))
+    if args.client == "sglang-bench":
+        for point in points:
+            point.update(
+                client=args.client,
+                protocol="smoke-sglang-bench" if args.smoke else "fig11-sglang-bench",
+            )
     if args.action == "plan":
         planned = [
             {
@@ -522,12 +570,36 @@ def main():
                     "cuda_visible_devices"
                 ],
                 "client": {
+                    "implementation": args.client,
                     "mode": "closed-loop",
                     "max_concurrency": point["concurrency"],
                     "num_requests": point["num_requests"],
                     "input_length": point["input_length"],
                     "output_length": point["output_length"],
                     "request_rate_limit": None,
+                    **(
+                        {
+                            "command": shlex.join(
+                                bench_command(
+                                    config,
+                                    point,
+                                    args.port,
+                                    Path("POINT_DIR/bench.jsonl"),
+                                )
+                            ),
+                            "warmup_command": shlex.join(
+                                bench_command(
+                                    config,
+                                    point,
+                                    args.port,
+                                    Path("POINT_DIR/bench-warmup.jsonl"),
+                                    warmup=True,
+                                )
+                            ),
+                        }
+                        if args.client == "sglang-bench"
+                        else {}
+                    ),
                 },
                 "command": shlex.join(
                     server_command(config, point, args.port, "ipc:///tmp/oasiskv-fpm")
@@ -537,7 +609,7 @@ def main():
         ]
         print(json.dumps({"count": len(points), "points": planned}, indent=2))
         return 0
-    checked = preflight(config, models, methods, args.data)
+    checked = preflight(config, models, methods, args.data, args.client)
     print(json.dumps(checked, indent=2))
     if args.action == "preflight":
         if args.output:

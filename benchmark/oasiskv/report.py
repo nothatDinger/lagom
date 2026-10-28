@@ -57,10 +57,16 @@ def plot(root, rows, tps_field):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    config = read_json(root / "run.json")["config"]
-    columns = [
-        (m, length) for m in config["models"] for length in config["input_lengths"]
-    ]
+    manifest = read_json(root / "run.json")
+    config, protocol = manifest["config"], manifest["protocol"]
+    if protocol not in ("fig11-sglang-port", "fig11-sglang-bench"):
+        raise ValueError("Smoke runs are startup checks, not Fig.11 measurements")
+    if protocol == "fig11-sglang-bench" and tps_field == "decode_window_tps":
+        raise ValueError(
+            "Native bench does not export decode-window TPS; use output_tps"
+        )
+    rows = [r for r in rows if r["protocol"] == protocol]
+    columns = sorted({(r["model"], r["input_length"]) for r in rows})
     metrics = [
         (
             tps_field,
@@ -84,8 +90,7 @@ def plot(root, rows, tps_field):
                 selected = {
                     r["concurrency"]: r
                     for r in rows
-                    if r["protocol"] == "fig11-sglang-port"
-                    and r["model"] == model
+                    if r["model"] == model
                     and r["input_length"] == length
                     and r["method"] == method
                 }
@@ -111,8 +116,13 @@ def plot(root, rows, tps_field):
             if row_index == 2:
                 ax.set_xlabel("Maximum concurrent requests")
     axes[0, 0].legend()
+    inputs = (
+        "native bench ShareGPT repeat/truncate"
+        if protocol == "fig11-sglang-bench"
+        else "ShareGPT packed inputs"
+    )
     figure.suptitle(
-        "OasisKV SGLang port — ShareGPT packed inputs; mean ± repeat sample SD\nMissing/failed points are gaps; see CSV for repeat counts. Not paper measurements.",
+        f"OasisKV SGLang port — {inputs}; mean ± repeat sample SD\nMissing/failed points are gaps; see CSV for repeat counts. Not paper measurements.",
         fontsize=11,
     )
     figure.tight_layout(rect=(0, 0, 1, 0.94))

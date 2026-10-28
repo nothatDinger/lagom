@@ -6,3 +6,6 @@ huggingface-hub>=0.30
 msgspec>=0.18
 pyzmq>=25
 matplotlib>=3.8
+orjson>=3.10
+requests>=2.31
+tqdm>=4.66

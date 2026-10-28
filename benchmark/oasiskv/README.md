@@ -10,6 +10,10 @@ Fig.11 横轴为 **Max concurrency**，不是强制每个 decode step 使用固�
 `run.py` 支持 `--concurrencies 8 16 --input-lengths 16384` 筛选；
 `--smoke` 始终是单并发启动检查，不能用于测 8/16 档。
 
+另提供 [SGLang 原生 bench 执行方案](SGLANG_BENCH.md)：`run.py --client sglang-bench`
+由原生 serving CLI 发请求并计算 TPS/TPOT，runner 采集 FPM running batch，自动校验和汇总。
+该方案直接读取 ShareGPT，无需 `prepare.py`；使用独立协议标记，不能混入下文 custom client 的结果。
+
 ## 测试矩阵
 
 | 项目 | 配置 |

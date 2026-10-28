@@ -211,14 +211,8 @@ def percentile(values, fraction):
     return values[low] + (values[math.ceil(position)] - values[low]) * (position - low)
 
 
-def summarize(requests, fpm, start, end):
-    """Wall-clock throughput and request-weighted TPOT; never count draft tokens."""
-    good = [r for r in requests if r["success"]]
-    tpots = [
-        1000 * (r["last_token_s"] - r["first_token_s"]) / (r["output_tokens"] - 1)
-        for r in good
-        if r["output_tokens"] > 1 and r["first_chunk_tokens"] == 1
-    ]
+def summarize_forward_metrics(fpm):
+    """Scheduler decode requests, excluding idle heartbeats and prefill-only passes."""
     decode = [f for f in fpm if f["scheduled_requests"]["num_decode_requests"] > 0]
     batches = [f["scheduled_requests"]["num_decode_requests"] for f in decode]
     all_prefill = sum(
@@ -227,6 +221,24 @@ def summarize(requests, fpm, start, end):
     gaps = sum(
         max(0, b["counter_id"] - a["counter_id"] - 1) for a, b in zip(fpm, fpm[1:])
     )
+    return {
+        "running_batch_mean": sum(batches) / len(batches) if batches else None,
+        "running_batch_p50": percentile(batches, 0.5),
+        "running_batch_max": max(batches) if batches else None,
+        "decode_forward_samples": len(batches),
+        "prefill_request_samples": all_prefill,
+        "fpm_sequence_gaps": gaps,
+    }
+
+
+def summarize(requests, fpm, start, end):
+    """Wall-clock throughput and request-weighted TPOT; never count draft tokens."""
+    good = [r for r in requests if r["success"]]
+    tpots = [
+        1000 * (r["last_token_s"] - r["first_token_s"]) / (r["output_tokens"] - 1)
+        for r in good
+        if r["output_tokens"] > 1 and r["first_chunk_tokens"] == 1
+    ]
     first = min((r["first_token_s"] for r in good), default=0)
     last = max((r["last_token_s"] for r in good), default=0)
     total = sum(r["output_tokens"] for r in good)
@@ -249,11 +261,6 @@ def summarize(requests, fpm, start, end):
             if good
             else None
         ),
-        "running_batch_mean": sum(batches) / len(batches) if batches else None,
-        "running_batch_p50": percentile(batches, 0.5),
-        "running_batch_max": max(batches) if batches else None,
-        "decode_forward_samples": len(batches),
-        "prefill_request_samples": all_prefill,
-        "fpm_sequence_gaps": gaps,
+        **summarize_forward_metrics(fpm),
         "tpot_samples": len(tpots),
     }

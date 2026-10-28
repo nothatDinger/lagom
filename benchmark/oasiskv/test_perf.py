@@ -195,6 +195,7 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(
                 point["client"],
                 {
+                    "implementation": "custom",
                     "mode": "closed-loop",
                     "max_concurrency": point["concurrency"],
                     "num_requests": 1024,

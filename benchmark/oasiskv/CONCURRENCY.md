@@ -2,6 +2,8 @@
 
 适用分支：`perf/oasiskv`。目标是让每个实验点的 server、请求负载和结果标签一致。
 使用本目录的 `run.py` 统一启动 server 和 benchmark；不要另启一个配置不匹配的 server。
+如需使用 SGLang 原生 bench，见 [SGLANG_BENCH.md](SGLANG_BENCH.md)，在 runner 命令中添加
+`--client sglang-bench`；下面的默认命令使用 custom client。两者保持相同的并发配置规则。
 
 ## 先确定测的是哪个实验
 
