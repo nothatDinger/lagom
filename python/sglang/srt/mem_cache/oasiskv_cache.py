@@ -14,11 +14,12 @@ import torch
 import torch.nn.functional as F
 from sglang.srt.mem_cache.oasiskv_config import OasisKVConfig
 from sglang.srt.mem_cache.oasiskv_pages import OasisKVPagePool, OasisKVPageTable
+from sglang.srt.mem_cache.oasiskv_prefill import prefill_attention
 
 
 def quest_scores(query, key_min, key_max):
     """Return [KV heads, blocks] bounds; never average away opposing GQA heads."""
-    heads, blocks, dim = key_min.shape
+    heads, _blocks, dim = key_min.shape
     if query.ndim != 2 or query.shape[1] != dim or query.shape[0] % heads:
         raise ValueError("Query heads/dimensions do not match the KV summaries")
     q = query.float().reshape(heads, -1, 1, dim)
@@ -655,6 +656,80 @@ class OasisKVLayerCache:
         )
         return output
 
+    def _prefill_prefix(self, prefix):
+        """Read only old history; never inspect pinned payloads on the CPU."""
+        if self.host is None:
+            active = (prefix - 1) // self.config.block_size
+            return torch.cat(
+                [
+                    self.block(i if i < active else self.config.history_blocks)
+                    for i in range(active + 1)
+                ],
+                1,
+            )[:, :prefix]
+        packed = torch.empty(
+            (self.heads, prefix, self.storage_dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        # Each source is contiguous pinned memory. Copying a strided multi-head
+        # CPU view can first pack it on the CPU, which would require a host-side
+        # wait for D2H. These DMA reads instead follow join()'s stream fences.
+        try:
+            for head in range(self.heads):
+                packed[head].copy_(
+                    self.host[head].flatten(0, 1)[:prefix], non_blocking=True
+                )
+        finally:
+            # Reclamation must also cover an exception in the subsequent
+            # attention call, before append() records its normal completion.
+            if self.pipeline.cuda:
+                self.read_done = torch.cuda.Event()
+                self.read_done.record(torch.cuda.current_stream(self.device))
+        return packed
+
+    def prefill(self, query, key, value, prefix, scale, *, indices=None, logit_cap=0):
+        """Attend to current GPU K/V before backing them up for sparse decode."""
+        if prefix != self.length or query.shape[0] != key.shape[0]:
+            raise ValueError(
+                "OasisKV prefill prefix/chunk does not match cache history"
+            )
+        self.join()
+        # A dense prefix is already on the GPU. Read it before prepare_append
+        # changes its active-page mapping or transitions it to host backing.
+        history = self._prefill_prefix(prefix) if prefix and self.host is None else None
+        # Allocate/grow before attention. Otherwise _grow's reclamation fence
+        # could wait for the attention we just launched on every new request.
+        self.prepare_append(prefix + key.shape[0])
+        if prefix and history is None:
+            history = self._prefill_prefix(prefix)
+        if history is None:
+            full_key, full_value = key, value
+        else:
+            full_key = torch.cat((history[..., : self.key_dim].transpose(0, 1), key))
+            full_value = torch.cat(
+                (
+                    history[
+                        ..., self.key_dim : self.key_dim + self.value_dim
+                    ].transpose(0, 1),
+                    value,
+                )
+            )
+        output = prefill_attention(
+            query,
+            full_key,
+            full_value,
+            prefix,
+            scale,
+            chunk_size=self.config.prefill_chunk_size,
+            indices=indices,
+            logit_cap=logit_cap,
+        )
+        # prepare_append is now a no-op; the persistent summaries, active page,
+        # and host history are identical to the ordinary committed-token path.
+        self.append(key, value, prefix)
+        return self._finish_attention(output)
+
     def materialize_history(self):
         if self.backup_done is not None:
             self.backup_done.synchronize()
@@ -722,48 +797,21 @@ class OasisKVLayerCache:
                 packed_value_offset=self.key_dim,
             )
             return self._finish_attention(output)
-        n = self.length
         packed = self.materialize_history()
-        key, value = (
-            packed[..., : self.key_dim],
-            packed[..., self.key_dim : self.key_dim + self.value_dim],
-        )
-        group = query.shape[1] // self.heads
-        key = key[:, None].expand(-1, group, -1, -1)
-        value = value[:, None].expand(-1, group, -1, -1)
-        results = []
-        for start in range(0, query.shape[0], self.config.prefill_chunk_size):
-            chunk = query[start : start + self.config.prefill_chunk_size]
-            q = chunk.transpose(0, 1).reshape(self.heads, group, -1, self.key_dim)
-            mask = torch.arange(n, device=self.device)[None] <= (
-                prefix
-                + start
-                + torch.arange(chunk.shape[0], device=self.device)[:, None]
-            )
-            if indices is not None:
-                selected = indices[start : start + chunk.shape[0]]
-                # Padding at -1 must not overwrite a genuine selection of 0.
-                valid = (selected >= 0) & (selected < n)
-                selected_mask = torch.zeros_like(mask, dtype=torch.int32)
-                selected_mask.scatter_add_(
-                    1, selected.clamp(0, n - 1).long(), valid.int()
-                )
-                mask &= selected_mask > 0
-            if logit_cap:
-                logits = torch.matmul(q.float(), key.float().transpose(-1, -2)) * scale
-                logits = logit_cap * torch.tanh(logits / logit_cap)
-                weights = logits.masked_fill(~mask, -float("inf")).softmax(-1)
-                out = torch.matmul(weights, value.float()).to(query.dtype)
-            else:
-                out = F.scaled_dot_product_attention(
-                    q, key, value, attn_mask=mask, scale=scale
-                )
-            results.append(
-                out.reshape(query.shape[1], chunk.shape[0], self.value_dim).transpose(
+        return self._finish_attention(
+            prefill_attention(
+                query,
+                packed[..., : self.key_dim].transpose(0, 1),
+                packed[..., self.key_dim : self.key_dim + self.value_dim].transpose(
                     0, 1
-                )
+                ),
+                prefix,
+                scale,
+                chunk_size=self.config.prefill_chunk_size,
+                indices=indices,
+                logit_cap=logit_cap,
             )
-        return self._finish_attention(torch.cat(results, 0))
+        )
 
 
 class OasisKVCache:

@@ -44,7 +44,8 @@ preflight 检查可见 H100 数量和显存，并保存 CPU、内存和 GPU 拓�
 提交前台图后立即提交各层后台图，下一步到达对应层才等待该层上次传输，允许末层传输跨过模型边界。
 后台保存独立元数据快照，避免下一批请求换序或 padding 更新覆盖正在执行的任务。
 host 分配/扩容、dense→sparse 转换和请求回收仍在图外，必要时等待相关页的使用者。
-变长 prefill 保持 eager；短请求直接使用原有 paged extend attention 读取共享页池。
+变长 prefill 保持 eager；H100 上常规 FP16/BF16 MHA/GQA 使用 FA3，直接读取当前 chunk 的 GPU K/V，
+仅在 chunked prefill 有旧 prefix 时恢复必要历史。
 `--disable-cuda-graph` 保留为显式 eager 对照；正式测试须确认日志中的实际 capture/replay。
 性能脚本检查服务端解析后的 decode graph 配置；若关闭 graph 或最大 batch 不覆盖该点并发，会将该点判为失败。
 
@@ -84,8 +85,39 @@ PYTHONPATH=python python -m pytest -q \
 - **成对 KV 复用**：通用 CUDA decode 一个 CTA 同时处理真实行和 draft 行，每个历史 K/V tile 只加载一次，分别累计 softmax；真实行仍屏蔽 draft KV。eager 和 full graph 使用同一个内核。
 - **统一分页及阈值切换**：通用模型的 dense/sparse 请求共享每层物理页池和 head-wise 页表。长度不超过 `top_k` 时按需分配 dense 页，无 host history；超过阈值时将完整历史写入 pinned host，已有 GPU 页原地转为 sparse 槽位。不同请求可处于不同模式，同一 decode graph 处理两种行。页回收后可供其它请求复用。
 
-这套页池服务于 OasisKV target；它没有启用 SGLang 的独立 `--enable-unified-memory` 选项，也不与 draft 权重或 KV 共用物理页。长请求的 sparse prefill 仍临时恢复完整 KV 进行 causal attention，调度容量估算仍保留最坏情况预算。
+这套页池服务于 OasisKV target；它没有启用 SGLang 的独立 `--enable-unified-memory` 选项，也不与 draft 权重或 KV 共用物理页。长请求的 prefill 临时恢复旧 prefix 并与当前 GPU K/V 合并计算完整 causal attention，调度容量估算仍保留最坏情况预算。
 本轮已做 CPU/Triton 数值回归和 SM90 离线编译；新增 external-event 跨步依赖尚待真实 CUDA capture/replay 验证。不能据此宣称 TPOT/TPS 已改善。
+
+### Prefill 的 GPU KV 路径
+
+通用 backend 在 attention 前准备容量，但在 attention 后才提交当前 chunk 的 KV。
+首个 chunk 直接把模型生成的 K/V 交给 attention，不从 host 回读当前 chunk。
+后续 chunk 的旧 prefix 若仍在 dense 页池中，直接在 GPU 上读取；若在 host 中，则只读旧 prefix，
+每个 KV head 用连续 pinned 源发起 H2D，并通过 CUDA event 的 stream wait 等待前次写入，
+不再调用 `materialize_history()` 的逐层 CPU `synchronize()`。
+扩容时保护旧内存的同步仍然保留。
+
+支持 FA3 的设备上，FP16/BF16、相同且不超过 256 的 Q/K/V head dimension（8 的倍数）、
+无原生 DSA mask 的请求，每个 request/chunk 调用一次 FA3；使用 bottom-right causal mask，
+保留 GQA 与 softcap。CPU、不支持的维度/设备和原生 DSA mask 使用原有语义的分块参考路径。
+`hisparse_config.prefill_chunk_size` 只控制参考路径的 query 分块；它不是调度器的
+`--chunked-prefill-size`，也不再将 FA3 拆成 256-query 的多次调用。
+
+例如一个 16K prompt 按 8K + 8K 调度：旧路径分别从 host 回读 8K、16K；新路径分别回读 0、8K。
+当前 chunk 仍需备份到 host，逐块 append/摘要更新及 pinned 容量倍增尚未在本次改动中优化。
+这不是持久保留完整 GPU history，也没有增加 decode 预取的 staging buffer。
+原生 DeepSeek-V4 专用后端不经过这个通用 prefill 分支。
+
+在 GPU 机器执行无需 checkpoint 的 prefill/graph 交接回归：
+
+```bash
+PYTHONPATH=python python -m pytest -q \
+  test/registered/unit/mem_cache/test_oasiskv_prefill.py \
+  test/registered/unit/mem_cache/test_oasiskv_graph_kernels.py
+```
+
+包含 FP16/BF16 FA3 与 dense 参考的比较、跨阈值及未对齐 chunk、DSA mask、缓存交接。
+本地 CPU 测试不代表已经验证 H100 上的 FA3 数值或 prefill 延迟；性能需在相同负载下复测。
 
 ### 补传与预传的去重判据
 

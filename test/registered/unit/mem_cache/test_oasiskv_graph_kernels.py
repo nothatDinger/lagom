@@ -94,8 +94,13 @@ def test_token_append_refill_attention_and_prefetch_match_eager_across_boundarie
     layout = graph.get_layer(0, queries, keys, values)
     state = cache.get(1, 0, 0, keys, values)
     reference = reference_cache.get(1, 0, 0, keys, values)
-    for item in (state, reference):
-        item.append(keys[:prefill], values[:prefill], 0)
+    reference.append(keys[:prefill], values[:prefill], 0)
+    if prefill:
+        # Exercise the production prefill -> graph ownership handoff as well
+        # as decode's graph-resident append/refill kernels.
+        state.prefill(queries[:prefill], keys[:prefill], values[:prefill], 0, kd**-0.5)
+    else:
+        state.append(keys[:0], values[:0], 0)
     w = layout.workspace
     for pos in range(prefill, prefill + 5):
         graph.prepare([1], [0], [pos], paired=True)

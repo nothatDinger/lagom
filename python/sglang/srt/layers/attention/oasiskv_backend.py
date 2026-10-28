@@ -257,8 +257,8 @@ class OasisKVAttnBackend(AttentionBackend):
                 # current pair has finished reading the old working set.
                 state.submit_prefetch(plan)
             else:
-                state.append(keys, values, prefix)
                 if forward_batch.forward_mode.is_decode():
+                    state.append(keys, values, prefix)
                     selection = None if topk_indices is None else topk_indices[start]
                     state.prepare_attention(q[start], selection)
                     output[start:end] = state.attend(
@@ -268,8 +268,10 @@ class OasisKVAttnBackend(AttentionBackend):
                     selection = (
                         None if topk_indices is None else topk_indices[start:end]
                     )
-                    output[start:end] = state.dense_prefill(
+                    output[start:end] = state.prefill(
                         q[start:end],
+                        keys,
+                        values,
                         prefix,
                         layer.scaling,
                         indices=selection,
