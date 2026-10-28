@@ -11,11 +11,12 @@ import torch
 import triton
 import triton.language as tl
 from sglang.srt.layers.attention.triton_ops import oasiskv as kernels
-from sglang.srt.mem_cache.oasiskv_async import LayerPrefetchGraphs
+from sglang.srt.mem_cache.oasiskv_async import LayerPrefetchGraphs, PrefetchGraphBatch
 from sglang.srt.mem_cache.oasiskv_attention import (
     GroupedAttentionWorkspace,
     use_grouped_attention,
 )
+from sglang.srt.mem_cache.oasiskv_graph_inputs import GraphInputs
 
 
 def copy_launch_geometry(
@@ -218,24 +219,13 @@ class OasisKVGraphState:
         )
         self.replay_batch_size = max_bs
         self.completed = torch.cuda.Event() if self.cuda else None
-        # Protect pinned upload sources independently of the much longer model
-        # replay; a CPU producer must not rewrite a source still being DMA-read.
-        self.uploads = [
-            (
-                torch.empty(
-                    self.tables.shape,
-                    dtype=torch.int64,
-                    device="cpu",
-                    pin_memory=self.cuda,
-                ),
-                torch.cuda.Event() if self.cuda else None,
-            )
-            for _ in range(2)
-        ]
-        self.upload_index = 0
+        self.inputs = GraphInputs(self)
+        self.prefetch_batch = PrefetchGraphBatch()
 
     def get_layer(self, layer_id, query, key, value):
         if layer_id not in self.layers:
+            for request in self.inputs.requests.values():
+                request.dirty = True
             heads, kd, vd = key.shape[1], key.shape[2], value.shape[2]
             group = query.shape[1] // heads
             geometry = (heads, group, kd, vd, key.dtype)
@@ -293,120 +283,53 @@ class OasisKVGraphState:
         return layer
 
     def prepare(self, slots, generations, prefixes, *, paired, graph_batch_size=None):
-        """Outside graph: join writers, grow storage, refresh indirect pointers."""
-        if not len(slots) == len(generations) == len(prefixes):
-            raise ValueError("OasisKV graph request metadata lengths disagree")
-        if len(slots) > self.max_bs or len(set(slots)) != len(slots):
-            raise ValueError(
-                "OasisKV graph requires distinct live slots within max batch"
-            )
-        host, uploaded = self.uploads[self.upload_index]
-        self.replay_batch_size = graph_batch_size or self.max_bs
-        self.replay_paired = paired
-        self.upload_index = 1 - self.upload_index
-        if uploaded is not None:
-            uploaded.synchronize()
-        # Construct one batched CPU tensor, rather than one tiny tensor/copy per
-        # request per layer (that launch overhead dominates at batch 256).
-        inactive = [0] * kernels.FIELDS
-        inactive[kernels.PREFIX] = -1
-        rows = [inactive] * (self.tables.shape[0] * self.max_bs)
-        pending = []
-        main = torch.cuda.current_stream(self.device) if self.cuda else None
-        for layer_id, layout in self.layers.items():
-            joined = set()
-            index = layer_id - self.start_layer
-            for b, (slot, generation, prefix) in enumerate(
-                zip(slots, generations, prefixes)
-            ):
-                if prefix < 0 or prefix >= self.max_context:
-                    raise ValueError(
-                        "OasisKV decode position exceeds captured context capacity"
-                    )
-                identity = (slot, generation, layer_id)
-                state = self.cache.layers.get(identity)
-                if state is None:
-                    if prefix:
-                        raise ValueError(
-                            f"Missing OasisKV prefill history for {identity}"
-                        )
-                    state = self.cache.new_layer(
-                        layer_id,
-                        layout.heads,
-                        layout.key_dim,
-                        layout.value_dim,
-                        layout.dtype,
-                        self.device,
-                    )
-                    self.cache.layers[identity] = state
-                if state.length != prefix:
-                    raise ValueError(
-                        f"OasisKV cache length {state.length} != prefix {prefix}"
-                    )
-                state.graph_background = layout.background
-                if (state.heads, state.key_dim, state.value_dim, state.dtype) != (
-                    layout.heads,
-                    layout.key_dim,
-                    layout.value_dim,
-                    layout.dtype,
-                ):
-                    raise ValueError(
-                        "OasisKV prefill storage does not match captured KV geometry"
-                    )
-                # Deduplicate each layer's fences across requests. Eager
-                # fallback may leave distinct events; prepare_stream releases
-                # this layer without blocking the whole foreground launch.
-                for event in (
-                    state.selection_done,
-                    state.pending,
-                    state.backup_done,
-                    state.refill_done,
-                    state.read_done,
-                ):
-                    if event is not None and id(event) not in joined:
-                        # Request tables can be uploaded while the previous
-                        # step still copies later layers: background graphs
-                        # read their own snapshots. Gate each layer separately.
-                        (self.prepare_stream or main).wait_event(event)
-                        joined.add(id(event))
-                state.prepare_append(prefix + 1)
-                rows[index * self.max_bs + b] = state.graph_row(prefix)
-                pending.append((state, prefix, paired))
-            if layout.background is not None:
-                layout.background.inputs_ready.record(self.prepare_stream)
-        host.copy_(torch.tensor(rows, dtype=torch.int64).reshape(self.tables.shape))
-        self.tables.copy_(host, non_blocking=self.cuda)
-        if uploaded is not None:
-            uploaded.record(torch.cuda.current_stream(self.device))
-        self.pending = pending
+        self.inputs.prepare(
+            slots, generations, prefixes, paired, graph_batch_size or self.max_bs
+        )
 
     def finish_in_graph(self):
-        # Side work belongs to separate graphs, not branches of this capture.
-        pass
+        # Called by warmup first; during model capture this is a cache hit.
+        # Side work remains independent of the foreground capture.
+        if self.cuda:
+            self.prefetch_batch.capture(
+                self._capture_batch_size,
+                [layout.background for layout in self.layers.values()],
+            )
 
     def finish_replay(self):
         """Outside graph: reflect the enqueued committed root in host ownership."""
         if self.completed is not None:
             self.completed.record(torch.cuda.current_stream(self.device))
             if self.replay_paired:
-                for layout in self.layers.values():
-                    layout.background.replay(self.replay_batch_size)
-        for state, prefix, paired in self.pending:
-            state.length = prefix + 1
-            state.step += int(paired)
-            state.prefetch_submissions += int(paired)
-            state.initialized = True
-            state.backup_done = state.refill_done = self.completed
-            state.read_done = self.completed
-            background = getattr(state, "graph_background", None)
-            state.pending = background.done if paired and background else None
-            state.selection_done = (
-                background.selection_done if paired and background else None
-            )
+                if self.replay_batch_size in self.prefetch_batch.graphs:
+                    self.prefetch_batch.replay(self.replay_batch_size)
+                else:
+                    # Direct kernel/eager callers may omit the model epilogue.
+                    for layout in self.layers.values():
+                        layout.background.replay(self.replay_batch_size)
+        paired = self.replay_paired
+        for request in self.pending:
+            request.length += 1
+            request.step_delta += int(paired)
+            for state in request.states:
+                state.length = request.length
+                state.step += int(paired)
+                state.prefetch_submissions += int(paired)
+                state.initialized = True
+                state.backup_done = state.refill_done = self.completed
+                state.read_done = self.completed
+                background = getattr(state, "graph_background", None)
+                state.pending = background.done if paired and background else None
+                state.selection_done = (
+                    background.selection_done if paired and background else None
+                )
         self.pending = []
 
     def forward(self, query, key, value, layer, batch_size, *, paired, topk=None):
         layout = self.get_layer(layer.layer_id, query, key, value)
+        self._capture_batch_size = batch_size
+        if layer.layer_id == self.start_layer:
+            self.inputs.materialize(batch_size)
         if layout.background is not None:
             layout.background.consume()
         table = self.tables[layer.layer_id - self.start_layer, :batch_size]

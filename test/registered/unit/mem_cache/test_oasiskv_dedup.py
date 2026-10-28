@@ -108,6 +108,7 @@ def test_graph_prefetch_uses_layer_owned_refill_result(
     state2 = cache.get(7, 0, 1, key, key)
     state2.append(key, key, 0)
     graph.prepare([7], [0], [64], paired=True)
+    graph.inputs.materialize(2)
     table = graph.tables[0]
     w = layout.workspace
     w.candidates.fill_(99)  # padded request must not generate I/O

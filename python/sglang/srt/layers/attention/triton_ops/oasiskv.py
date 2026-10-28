@@ -24,6 +24,38 @@ FIELDS = 11
 
 
 @triton.jit
+def prepare_request_tables(
+    Descriptors,
+    Inputs,
+    Tables,
+    REQUESTS: tl.constexpr,
+    LAYERS: tl.constexpr,
+    MAX_BATCH: tl.constexpr,
+    BATCH: tl.constexpr,
+):
+    """Gather persistent descriptors using this replay's request identities."""
+    layer = tl.program_id(0)
+    b = tl.program_id(1) * 16 + tl.arange(0, 16)
+    index = tl.load(Inputs + b * 4, b < BATCH, -1)
+    generation = tl.load(Inputs + b * 4 + 1, b < BATCH, -1)
+    prefix = tl.load(Inputs + b * 4 + 2, b < BATCH, -1)
+    step_delta = tl.load(Inputs + b * 4 + 3, b < BATCH, 0)
+    valid = (b < BATCH) & (index >= 0) & (index < REQUESTS) & (prefix >= 0)
+    source = Descriptors + (index * LAYERS + layer) * 12
+    stored_generation = tl.load(source + 11, valid, -1)
+    valid = valid & (stored_generation == generation)
+    fields = tl.arange(0, 16)[None, :]
+    row = tl.load(source[:, None] + fields, valid[:, None] & (fields < 11), 0)
+    row = tl.where(fields == 7, tl.where(valid, prefix, -1)[:, None], row)
+    row = tl.where((fields == 8) & valid[:, None], row + step_delta[:, None], row)
+    tl.store(
+        Tables + (layer * MAX_BATCH + b[:, None]) * 11 + fields,
+        row,
+        (b[:, None] < BATCH) & (fields < 11),
+    )
+
+
+@triton.jit
 def _slot_pointer(
     row,
     h,

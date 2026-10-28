@@ -26,12 +26,12 @@ slots (FB attribute name maps 1:1 to slot name).
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
-
 from sglang.srt.model_executor.input_buffers import (
     INDEX_SEMANTIC_BUFFERS,
     share_input_buffer,
@@ -308,6 +308,107 @@ class CudaGraphBufferRegistry:
         # when allocating (bind/source bypasses the pool).
         self.share_pool = share_pool
         self._slots: Dict[str, GraphSlot] = {}
+        self._cache_fill_plans = False
+        self._fill_plans = OrderedDict()
+
+    def enable_cached_fill(self):
+        """Freeze slot geometry for replay; sources are still read every call.
+
+        Registration invalidates cached plans. A caller changing an existing
+        slot's buffer/policy must invalidate_fill_plans() before the next fill.
+        Opt-in so backends with dynamically mutable slot layouts keep the
+        general registry path.
+        """
+        self._cache_fill_plans = True
+        self.invalidate_fill_plans()
+
+    def invalidate_fill_plans(self):
+        self._fill_plans.clear()
+
+    def _compiled_fill_plan(self, ctx):
+        key = (ctx.raw_bs, ctx.padded_bs, ctx.raw_num_tokens, ctx.padded_num_tokens)
+        plan = self._fill_plans.get(key)
+        if plan is not None:
+            self._fill_plans.move_to_end(key)
+            return plan
+        padding, copies, hooks = [], [], []
+        for slot in self._slots.values():
+            if not slot.enabled or slot.buffer is None:
+                continue
+            raw_n = slot._raw_n(ctx.raw_bs, ctx.raw_num_tokens)
+            padded_n = slot._padded_n(ctx.padded_bs, ctx.padded_num_tokens)
+            if raw_n < padded_n and slot.padding_policy in (
+                PaddingPolicy.ZERO,
+                PaddingPolicy.FILL_SENTINEL,
+            ):
+                if slot.slice_fn is None:
+                    tail = slot.buffer[raw_n:padded_n]
+                else:
+                    view = slot.slice_fn(slot.buffer, padded_n)
+                    tail = (
+                        view[..., raw_n:padded_n]
+                        if view.dim() > 1
+                        else view[raw_n:padded_n]
+                    )
+                value = (
+                    0 if slot.padding_policy == PaddingPolicy.ZERO else slot.pad_value
+                )
+                if value is None:
+                    raise RuntimeError(
+                        f"GraphSlot {slot.name!r}: FILL_SENTINEL requires pad_value"
+                    )
+                padding.append((tail, value))
+            if slot.copy_from_fb:
+                destination = None
+                if slot.source_fn is None:
+                    destination = (
+                        slot.slice_fn(slot.buffer, raw_n)
+                        if slot.slice_fn
+                        else slot.buffer if slot.axis == "none" else slot.buffer[:raw_n]
+                    )
+                copies.append(
+                    (
+                        slot.name,
+                        slot.source_fn,
+                        slot.buffer,
+                        destination,
+                        slot.buffer.device.type == "cpu",
+                    )
+                )
+            if slot.post_fill is not None:
+                hooks.append((slot.post_fill, slot.buffer))
+        plan = padding, copies, hooks
+        if len(self._fill_plans) >= 32:
+            self._fill_plans.popitem(last=False)
+        self._fill_plans[key] = plan
+        return plan
+
+    def _fill_from_cached(self, forward_batch, ctx):
+        padding, copies, hooks = self._compiled_fill_plan(ctx)
+        for destination, value in padding:
+            destination.fill_(value)
+        gpu_dsts, gpu_srcs, cpu_pairs = [], [], []
+        for name, source_fn, buffer, destination, cpu in copies:
+            source = (
+                source_fn(forward_batch, ctx)
+                if source_fn
+                else getattr(forward_batch, name, None)
+            )
+            if source is None or not isinstance(source, torch.Tensor):
+                continue
+            if source_fn is not None:
+                destination = buffer[: source.shape[0]]
+            if cpu:
+                cpu_pairs.append((destination, source))
+            else:
+                gpu_dsts.append(destination)
+                gpu_srcs.append(source)
+        if gpu_dsts:
+            _grouped_foreach_copy_(gpu_dsts, gpu_srcs)
+        for destination, source in cpu_pairs:
+            destination.copy_(source)
+        for hook, buffer in hooks:
+            hook(buffer, forward_batch, ctx)
 
     # ---- registration ------------------------------------------------------
 
@@ -330,6 +431,7 @@ class CudaGraphBufferRegistry:
                 f"GraphSlot {slot.name!r} already registered; "
                 "use enable()/disable() to gate per-iter."
             )
+        self.invalidate_fill_plans()
         if not slot.enabled:
             # Even when disabled, keep the spec so callers can introspect
             # by name; just don't allocate.
@@ -412,6 +514,9 @@ class CudaGraphBufferRegistry:
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        if self._cache_fill_plans:
+            self._fill_from_cached(forward_batch, ctx)
+            return
 
         # Phase 1: reset padded regions where it matters.
         for slot in self._slots.values():

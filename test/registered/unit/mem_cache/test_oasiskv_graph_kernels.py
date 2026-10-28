@@ -52,6 +52,7 @@ def test_delta_matches_reference_including_empty_slots_hits_and_lru_ties(slots, 
     state.ages.copy_(ages)
     state.step = 7
     graph.prepare([1], [0], [1], paired=True)
+    graph.inputs.materialize(2)
     layout.draft[0].copy_(candidates)
     expected = plan_delta(candidates, resident, ages, 8, cap)
     layout.plan.select(graph.tables[0], layout.draft, cap=cap, background=True)
@@ -104,6 +105,7 @@ def test_token_append_refill_attention_and_prefetch_match_eager_across_boundarie
     w = layout.workspace
     for pos in range(prefill, prefill + 5):
         graph.prepare([1], [0], [pos], paired=True)
+        graph.inputs.materialize(2)
         table = graph.tables[0]
         q, k, v = [
             torch.cat((x[pos : pos + 2], torch.zeros_like(x[:2])), 0).contiguous()
@@ -284,6 +286,7 @@ def test_dense_and_sparse_rows_share_one_paged_decode_launch():
         is cache.layers[(1, 0, 0)].page_table.pool
     )
     graph.prepare([0, 1], [0, 0], [5, 21], paired=False)
+    graph.inputs.materialize(2)
     assert graph.tables[0, :, kernels.DENSE].tolist() == [1, 0, 0]
     output = graph.forward(
         q, k, v, SimpleNamespace(layer_id=0, scaling=0.25, logit_cap=0), 3, paired=False

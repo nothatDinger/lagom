@@ -455,6 +455,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             dp_size=self.dp_size,
             source=self.buffers,
         )
+        if self.model_runner.server_args.attention_backend == "oasiskv":
+            self.buffer_registry.enable_cached_fill()
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)

@@ -92,6 +92,7 @@ class OasisKVAttnBackend(AttentionBackend):
             # execute with inactive table rows, including graph padding.
             self.graph_state.tables.zero_()
             self.graph_state.tables[..., 7] = -1
+            self.graph_state.inputs.batch.fill_(-1)
             return
         actual = getattr(
             forward_batch, "actual_forward_mode", forward_batch.forward_mode

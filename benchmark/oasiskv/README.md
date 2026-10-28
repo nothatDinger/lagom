@@ -39,9 +39,9 @@ preflight 检查可见 H100 数量和显存，并保存 CPU、内存和 GPU 拓�
 
 通用 decode 通过固定 GPU 请求表间接访问各请求的 host KV、摘要和 device working set；
 请求身份、长度和扩容后的地址在 replay 前更新。图内执行 root KV 追加、摘要更新、预测、
-真实 Top-K 补载和成对 attention。每层的选择/传输使用独立捕获的 CUDA graph，
+真实 Top-K 补载和成对 attention。通用路径把各层选择合入一个后台 CUDA graph，传输合入另一个，
 由 external event 连接：选择等预测及真实补载，传输再等本层 attention；前台图尾不汇合后台。
-提交前台图后立即提交各层后台图，下一步到达对应层才等待该层上次传输，允许末层传输跨过模型边界。
+提交前台图后立即提交这两个后台图，下一步到达对应层才等待该层上次传输，允许末层传输跨过模型边界。
 后台保存独立元数据快照，避免下一批请求换序或 padding 更新覆盖正在执行的任务。
 host 分配/扩容、dense→sparse 转换和请求回收仍在图外，必要时等待相关页的使用者。
 变长 prefill 保持 eager；H100 上常规 FP16/BF16 MHA/GQA 使用 FA3，直接读取当前 chunk 的 GPU K/V，
@@ -87,6 +87,38 @@ PYTHONPATH=python python -m pytest -q \
 
 这套页池服务于 OasisKV target；它没有启用 SGLang 的独立 `--enable-unified-memory` 选项，也不与 draft 权重或 KV 共用物理页。长请求的 prefill 临时恢复旧 prefix 并与当前 GPU K/V 合并计算完整 causal attention，调度容量估算仍保留最坏情况预算。
 本轮已做 CPU/Triton 数值回归和 SM90 离线编译；新增 external-event 跨步依赖尚待真实 CUDA capture/replay 验证。不能据此宣称 TPOT/TPS 已改善。
+
+### Decode replay 前的 CPU 开销
+
+通用 OasisKV 的稳定请求复用每层的 KV 地址描述符。每步只上传请求登记索引、generation、
+prefix 和 step 增量，由前台图中的小型 gather kernel 组装本轮请求表；batch 换序、padding
+和调度器槽号均不固化在 capture 时。generation 不匹配或无效索引的行被屏蔽。
+新请求、容量扩展、dense 页移动和 eager 切回会使描述符失效，仍走完整检查和逐层就绪通知。
+两个 pinned 上传槽只在自身 DMA 未完成时等待，设备输入覆盖只依赖上一轮读取输入的 prologue。
+
+36 层稳定请求的 `prepare` 不再逐层重建 `graph_row` 或调用 `prepare_append`：
+常见的 108 次主机侧 event wait、37 次 event record，降为一次输入读取保护 wait 和一次上传 record。
+这是该函数的提交次数，不包含图内依赖，也不表示所有同步已经消除。回收、扩容和冷请求仍可能等待。
+输入 registry 按 batch 形状缓存目标切片和复制计划，源张量每步重新读取，继续使用现有分组复制。
+
+通用路径的后台提交从每层两个 graph launch 合并为全模型两个 launch；图中保留每层的
+事件依赖：选择等 `prediction_ready`，传输同时等 `selection_done` 和 `read_done`，再记录 `done`。
+下一轮第一层只等待上一轮第一层，不等待整个后台图结束。DeepSeek-V4 的独立后台图提交方式未改动。
+`finish_replay` 仍更新各请求、各层的 CPU 状态；本次没有将全部簿记迁入 C++。
+
+无需 checkpoint 的 CPU/解释器回归：
+
+```bash
+PYTHONPATH=python TRITON_INTERPRET=1 python -m pytest -q \
+  test/registered/unit/mem_cache/test_oasiskv_graph_descriptors.py \
+  test/registered/unit/mem_cache/test_oasiskv_async.py \
+  test/registered/unit/model_executor/test_oasiskv_graph_fill.py
+```
+
+在 H100 上还需执行上方 CUDA graph 回归，尤其是合并后台图后“下一轮早层先于上轮末层传输完成”的测试。
+再用相同 batch/上下文重测 `load_batch`（包含 metadata prepare）、`prepare`、
+draft 末个 GPU kernel 到 target 首个 GPU kernel 的空窗，以及 TPOT/TPS。
+本地没有 GPU，不能据提交次数直接推算 2.55 ms 空窗或 TPOT 的降幅。
 
 ### Prefill 的 GPU KV 路径
 

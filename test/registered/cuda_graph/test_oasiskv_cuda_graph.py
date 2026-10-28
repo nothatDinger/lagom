@@ -176,6 +176,7 @@ def test_same_step_refill_prefetch_dedup_across_independent_graphs():
             real = state.layers[layer.layer_id].workspace.real
             refill_counts[layer.layer_id].copy_(real.counts)
             refill_sources[layer.layer_id].copy_(real.sources)
+        state.finish_in_graph()
 
     for _ in range(2):
         run()

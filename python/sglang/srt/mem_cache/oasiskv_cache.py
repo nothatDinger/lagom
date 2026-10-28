@@ -9,6 +9,7 @@ latent KV head, with its absorbed query and latent value dimensions.
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+from weakref import WeakSet
 
 import torch
 import torch.nn.functional as F
@@ -131,6 +132,11 @@ class OasisKVLayerCache:
         )
         self.real_heads = torch.tensor([heads], dtype=torch.int32, device=device)
         self.prefetch_submissions = 0
+        self._graph_bindings = WeakSet()
+
+    def _invalidate_graph_bindings(self, *, release=False):
+        for binding in tuple(self._graph_bindings):
+            binding.invalidate(release=release)
 
     @property
     def data(self):
@@ -157,6 +163,7 @@ class OasisKVLayerCache:
         ]
 
     def prepare_append(self, end):
+        self._invalidate_graph_bindings()
         was_dense = not self.sparse
         transition = was_dense and end > self.config.token_budget
         if transition:
@@ -200,6 +207,7 @@ class OasisKVLayerCache:
 
     def release(self):
         self.join(reclaim=True)
+        self._invalidate_graph_bindings(release=True)
         if self.page_table:
             self.page_table.release()
 
@@ -230,6 +238,7 @@ class OasisKVLayerCache:
     def _grow(self, blocks):
         if blocks <= self.capacity:
             return
+        self._invalidate_graph_bindings()
         # Host allocations may not be freed while UVA or D2H still accesses them.
         self.join(reclaim=True)
         capacity = max(blocks, max(4, self.capacity * 2))
@@ -404,6 +413,7 @@ class OasisKVLayerCache:
         the real attention uses. The same refill handles cold start and later
         prediction misses, using the UVA copy kernel for missing payloads only.
         """
+        self._invalidate_graph_bindings()
         self.join()
         self._prefetch_base = None
         if not self.sparse:
@@ -440,6 +450,7 @@ class OasisKVLayerCache:
         Call after prepare_attention(): the plan must observe the real query's
         refilled resident set. Updates allocate independent metadata tensors.
         """
+        self._invalidate_graph_bindings()
         self.step += 1
         pipeline = self.pipeline
         resident, ages = self._prefetch_base or (self.resident, self.ages)
@@ -465,6 +476,7 @@ class OasisKVLayerCache:
 
     def submit_prefetch(self, plan):
         """After current attention's reads, submit the planned KV overwrites."""
+        self._invalidate_graph_bindings()
         pipeline = self.pipeline
         if pipeline.cuda:
             pipeline.transfer.wait_event(self.selection_done)
