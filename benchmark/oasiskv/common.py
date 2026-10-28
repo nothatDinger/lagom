@@ -118,6 +118,30 @@ def matrix(config, models=None, methods=None, smoke=False):
         }
 
 
+def select_workload(config, concurrencies=None, input_lengths=None, *, smoke=False):
+    """Filter configured points without changing request count or their meaning."""
+    if smoke and (concurrencies is not None or input_lengths is not None):
+        raise ValueError(
+            "--smoke is fixed at concurrency=1, 2 requests, 32 output tokens; "
+            "omit --smoke for a concurrency sweep"
+        )
+    selected = dict(config)
+    for key, values in (
+        ("concurrencies", concurrencies),
+        ("input_lengths", input_lengths),
+    ):
+        if values is None:
+            continue
+        if (
+            not values
+            or len(set(values)) != len(values)
+            or set(values) - set(config[key])
+        ):
+            raise ValueError(f"{key} must be distinct values from {config[key]}")
+        selected[key] = [value for value in config[key] if value in values]
+    return selected
+
+
 def point_name(point):
     return "{protocol}-{model}-{method}-i{input_length}-o{output_length}-c{concurrency}-r{repeat}".format(
         **point

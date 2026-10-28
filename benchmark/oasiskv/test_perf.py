@@ -15,10 +15,18 @@ import numpy as np
 import zmq.asyncio
 from aiohttp import web
 from client import ForwardCollector, generate, sse_events, workload
-from common import HERE, load_config, matrix, server_command, summarize, write_json
+from common import (
+    HERE,
+    load_config,
+    matrix,
+    select_workload,
+    server_command,
+    summarize,
+    write_json,
+)
 from prepare import packed_prompts, prepare
 from report import collect, save_csv
-from run import ensure_port_free, resolve_checkpoint, validate_server_info
+from run import ensure_port_free, main, resolve_checkpoint, validate_server_info
 
 
 class Tokenizer:
@@ -131,6 +139,70 @@ class ProtocolTests(unittest.TestCase):
                 write_json(path, modified)
                 with self.assertRaises(ValueError):
                     load_config(path)
+
+    def test_concurrency_filters_keep_client_server_and_graph_limits_aligned(self):
+        config = load_config(HERE / "config.json")
+        selected = select_workload(config, [8, 16], [16384])
+        points = list(matrix(selected, ["qwen3-235b-a22b"]))
+        self.assertEqual(len(points), 12)
+        self.assertEqual(config["concurrencies"], [8, 16, 32, 64, 128, 256])
+        for point in points:
+            cmd = server_command(selected, point, 30000, "ipc:///tmp/example")
+            self.assertEqual(cmd[cmd.index("--tp") + 1], "8")
+            self.assertEqual(
+                int(cmd[cmd.index("--max-running-requests") + 1]), point["concurrency"]
+            )
+            self.assertEqual(
+                json.loads(cmd[cmd.index("--cuda-graph-config") + 1])["decode"][
+                    "max_bs"
+                ],
+                point["concurrency"],
+            )
+            self.assertEqual(point["num_requests"], 1024)
+            self.assertEqual(point["output_length"], 2048)
+            self.assertEqual(point["input_length"], 16384)
+        for kwargs in (
+            {"concurrencies": [8], "smoke": True},
+            {"input_lengths": [16384], "smoke": True},
+            {"concurrencies": [8, 8]},
+            {"concurrencies": [7]},
+            {"input_lengths": [16000]},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                select_workload(config, **kwargs)
+
+    def test_plan_exposes_the_client_load_and_device_selection(self):
+        output = io.StringIO()
+        with patch(
+            "sys.argv",
+            [
+                "run.py",
+                "plan",
+                "--models",
+                "qwen3-8b",
+                "--concurrencies",
+                "8",
+                "16",
+                "--input-lengths",
+                "16384",
+            ],
+        ), patch("sys.stdout", output):
+            self.assertEqual(main(), 0)
+        planned = json.loads(output.getvalue())
+        self.assertEqual(planned["count"], 12)
+        for point in planned["points"]:
+            self.assertEqual(point["cuda_visible_devices"], "0")
+            self.assertEqual(
+                point["client"],
+                {
+                    "mode": "closed-loop",
+                    "max_concurrency": point["concurrency"],
+                    "num_requests": 1024,
+                    "input_length": 16384,
+                    "output_length": 2048,
+                    "request_rate_limit": None,
+                },
+            )
 
     def test_packing_is_exact_deterministic_and_uses_all_turns(self):
         records = [

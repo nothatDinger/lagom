@@ -25,6 +25,7 @@ from common import (
     matrix,
     point_name,
     read_json,
+    select_workload,
     server_command,
     sha256,
     summarize,
@@ -413,6 +414,7 @@ async def run_sweep(args, config, points, checked):
     env_record = environment()
     identity = {
         "config": config,
+        "points": points,
         "protocol": "smoke" if args.smoke else "fig11-sglang-port",
         "resolved": checked["resolved"],
         "git_head": command_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"]),
@@ -482,11 +484,33 @@ def main():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--models", nargs="+")
     parser.add_argument("--methods", nargs="+", choices=["dense", "oasiskv"])
-    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument(
+        "--concurrencies",
+        type=int,
+        nargs="+",
+        help="Select configured max-concurrency points (client and server), e.g. 8 16; not fixed running batch",
+    )
+    parser.add_argument(
+        "--input-lengths",
+        type=int,
+        nargs="+",
+        help="Select configured prompt lengths in tokens, e.g. 16384 32768",
+    )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Startup check only: concurrency=1, 2 requests, 32 output tokens",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--port", type=int, default=30000)
     args = parser.parse_args()
     config = load_config(args.config)
+    try:
+        config = select_workload(
+            config, args.concurrencies, args.input_lengths, smoke=args.smoke
+        )
+    except ValueError as error:
+        parser.error(str(error))
     models = args.models or list(config["models"])
     methods = args.methods or config["methods"]
     points = list(matrix(config, models, methods, args.smoke))
@@ -494,6 +518,17 @@ def main():
         planned = [
             {
                 **point,
+                "cuda_visible_devices": config["models"][point["model"]][
+                    "cuda_visible_devices"
+                ],
+                "client": {
+                    "mode": "closed-loop",
+                    "max_concurrency": point["concurrency"],
+                    "num_requests": point["num_requests"],
+                    "input_length": point["input_length"],
+                    "output_length": point["output_length"],
+                    "request_rate_limit": None,
+                },
                 "command": shlex.join(
                     server_command(config, point, args.port, "ipc:///tmp/oasiskv-fpm")
                 ),

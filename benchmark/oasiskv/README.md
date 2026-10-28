@@ -4,6 +4,12 @@
 为 [OasisKV v1](https://arxiv.org/pdf/2608.08097v1) §5.2、§5.3.1 / Fig.11
 准备长度、并发扫描与指标采集。**尚无 GPU 性能结果。**
 
+GPU 执行 agent 请先读 [并发测试执行指南](CONCURRENCY.md)：区分最大并发、实际 running batch、
+graph bucket 和成对 query 行数，包含 8/16 档的完整执行入口和结果核对方法。
+Fig.11 横轴为 **Max concurrency**，不是强制每个 decode step 使用固定 batch。
+`run.py` 支持 `--concurrencies 8 16 --input-lengths 16384` 筛选；
+`--smoke` 始终是单并发启动检查，不能用于测 8/16 档。
+
 ## 测试矩阵
 
 | 项目 | 配置 |
