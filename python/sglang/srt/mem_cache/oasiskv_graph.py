@@ -12,6 +12,10 @@ import triton
 import triton.language as tl
 from sglang.srt.layers.attention.triton_ops import oasiskv as kernels
 from sglang.srt.mem_cache.oasiskv_async import LayerPrefetchGraphs
+from sglang.srt.mem_cache.oasiskv_attention import (
+    GroupedAttentionWorkspace,
+    use_grouped_attention,
+)
 
 
 def copy_launch_geometry(
@@ -70,7 +74,17 @@ class GraphPlan:
             USE_REFILL_BASE=use_refill_base,
         )
 
-    def transfer(self, table, config, storage, dtype, *, background, next_plan=None):
+    def transfer(
+        self,
+        table,
+        config,
+        storage,
+        dtype,
+        *,
+        background,
+        next_plan=None,
+        attention_pages=None,
+    ):
         heads, slots = self.ids.shape[1:]
         batch = table.shape[0]
         if config.copy_kernel == "legacy":
@@ -124,13 +138,22 @@ class GraphPlan:
             NextIds=None if next_plan is None else next_plan.ids,
             NextAges=None if next_plan is None else next_plan.ages,
             SEED_NEXT=next_plan is not None,
+            AttentionPages=attention_pages,
+            Selected=self.selected,
+            BLOCK=config.block_size,
+            STORAGE=storage,
+            DTYPE={
+                torch.float16: tl.float16,
+                torch.bfloat16: tl.bfloat16,
+                torch.float32: tl.float32,
+            }[dtype],
         )
 
 
 class GraphWorkspace:
     """Foreground scratch shared across layers with the same head geometry."""
 
-    def __init__(self, batch, heads, group, kd, vd, config, max_blocks, device):
+    def __init__(self, batch, heads, group, kd, vd, config, max_blocks, device, dtype):
         slots = config.history_blocks
         self.real = GraphPlan(batch, heads, slots, device)
         self.candidates = torch.empty(
@@ -150,6 +173,11 @@ class GraphWorkspace:
             (batch * 2, heads * group, self.splits, vd + 2),
             dtype=torch.float32,
             device=device,
+        )
+        self.grouped = (
+            GroupedAttentionWorkspace(batch, heads, group, kd, vd, config, device)
+            if use_grouped_attention(config, dtype, group, kd, vd)
+            else None
         )
 
 
@@ -210,7 +238,7 @@ class OasisKVGraphState:
         if layer_id not in self.layers:
             heads, kd, vd = key.shape[1], key.shape[2], value.shape[2]
             group = query.shape[1] // heads
-            geometry = (heads, group, kd, vd)
+            geometry = (heads, group, kd, vd, key.dtype)
             if geometry not in self.workspaces:
                 self.workspaces[geometry] = GraphWorkspace(
                     self.max_bs,
@@ -221,6 +249,7 @@ class OasisKVGraphState:
                     self.config,
                     self.max_blocks,
                     self.device,
+                    key.dtype,
                 )
             storage = (
                 triton.cdiv((kd + vd) * key.element_size(), 16)
@@ -449,6 +478,7 @@ class OasisKVGraphState:
             key.dtype,
             background=False,
             next_plan=layout.plan if paired else None,
+            attention_pages=w.grouped.pages if w.grouped is not None else None,
         )
 
         if paired:
@@ -481,6 +511,21 @@ class OasisKVGraphState:
             dtype=query.dtype,
             device=self.device,
         )
+        if w.grouped is not None and query.dtype == key.dtype == value.dtype:
+            w.grouped.forward(
+                query,
+                key,
+                value,
+                output,
+                batch=batch_size,
+                width=width,
+                storage=storage,
+                scale=layer.scaling,
+                cap=layer.logit_cap,
+            )
+            if paired:
+                layout.background.read_done.record()
+            return output.reshape(batch_size * width, -1)
         kernels.attention_partial[(batch_size, heads * layout.group, w.splits)](
             table,
             query,

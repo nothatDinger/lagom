@@ -559,6 +559,10 @@ class OasisKVLayerCache:
         """Eager decode uses the same paged, paired kernel as full graph decode."""
         import triton
         from sglang.srt.layers.attention.triton_ops import oasiskv as kernels
+        from sglang.srt.mem_cache.oasiskv_attention import (
+            GroupedAttentionWorkspace,
+            use_grouped_attention,
+        )
 
         width, qheads, _ = query.shape
         if width not in (1, 2) or (width == 2) != (draft_key is not None):
@@ -581,6 +585,34 @@ class OasisKVLayerCache:
         if width == 2:
             key[1].copy_(draft_key)
             value[1].copy_(draft_value)
+        if query.dtype == self.dtype and use_grouped_attention(
+            self.config, self.dtype, qheads // self.heads, self.key_dim, self.value_dim
+        ):
+            workspace = GroupedAttentionWorkspace(
+                1,
+                self.heads,
+                qheads // self.heads,
+                self.key_dim,
+                self.value_dim,
+                self.config,
+                self.device,
+            )
+            workspace.prepare(
+                table, self.resident, selected, self.storage_dim, self.dtype
+            )
+            output = query.new_empty((width, qheads, self.value_dim))
+            workspace.forward(
+                query.contiguous(),
+                key,
+                value,
+                output,
+                batch=1,
+                width=width,
+                storage=self.storage_dim,
+                scale=scale,
+                cap=logit_cap,
+            )
+            return output
         tokens = (slots + 1) * block + 1
         splits = min(8, triton.cdiv(tokens, 256))
         partial = torch.empty(

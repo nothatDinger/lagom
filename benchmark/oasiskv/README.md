@@ -297,3 +297,64 @@ GEMM 只用于对比资源干扰，不能替代真实 attention/MLP trace、TPS 
 本开关只作用于通用 full-graph UVA copy；通用 eager 暂不读取这些调优项，DeepSeek-V4 仍采用其 C++ 搬运实现。
 真实补取仍在 attention 前完成，预取写入仍依赖本层 attention 读取结束，未改变 stream/event 依赖。
 优先按真实主流耗时、联合耗时与最终 TPS/TPOT 选择预算，不能只按 copy 单独运行的带宽选择。
+
+## HBM 稀疏 attention kernel 对比
+
+通用路径默认 `attention_kernel=auto`：FP16/BF16、GQA group ≥ 2、K/V head dim
+各 ≤ 256、block_size 为不超过 64 的 2 的幂时使用 physical-page grouped kernel。
+MHA、FP32、大维 MLA 和不支持的 block geometry 保留原 SIMT kernel；
+DeepSeek-V4 继续使用其原生 FlashMLA。这不是直接移植 V4 的共享 K/V、FP8 数据布局。
+
+优化包含：
+
+- 将物理页地址和有效长度合入前台 `publish_plan`，与真实 query 补载后的状态一致。
+  descriptor 地址固定，每次 replay 重写，padding 行清零，支持请求重排和页复用。
+  eager 使用独立 metadata kernel。metadata 只含地址和长度，不复制 KV。
+- 每 CTA 处理同一 KV head 的多个 query heads，以及 real/draft 两行。
+  K/V tile 在组内共享；QK/PV 使用 Tensor Core，softmax 和累加使用 FP32。
+  对齐的 K/V 特征维使用向量读取，避免同时持有展开后的 FP32 K、V。
+- 历史块、active block、draft token 分开处理；draft KV 仅对 draft 行可见。
+  split-KV 根据 batch、head 分组及 SM 数静态选择，所有 workspace 在 capture 前分配。
+  workspace 在相同 head geometry 的层之间共享，不按最大 batch 一律分配 32 个 splits。
+
+选择的 KV 集合、真实 token 提交规则、前台补载与后台预取的依赖保持原语义。
+没有增加 HBM staging buffer，也没有放宽预取写入必须等待 attention 读取结束的约束。
+浮点计算顺序和概率矩阵精度发生变化，数值按 FP16/BF16 容差验证，不保证逐 bit 相同。
+
+同一启动配置中加入 `"attention_kernel":"legacy"` 可做整服务 A/B；
+改回 `"attention_kernel":"auto"` 恢复自动选择。每次都重启服务并重新捕获 graph。
+不要同时改 top_k、max_new_blocks、copy_kernel 或请求并发，以免混入其他因素。
+
+HBM-only 微基准无需 checkpoint；所有 KV 已经驻留在 HBM，新旧实现读取完全相同的
+物理页、query 和 mask。脚本先校验结果，再用 CUDA graph 计时，并分别报告
+`metadata`、`attention_and_reduce`、`metadata_attention_reduce` 的 p50/p95，
+以及寄存器、spill、shared memory 和有效 KV 字节数。默认在每个样本前驱逐 L2，
+驱逐操作不计时；`--flush-mib 0` 可测 warm-cache 场景。
+
+```bash
+# Qwen3-8B 对应的本地 head geometry；包含 padding 的 batch=8 / live=7。
+PYTHONPATH=python python benchmark/oasiskv/bench_attention.py \
+  --batch 8 --padding 1 --heads 8 --group 4 \
+  --key-dim 128 --value-dim 128 --top-k 2048 --block-size 16 \
+  --output /tmp/oasiskv-attention-b8.json
+
+# 扫描 batch，以及 CTA head 分组、split 数和 KV tile 大小。
+# 默认只比较 legacy 和 auto；指定以下选项才额外编译 sweep 配置。
+PYTHONPATH=python python benchmark/oasiskv/bench_attention.py \
+  --batch 1,8,32,128,256 --head-tiles 2,4,8 --splits 4,8,16 --tiles 32,64 \
+  --output /tmp/oasiskv-attention-sweep.json
+
+# CUDA 数值验证，以及完整模型前的请求重排、padding、回收复用、异步 graph 验证。
+PYTHONPATH=python SGLANG_USE_CPU_ENGINE=0 python -m pytest -q \
+  test/registered/unit/mem_cache/test_oasiskv_attention.py \
+  test/registered/cuda_graph/test_oasiskv_cuda_graph.py
+```
+
+`useful_GBps` 的分子按实际 live request、KV head、有效 token 和 K/V 维度计算一次，
+不乘 GQA query heads 或 real/draft 行数；它不是 Nsight 的 DRAM 流量计数。
+判断带宽时还需采集 DRAM/L2 bytes、sector 利用率、memory stalls 和实际 occupancy。
+最终以 `metadata_attention_reduce` 与整服务 TPS/TPOT 为准，不能只看 partial kernel。
+不以离线编译出的寄存器数宣称 GPU 加速：当前交付环境无 GPU，CUDA replay、
+BF16 数值误差、真实性能及最终 token 质量需在 H100 上按上述命令确认。
+CPU `TRITON_INTERPRET=1` 可检查 FP16 数值、寻址和 mask；Triton 3.7 的 BF16 dot
+解释器将位模式当 uint16 处理，因此这些 BF16 用例只在 CUDA 上运行。

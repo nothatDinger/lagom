@@ -18,8 +18,12 @@ class OasisKVConfig:
     copy_kernel: str = "tiled"
     refill_ctas_per_sm: int = 8
     prefetch_ctas_per_sm: int = 1
+    # auto: physical-page Tensor Core GQA when supported, SIMT otherwise.
+    attention_kernel: str = "auto"
 
     def __post_init__(self):
+        if self.attention_kernel not in ("auto", "legacy"):
+            raise ValueError("OasisKV attention_kernel must be 'auto' or 'legacy'")
         if self.copy_kernel not in ("tiled", "legacy"):
             raise ValueError("OasisKV copy_kernel must be 'tiled' or 'legacy'")
         for name in (
@@ -59,6 +63,7 @@ class OasisKVConfig:
             "copy_kernel",
             "refill_ctas_per_sm",
             "prefetch_ctas_per_sm",
+            "attention_kernel",
         }
         if unknown:
             raise ValueError(
@@ -80,6 +85,7 @@ class OasisKVConfig:
             copy_kernel=config.get("copy_kernel", "tiled"),
             refill_ctas_per_sm=config.get("refill_ctas_per_sm", 8),
             prefetch_ctas_per_sm=config.get("prefetch_ctas_per_sm", 1),
+            attention_kernel=config.get("attention_kernel", "auto"),
         )
 
 

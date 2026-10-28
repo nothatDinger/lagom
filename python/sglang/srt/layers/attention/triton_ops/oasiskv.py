@@ -358,6 +358,72 @@ def copy_misses(
 
 
 @triton.jit
+def _attention_pages(
+    Table,
+    Ids,
+    Selected,
+    Pages,
+    b,
+    h,
+    HEADS: tl.constexpr,
+    SLOTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    STORAGE: tl.constexpr,
+    DTYPE: tl.constexpr,
+    NP: tl.constexpr,
+):
+    # One descriptor per physical block, shared by every query head/split.
+    # Ids is the *published foreground* plan, never the next prefetch plan.
+    row = Table + b * 11
+    pos = tl.load(row + 7)
+    s = tl.arange(0, NP)
+    address = tl.full(s.shape, 0, tl.int64)
+    length = tl.full(s.shape, 0, tl.int64)
+    if pos >= 0:
+        ids = tl.load(Ids + (b * HEADS + h) * SLOTS + s, s < SLOTS, -1)
+        selected = tl.load(Selected + (b * HEADS + h) * SLOTS + s, s < SLOTS, False)
+        ids = tl.where(s == SLOTS, pos // BLOCK, ids)
+        valid = (ids >= 0) & (selected | (s == SLOTS))
+        length = tl.where(
+            valid, tl.minimum(BLOCK, tl.maximum(0, pos - ids * BLOCK + 1)), 0
+        )
+        address = _slot_pointer(row, h, s, SLOTS, BLOCK, STORAGE, DTYPE).to(tl.int64)
+        address = tl.where(length > 0, address, 0)
+    out = Pages + ((b * HEADS + h) * (SLOTS + 1) + s) * 2
+    tl.store(out, address, s <= SLOTS)
+    tl.store(out + 1, length, s <= SLOTS)
+
+
+@triton.jit
+def prepare_attention_pages(
+    Table,
+    Ids,
+    Selected,
+    Pages,
+    HEADS: tl.constexpr,
+    SLOTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    STORAGE: tl.constexpr,
+    DTYPE: tl.constexpr,
+    NP: tl.constexpr,
+):
+    _attention_pages(
+        Table,
+        Ids,
+        Selected,
+        Pages,
+        tl.program_id(0),
+        tl.program_id(1),
+        HEADS,
+        SLOTS,
+        BLOCK,
+        STORAGE,
+        DTYPE,
+        NP,
+    )
+
+
+@triton.jit
 def publish_plan(
     Table,
     Ids,
@@ -368,6 +434,11 @@ def publish_plan(
     NextIds=None,
     NextAges=None,
     SEED_NEXT: tl.constexpr = False,
+    AttentionPages=None,
+    Selected=None,
+    BLOCK: tl.constexpr = 1,
+    STORAGE: tl.constexpr = 1,
+    DTYPE: tl.constexpr = tl.float32,
 ):
     b, h = tl.program_id(0), tl.program_id(1)
     row = Table + b * 11
@@ -382,6 +453,21 @@ def publish_plan(
         if SEED_NEXT:
             tl.store(NextIds + (b * HEADS + h) * SLOTS + i, ids, i < SLOTS)
             tl.store(NextAges + (b * HEADS + h) * SLOTS + i, times, i < SLOTS)
+    if AttentionPages is not None:
+        _attention_pages(
+            Table,
+            Ids,
+            Selected,
+            AttentionPages,
+            b,
+            h,
+            HEADS,
+            SLOTS,
+            BLOCK,
+            STORAGE,
+            DTYPE,
+            2 * N if SLOTS == N else N,
+        )
 
 
 @triton.jit
