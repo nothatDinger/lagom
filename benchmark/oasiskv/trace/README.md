@@ -44,6 +44,11 @@ python benchmark/oasiskv/trace/run.py \
 
 已有本地实验分支时使用 `git switch exp/oasiskv-trace`。输出目录必须不存在，以防混合旧 trace。默认使用 GPU `0,1,2,3`；可通过 `--gpus` 修改。脚本顺序启动并关闭自己的服务进程，不连接或终止已有服务。每个模式共用同一份 `prompts.npy`，请求串行执行。
 
+启动检查读取最终解析的 decode/prefill graph backend，两者必须都是 `disabled`，不依赖旧的 `disable_cuda_graph` 标志。
+若 HiSparse 检查失败，异常中的 `failed` 列出具体失败条件，`runtime` 报告 coordinator/allocator 类型及各实际开关。
+`enable_hisparse=True` 不等于已创建 V4 coordinator；`prefetcher=None` 也不等于旧 shared-index `enable_prefetch=False`。
+该检查保持禁止在线预取及 skip-IO，不会为绕过启动错误而修改实验语义。检查成功后的状态也会写入 `runtime.json` 的 `hisparse_runtime`。
+
 `G` 从 DSPARK checkpoint 的配置中读取，启动时明确传入 `speculative_num_draft_tokens=G+1`，**不扩大训练 proposal 窗口**。默认 `P=[1,2,3]`，`V=G−3`。例如 G=7 时 V=4。若 checkpoint 的 G 太短，脚本会报错；可选 `--verify-candidates 2 --probes 1 2`，但必须满足 `V+max(P)≤G`。控制组与 probe 组使用相同的 G 和 V。
 
 Top-K 使用模型的原生设置，不用通用 Qwen 实验的 2048 代替 V4 的 indexer 配置。若 G=7、`index_topk=512`，默认驻留容量为 4096 个 C4 单元。现有普通 DSPARK 路径要求容量至少为 `(G+1)×index_topk`，以同时保留所有验证行的 KV；脚本遵守这一限制，不为制造 misses 而绕过它。三组容量相同，实际值写入 `runtime.json`。

@@ -17,6 +17,55 @@ from pathlib import Path
 import torch
 
 
+def validate_trace_hisparse(runner):
+    """Report actual runtime state, without changing the experiment's IO mode."""
+    coordinator = getattr(runner, "hisparse_coordinator", None)
+
+    def type_name(value):
+        return (
+            None
+            if value is None
+            else f"{type(value).__module__}.{type(value).__name__}"
+        )
+
+    prefetcher = getattr(coordinator, "prefetcher", None)
+    state = {
+        "coordinator_type": type_name(coordinator),
+        "is_dsv4_hisparse": getattr(coordinator, "is_dsv4_hisparse", None),
+        "prefetcher_type": type_name(prefetcher),
+        "prefetcher_name": getattr(coordinator, "prefetcher_name", None),
+        "enable_prefetch": getattr(coordinator, "enable_prefetch", None),
+        "skip_io": getattr(coordinator, "skip_io", None),
+        "runner_enable_hisparse": getattr(runner, "enable_hisparse", None),
+        "runner_is_draft_worker": getattr(runner, "is_draft_worker", None),
+        "runner_allocator_type": type_name(
+            getattr(runner, "token_to_kv_pool_allocator", None)
+        ),
+        "coordinator_allocator_type": type_name(
+            getattr(coordinator, "token_to_kv_pool_allocator", None)
+        ),
+    }
+    failed = []
+    if coordinator is None:
+        failed.append("hisparse_coordinator is None")
+    else:
+        for name, expected in (
+            ("is_dsv4_hisparse", True),
+            ("enable_prefetch", False),
+            ("skip_io", False),
+        ):
+            if state[name] != expected:
+                failed.append(f"{name}={state[name]!r} (expected {expected!r})")
+        if prefetcher is not None:
+            failed.append(f"prefetcher is {state['prefetcher_type']} (expected None)")
+    if failed:
+        raise ValueError(
+            "Trace requires V4 HiSparse with real IO and no online prefetcher; "
+            f"failed: {'; '.join(failed)}; runtime: {json.dumps(state, sort_keys=True)}"
+        )
+    return state
+
+
 class TensorSnapshot:
     """Restore existing allocations in place, including aliased tensor views."""
 
@@ -238,6 +287,9 @@ class OasisKVTrace:
         return None if not path else cls(worker, json.loads(Path(path).read_text()))
 
     def __init__(self, worker, config):
+        from sglang.srt.model_executor.cuda_graph_config import (
+            cuda_graph_fully_disabled,
+        )
         from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
         from sglang.srt.speculative.ragged_verify import (
             RaggedVerifyMode,
@@ -261,7 +313,7 @@ class OasisKVTrace:
             raise ValueError("Use unique P values and at least two trace windows")
         if (
             worker._oasiskv_lookahead
-            or not get_exec().graph.disable_cuda_graph
+            or not cuda_graph_fully_disabled()
             or not get_schedule().disable_overlap_schedule
             or get_parallel().enable_dp_attention
             or get_parallel().pp_size != 1
@@ -274,16 +326,7 @@ class OasisKVTrace:
             )
         self.runner = worker.model_runner
         self.coordinator = self.runner.hisparse_coordinator
-        if (
-            self.coordinator is None
-            or not self.coordinator.is_dsv4_hisparse
-            or self.coordinator.prefetcher is not None
-            or self.coordinator.enable_prefetch
-            or self.coordinator.skip_io
-        ):
-            raise ValueError(
-                "Trace requires V4 HiSparse with real IO and no online prefetcher"
-            )
+        hisparse_state = validate_trace_hisparse(self.runner)
         # Validate the state inventory at startup, before the first request.
         list(target_state_tensors(self.runner))
         self.writer = None
@@ -298,6 +341,7 @@ class OasisKVTrace:
                     {
                         **config,
                         "gamma": worker.gamma,
+                        "hisparse_runtime": hisparse_state,
                         "tp": get_parallel().tp_size,
                         "c4_bytes": self.coordinator.item_size_bytes,
                         "effective_top_k": self.coordinator.top_k,

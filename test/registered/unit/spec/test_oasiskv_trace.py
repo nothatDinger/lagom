@@ -23,6 +23,7 @@ from sglang.srt.speculative.oasiskv_trace import (
     check_live_locations,
     replace_method,
     resident_lookup,
+    validate_trace_hisparse,
 )
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
@@ -312,6 +313,107 @@ def test_missing_probes_and_current_scratch_are_not_mistaken_for_stale_history()
 def test_trace_disabled_has_no_runtime_dependencies(monkeypatch):
     monkeypatch.delenv("SGLANG_OASISKV_TRACE_CONFIG", raising=False)
     assert OasisKVTrace.from_environment(object()) is None
+
+
+def trace_startup_runner():
+    allocator = object()
+    return NS(
+        enable_hisparse=True,
+        is_draft_worker=False,
+        token_to_kv_pool_allocator=allocator,
+        hisparse_coordinator=NS(
+            is_dsv4_hisparse=True,
+            prefetcher=None,
+            prefetcher_name=None,
+            enable_prefetch=False,
+            skip_io=False,
+            token_to_kv_pool_allocator=allocator,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value,reason",
+    [
+        (None, None, "hisparse_coordinator is None"),
+        ("is_dsv4_hisparse", False, "is_dsv4_hisparse=False"),
+        ("prefetcher", object(), "prefetcher is builtins.object"),
+        ("enable_prefetch", True, "enable_prefetch=True"),
+        ("skip_io", True, "skip_io=True"),
+    ],
+)
+def test_startup_guard_identifies_each_actual_failure(field, value, reason):
+    model_runner = trace_startup_runner()
+    if field is None:
+        model_runner.hisparse_coordinator = None
+    else:
+        setattr(model_runner.hisparse_coordinator, field, value)
+    with pytest.raises(ValueError) as error:
+        validate_trace_hisparse(model_runner)
+    message = str(error.value)
+    assert reason in message
+    details = json.loads(message.split("; runtime: ", 1)[1])
+    assert details["runner_enable_hisparse"] is True
+    assert details["runner_allocator_type"] == "builtins.object"
+    if field == "enable_prefetch":
+        # A missing named prefetcher does not disable the legacy shared-index mode.
+        assert details["prefetcher_type"] is None
+        assert details["enable_prefetch"] is True
+
+
+def test_startup_guard_accepts_real_io_zero_environment(monkeypatch):
+    monkeypatch.setenv("SGLANG_DEBUG_HISPARSE_SKIP_IO", "0")
+    model_runner = trace_startup_runner()
+    model_runner.hisparse_coordinator.skip_io = envs.SGLANG_DEBUG_HISPARSE_SKIP_IO.get()
+    details = validate_trace_hisparse(model_runner)
+    assert details["skip_io"] is False
+    assert details["is_dsv4_hisparse"] is True
+
+
+@pytest.mark.parametrize("active_phase", [None, "decode", "prefill"])
+def test_trace_startup_uses_resolved_graph_backends(monkeypatch, active_phase):
+    from sglang.srt import runtime_context
+    from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
+    from sglang.srt.speculative import oasiskv_trace
+
+    graph = CudaGraphConfig.from_dict(
+        {"decode": {"backend": "disabled"}, "prefill": {"backend": "disabled"}}
+    )
+    if active_phase:
+        getattr(graph, active_phase).backend = "full"
+    # Deliberately contradict the legacy flag: resolved phases are authoritative.
+    monkeypatch.setattr(
+        runtime_context,
+        "get_exec",
+        lambda: NS(
+            graph=NS(cuda_graph_config=graph, disable_cuda_graph=bool(active_phase)),
+            moe=NS(enable_eplb=False),
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_context, "get_schedule", lambda: NS(disable_overlap_schedule=True)
+    )
+    monkeypatch.setattr(
+        runtime_context,
+        "get_parallel",
+        lambda: NS(enable_dp_attention=False, pp_size=1),
+    )
+    monkeypatch.setattr(oasiskv_trace, "target_state_tensors", lambda runner: [])
+    worker = NS(
+        gamma=7,
+        _oasiskv_lookahead=False,
+        _simulate_acc_len=0,
+        model_runner=trace_startup_runner(),
+        ps=NS(tp_rank=1),
+    )
+    config = {"verify_candidates": 1, "probes": [1, 2], "max_windows": 2}
+    with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+        if active_phase:
+            with pytest.raises(ValueError, match="ordinary DSPARK, eager"):
+                OasisKVTrace(worker, config)
+        else:
+            trace = OasisKVTrace(worker, config)
+            assert trace.coordinator is worker.model_runner.hisparse_coordinator
 
 
 def test_fixed_trace_does_not_need_confidence_head_but_backend_keeps_compact_mode():
