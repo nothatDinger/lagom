@@ -45,9 +45,20 @@ python benchmark/oasiskv/trace/run.py \
 已有本地实验分支时使用 `git switch exp/oasiskv-trace`。输出目录必须不存在，以防混合旧 trace。默认使用 GPU `0,1,2,3`；可通过 `--gpus` 修改。脚本顺序启动并关闭自己的服务进程，不连接或终止已有服务。每个模式共用同一份 `prompts.npy`，请求串行执行。
 
 启动检查读取最终解析的 decode/prefill graph backend，两者必须都是 `disabled`，不依赖旧的 `disable_cuda_graph` 标志。
+trace 在 `DSparkWorkerV2.alloc_memory_pool()` 完成 draft 池分配后构造，不在 worker 的 `__init__` 中构造。
+实际启动顺序是：加载 target/draft 权重 → target 池分配及 HiSparse coordinator 创建 → draft 池分配 →
+trace 校验/状态登记 → attention backend 初始化 → 服务接收请求。这里复用现有内存池生命周期，
+不跳过 real-IO / 禁止在线预取检查，也不推迟到第一条请求才发现错误。
+成功时 rank 0 日志包含 `OasisKV trace initialized after target/draft KV pool allocation.`，
+对应模式目录出现 `runtime.json` 和初始空的 `trace.jsonl.gz`；此时尚不代表采集成功。
 若 HiSparse 检查失败，异常中的 `failed` 列出具体失败条件，`runtime` 报告 coordinator/allocator 类型及各实际开关。
 `enable_hisparse=True` 不等于已创建 V4 coordinator；`prefetcher=None` 也不等于旧 shared-index `enable_prefetch=False`。
 该检查保持禁止在线预取及 skip-IO，不会为绕过启动错误而修改实验语义。检查成功后的状态也会写入 `runtime.json` 的 `hisparse_runtime`。
+
+`eb91f01a4` 及之前版本在 worker 构造时过早读取尚未分配的 coordinator/allocator，会在这里失败。
+升级后先用**新的输出目录**重跑上方 4K smoke；旧的 `manifest.json` 不是成功 trace，不可与新结果混用。
+只有 control/probes 均产生有效窗口记录、`audit.json` 为 `passed=true`，且 `analysis/report.json` 有匹配样本，
+才进入 16K/32K 正式采集。这个修复没有在本地 GPU 上验证，不据启动顺序回归宣称已有实验结果。
 
 `G` 从 DSPARK checkpoint 的配置中读取，启动时明确传入 `speculative_num_draft_tokens=G+1`，**不扩大训练 proposal 窗口**。默认 `P=[1,2,3]`，`V=G−3`。例如 G=7 时 V=4。若 checkpoint 的 G 太短，脚本会报错；可选 `--verify-candidates 2 --probes 1 2`，但必须满足 `V+max(P)≤G`。控制组与 probe 组使用相同的 G 和 V。
 
@@ -155,5 +166,6 @@ CPU 验证命令：
 
 ```bash
 PYTHONPATH=python SGLANG_USE_CPU_ENGINE=0 python -m pytest -q \
-  test/registered/unit/spec/test_oasiskv_trace.py
+  test/registered/unit/spec/test_oasiskv_trace.py \
+  test/registered/unit/spec/test_oasiskv_trace_startup.py
 ```

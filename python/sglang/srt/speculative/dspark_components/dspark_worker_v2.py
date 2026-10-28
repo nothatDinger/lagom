@@ -288,9 +288,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulate_acc_len=self._simulate_acc_len,
         )
 
-        from sglang.srt.speculative.oasiskv_trace import OasisKVTrace
-
-        self._oasiskv_trace = OasisKVTrace.from_environment(self)
+        # The scheduler has loaded weights, but target/draft KV pools and the
+        # target HiSparse coordinator do not exist yet. Bind the trace in
+        # alloc_memory_pool(), before any request can reach this worker.
+        self._oasiskv_trace = None
 
         self._forced_budget_frac: Optional[float] = None
         self._need_mamba_verify_commit = False
@@ -344,6 +345,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        # Scheduler.init_memory_pools() allocates the target first (including
+        # ModelRunner._init_post_memory_pool_components / HiSparse), then the
+        # draft. The complete target snapshot inventory is now available.
+        from sglang.srt.speculative.oasiskv_trace import OasisKVTrace
+
+        self._oasiskv_trace = OasisKVTrace.from_environment(self)
+        if self._oasiskv_trace is not None and self.ps.tp_rank == 0:
+            logger.info(
+                "OasisKV trace initialized after target/draft KV pool allocation."
+            )
 
     def init_attention_backends(self):
         with self._draft_context():
