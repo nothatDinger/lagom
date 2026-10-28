@@ -15,8 +15,10 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 
 class OasisKVAttnBackend(AttentionBackend):
     def __init__(self, model_runner):
-        self.req_pool = model_runner.req_to_token_pool
-        self.pool = model_runner.token_to_kv_pool
+        # ForwardContext and backend wrappers resolve pools by these standard
+        # names, including model-side decisions about fused KV writes.
+        self.req_to_token_pool = self.req_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = self.pool = model_runner.token_to_kv_pool
         self.cache = self.pool.oasiskv_cache
         self.graph_state = None
         self.graph_mode = False

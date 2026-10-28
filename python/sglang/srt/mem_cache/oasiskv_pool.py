@@ -6,6 +6,11 @@ from sglang.srt.mem_cache.oasiskv_cache import OasisKVCache
 
 
 class OasisKVPoolMixin:
+    # RoPE's fused store addresses a dense pool by out_cache_loc. OasisKV must
+    # append through its backend to maintain request/head pages, summaries and
+    # real/draft visibility (the DSA pool's latent buffer is only a placeholder).
+    supports_fused_set_kv_buffer = False
+
     def init_oasiskv(self, config, req_to_token_pool):
         self.oasiskv_cache = OasisKVCache(
             config, self.device, max_requests=req_to_token_pool.size

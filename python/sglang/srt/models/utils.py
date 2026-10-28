@@ -292,6 +292,10 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     `flash_layout=False`. See `create_fused_set_kv_buffer_arg` below.
     """
     pool = get_token_to_kv_pool()
+    # Some pools require backend-owned writes rather than a direct dense store.
+    # Check before both platform branches; BF16 dtype alone is not sufficient.
+    if not getattr(pool, "supports_fused_set_kv_buffer", True):
+        return False
     return (
         _is_cuda
         and pool.dtype == torch.bfloat16
