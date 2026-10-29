@@ -279,6 +279,39 @@ PYTHONPATH=python python -m pytest -q \
 
 Top-K 使用模型的原生设置，不用通用 Qwen 实验的 2048 代替 V4 的 indexer 配置。若 G=7、`index_topk=512`，默认驻留容量为 4096 个 C4 单元。现有普通 DSPARK 路径要求容量至少为 `(G+1)×index_topk`，以同时保留所有验证行的 KV；脚本遵守这一限制，不为制造 misses 而绕过它。三组容量相同，实际值写入 `runtime.json`。
 
+### 16K 首窗口误报 C4 4095 被淘汰
+
+GPU 测试方在 `c1d98fda2` 报告的 `references evicted C4 4095` **不能直接证明容量不足**。
+6 行各取 512 个 ID，其并集最多为 3072；3072 是最坏情况下的历史并集上界，不是“一有行间差异就不够”的临界值。
+请求的真实历史规模以 trace 的 `prefix_len/history_units` 为准，不能用不同层的 Top-K 并集大小代替全部历史。
+
+代码中有一个可在 CPU 使用真实 allocator/coordinator 复现的元数据缺口：
+
+- V4 allocator 裁剪长 prefill 时，把最后一个 C4 的物理位置保留在 `slot=device_buffer_size`，即 LRU 之外的 reserved slot。16K 对应的最后一个 ID 正是 4095。
+- coordinator 原来只登记前 3072 个 hot slot 的 token ID，reserved slot 的标签仍为 −1。换入 kernel 的 newest 快速路径返回该有效地址，trace 的元数据检查却认为 token 不在其中。
+- 已补齐标签，依据 allocator 裁剪前的物理映射验证该 KV 确实被保留。映射为空的 direct-to-host 路径不会被错误标记成已驻留。
+- 同一 token 可同时保留 hot/reserved 两份有效副本；guard 改为检查 `(token, physical_location)`，避免单个 `token→location` 字典覆盖另一份有效地址。真正的陈旧地址仍拒绝。
+
+这次修复不扩大物理容量，不改变 P、V、Top-K 或输入长度。reserved slot 原先已经存在。
+若仍报错，错误现在包含实际 `verify_width`、历史并集大小、hot 容量、返回地址、该 token 的已登记地址和该地址的登记 token，需据此区分真实淘汰与元数据不一致。
+一个窗口首先执行不含 probe 的 V 基线，因此“首窗口还没有 trace 就失败”也不能直接断言失败发生在 P=3 的六行 forward。
+
+可先在 GPU 上跑无需加载模型的实际 H2D kernel 回归：覆盖 4096/8192 历史、6×512 行选择、3072 hot slot，以及 newest 双副本；它检查最终所有 query 引用的 KV 字节仍正确。
+
+```bash
+PYTHONPATH=python python -m pytest -q \
+  test/registered/kernels/ops/kvcache/test_hisparse.py \
+  -k six_verify_rows_keep_live_kv
+
+python benchmark/oasiskv/trace/run.py --mode paired --topk-order logical-all \
+  --gpus 1,5,6,7 --port 31010 --input-lengths 16384 --output-length 32 \
+  --verify-candidates 2 --probes 1 2 3 --resident-units 3072 \
+  --requests 1 --max-windows 3 --diagnostics --request-timeout 1800 \
+  --output /srv/oasiskv/paired-16k-reserved-fixed --execute
+```
+
+16K 同进程 audit 通过后，再按原方案采集 32K。CPU 回归不代替上述 GPU kernel 和完整模型验证；4K 已有结果仍只作为全驻留 smoke。
+
 可用参数见 `python benchmark/oasiskv/trace/run.py --help`。`--max-windows` 是每个请求的采集上限；不会伪造接受长度来凑窗口。若生成太短、没有连续两个验证窗口，分析会拒绝给出结果。想覆盖生成中后期，应增加 `--output-length` 和 `--max-windows`，并相应增加 `--context-length`。
 
 ## 配对基线及独立参考组

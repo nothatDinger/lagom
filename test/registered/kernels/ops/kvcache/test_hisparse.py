@@ -2,7 +2,6 @@ import sys
 
 import pytest
 import torch
-
 from sglang.kernels.ops.kvcache.hisparse import (
     copy_cache_planned_mla,
     load_cache_to_device_buffer_dsv4_mla,
@@ -146,6 +145,105 @@ def _read_dsv4_token(cache: torch.Tensor, loc: int) -> torch.Tensor:
 
 def _dsv4_ptrs(cache: torch.Tensor) -> torch.Tensor:
     return torch.tensor([cache.data_ptr()], dtype=torch.uint64, device=DEVICE)
+
+
+@pytest.mark.parametrize("history", [4096, 8192])
+@pytest.mark.parametrize("duplicate_newest", [False, True])
+def test_v4_six_verify_rows_keep_live_kv_at_3072_capacity(history, duplicate_newest):
+    """Actual fused H2D kernel, 6x512 selections, fixed 3072 hot slots.
+
+    The reserved slot has the last prefill C4, as retained by the V4 allocator.
+    Later rows may also load a hot copy of that token after their C4 length grows.
+    """
+    from sglang.srt.speculative.oasiskv_trace import check_live_locations
+
+    hot, k, width = 3072, 512, 6
+    host = torch.zeros(
+        (history // DSV4_PAGE_SIZE, DSV4_PAGE_BYTES), dtype=torch.uint8, pin_memory=True
+    )
+    # Distinguishable low/high token bytes: unlike a repeating 8-bit pattern,
+    # this catches a wrong source that differs by 256 C4 units.
+    logical = torch.arange(history).view(-1, DSV4_PAGE_SIZE)
+    host[:, :DSV4_SCALE_OFFSET].view(-1, DSV4_PAGE_SIZE, DSV4_VALUE_BYTES).copy_(
+        (logical % 256).to(torch.uint8).unsqueeze(-1)
+    )
+    host[
+        :, DSV4_SCALE_OFFSET : DSV4_SCALE_OFFSET + DSV4_PAGE_SIZE * DSV4_SCALE_BYTES
+    ].view(-1, DSV4_PAGE_SIZE, DSV4_SCALE_BYTES).copy_(
+        (logical // 256).to(torch.uint8).unsqueeze(-1)
+    )
+    device = host[: hot // DSV4_PAGE_SIZE + 1].to(DEVICE)
+    # Retained newest at physical slot hot, outside the LRU range.
+    device[-1, :DSV4_VALUE_BYTES] = (history - 1) % 256
+    device[-1, DSV4_SCALE_OFFSET : DSV4_SCALE_OFFSET + DSV4_SCALE_BYTES] = (
+        history - 1
+    ) // 256
+    tokens = (
+        torch.cat((torch.arange(hot), torch.tensor([history - 1])))
+        .to(device=DEVICE, dtype=torch.int32)
+        .view(1, -1)
+    )
+    locations = torch.arange(hot + 1, device=DEVICE, dtype=torch.int32).view(1, -1)
+    lru = torch.arange(hot, device=DEVICE, dtype=torch.int16).view(1, -1)
+    raw = torch.arange(history - hot, history, dtype=torch.int32).view(width, k)
+    raw[0, 0], raw[-1, -1] = raw[-1, -1].clone(), raw[0, 0].clone()
+    if duplicate_newest:
+        raw[-1, 1] = history - 1
+    raw = raw.sort(-1).values.to(DEVICE)
+    output = torch.full_like(raw, -1)
+    req = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+    real_reqs = torch.ones(1, dtype=torch.int32, device=DEVICE)
+    host_locs = torch.arange(history + 1, dtype=torch.int64, device=DEVICE).view(1, -1)
+    host_locs[0, history] = -1  # Current-window C4 is resolved through scratch.
+    for row in range(width):
+        load_cache_to_device_buffer_dsv4_mla(
+            top_k_tokens=raw[row : row + 1],
+            device_buffer_tokens=tokens,
+            host_cache_locs=host_locs,
+            device_buffer_locs=locations,
+            host_cache=host,
+            device_buffer=device,
+            top_k_device_locs=output[row : row + 1],
+            req_pool_indices=req,
+            seq_lens=torch.tensor(
+                [history + (row >= 3)], dtype=torch.int32, device=DEVICE
+            ),
+            lru_slots=lru,
+            item_size_bytes=DSV4_ITEM_BYTES,
+            num_top_k=k,
+            hot_buffer_size=hot,
+            page_size=1,
+            num_real_reqs=real_reqs,
+        )
+    torch.cuda.synchronize()
+    selected, wanted = output.cpu(), raw.cpu()
+    check_live_locations(
+        wanted.tolist(),
+        selected.tolist(),
+        tokens[0].cpu().tolist(),
+        locations[0].cpu().tolist(),
+        history,
+        buffer_size=hot,
+    )
+    cache = device.cpu()
+    locs = selected.flatten().long()
+    values = cache[
+        locs[:, None] // DSV4_PAGE_SIZE,
+        (locs[:, None] % DSV4_PAGE_SIZE) * DSV4_VALUE_BYTES
+        + torch.arange(DSV4_VALUE_BYTES),
+    ]
+    scales = cache[
+        locs[:, None] // DSV4_PAGE_SIZE,
+        DSV4_SCALE_OFFSET
+        + (locs[:, None] % DSV4_PAGE_SIZE) * DSV4_SCALE_BYTES
+        + torch.arange(DSV4_SCALE_BYTES),
+    ]
+    assert torch.equal(
+        values, (wanted.flatten() % 256).to(torch.uint8)[:, None].expand_as(values)
+    )
+    assert torch.equal(
+        scales, (wanted.flatten() // 256).to(torch.uint8)[:, None].expand_as(scales)
+    )
 
 
 def _run_kernel(

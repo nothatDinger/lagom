@@ -3,7 +3,6 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-
 from sglang.srt.managers.hisparse_coordinator import (
     HiSparseCoordinator,
     HiSparseDSparkWindow,
@@ -11,6 +10,73 @@ from sglang.srt.managers.hisparse_coordinator import (
     dspark_fixed_buffer_commit_indices,
 )
 from sglang.srt.mem_cache.allocation import alloc_paged_token_slots_extend
+from sglang.srt.mem_cache.allocator.hisparse import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+)
+from sglang.srt.speculative.oasiskv_trace import check_live_locations
+
+
+@pytest.mark.parametrize("retained", [True, False])
+def test_v4_admission_registers_only_physically_retained_newest(retained):
+    # Exercise BOTH real allocator trimming and coordinator initialization.
+    # Scaled analogue of H=4096, hot=3072: the last prefill C4 lives outside LRU.
+    mapping = torch.arange(1, 8) if retained else torch.zeros(7, dtype=torch.int64)
+    allocator = DeepSeekV4HiSparseTokenToKVPoolAllocator.__new__(
+        DeepSeekV4HiSparseTokenToKVPoolAllocator
+    )
+    allocator.hisparse_page_size = 2
+    allocator.full_to_hisparse_device_index_mapping = mapping
+    allocator.hisparse_attn_allocator = SimpleNamespace(
+        alloc=lambda size: torch.arange(100, 100 + size),
+        free=MagicMock(),
+    )
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator.is_dsv4_hisparse = True
+    coordinator.device_buffer_size, coordinator.padded_buffer_size = 4, 6
+    coordinator.mem_pool_device = SimpleNamespace(
+        translate_loc_from_full_to_compressed=lambda _: torch.arange(7),
+        full_to_hisparse_device_index_mapping=mapping,
+    )
+    coordinator.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.arange(28).view(1, -1)
+    )
+    coordinator.token_to_kv_pool_allocator = allocator
+    coordinator.req_to_device_buffer = torch.full((1, 6), -1, dtype=torch.int32)
+    coordinator.req_device_buffer_size = torch.zeros(1, dtype=torch.int32)
+    coordinator.req_device_buffer_tokens = torch.full((2, 1, 6), -1, dtype=torch.int32)
+    coordinator.req_device_buffer_token_locs = torch.full(
+        (2, 1, 6), -1, dtype=torch.int32
+    )
+    coordinator._device_buffer_arange_i32 = torch.arange(4, dtype=torch.int32)
+    coordinator.alloc_device_buffer(
+        SimpleNamespace(req_pool_idx=0, extend_range=SimpleNamespace(end=28))
+    )
+    assert not mapping.any()  # Allocator cleared it; saved identity must survive.
+    assert (
+        coordinator.req_device_buffer_tokens[:, 0, 4] == (6 if retained else -1)
+    ).all()
+    if retained:
+        assert coordinator.req_to_device_buffer[0, 4] == 7
+        check_live_locations(
+            [[6]],
+            [[7]],
+            coordinator.req_device_buffer_tokens[0, 0].tolist(),
+            coordinator.req_device_buffer_token_locs[0, 0].tolist(),
+            7,
+            buffer_size=4,
+        )
+        # Reproduce the old false "capacity exceeded" rejection exactly.
+        old_tags = coordinator.req_device_buffer_tokens[0, 0].tolist()
+        old_tags[4] = -1
+        with pytest.raises(RuntimeError, match="inconsistent slot metadata"):
+            check_live_locations(
+                [[6]],
+                [[7]],
+                old_tags,
+                coordinator.req_to_device_buffer[0].tolist(),
+                7,
+                buffer_size=4,
+            )
 
 
 def test_dspark_spec_reservation_allocates_logical_kv_only(monkeypatch):

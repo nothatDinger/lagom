@@ -842,6 +842,18 @@ class HiSparseCoordinator:
         )
         compressed_len = len(compressed_logical_indices)
 
+        # V4's allocator retains the last prefill C4 in the reserved slot when
+        # trimming a long history. Preserve its physical identity before the
+        # allocator clears the logical mapping. A direct-to-host admission has
+        # no retained device KV (mapping == 0) and must not claim this hit.
+        retained_newest_loc = None
+        if self.is_dsv4_hisparse and compressed_len > self.device_buffer_size:
+            retained_newest_loc = (
+                self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                    compressed_logical_indices[-1]
+                ].clone()
+            )
+
         buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
             compressed_logical_indices, alloc_size
         )
@@ -865,6 +877,15 @@ class HiSparseCoordinator:
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
+        if retained_newest_loc is not None:
+            self.req_device_buffer_tokens[
+                :, req.req_pool_idx, self.device_buffer_size
+            ] = torch.where(
+                (retained_newest_loc > 0)
+                & (buffer_indices[self.device_buffer_size] == retained_newest_loc),
+                compressed_len - 1,
+                -1,
+            ).to(torch.int32)
 
     def _grow_device_buffers(
         self,

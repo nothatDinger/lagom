@@ -156,16 +156,45 @@ def resident_lookup(raw, tokens, locations):
     ]
 
 
-def check_live_locations(raw, selected, tokens, locations, history_units):
-    """Fail if a later verify row evicted KV still referenced by an earlier row."""
-    live = {token: loc for token, loc in zip(tokens, locations) if token >= 0}
+def check_live_locations(
+    raw, selected, tokens, locations, history_units, *, buffer_size=None
+):
+    """Check physical references, including valid hot/reserved duplicates.
+
+    A mismatched slot can be caused by eviction OR incomplete metadata. It does
+    not by itself prove that the selected history union exceeds capacity.
+    """
+    live = {
+        (token, loc) for token, loc in zip(tokens, locations) if token >= 0 and loc >= 0
+    }
     for row, (ids, physical) in enumerate(zip(raw, selected)):
         for token, loc in zip(ids, physical):
-            if 0 <= token < history_units and loc >= 0 and live.get(token) != loc:
+            if 0 <= token < history_units and loc >= 0 and (token, loc) not in live:
+                diagnostic = {
+                    "row": row,
+                    "token": token,
+                    "returned_location": loc,
+                    "live_locations_for_token": sorted(
+                        place for item, place in live if item == token
+                    ),
+                    "tokens_at_returned_location": sorted(
+                        item for item, place in live if place == loc
+                    ),
+                    "history_union_units": len(
+                        {
+                            item
+                            for values in raw
+                            for item in values
+                            if 0 <= item < history_units
+                        }
+                    ),
+                    "hot_buffer_size": buffer_size,
+                    "verify_width": len(raw),
+                }
                 raise RuntimeError(
-                    f"V4 verify row {row} references evicted C4 {token}; "
-                    "the active Top-K union exceeds safe residency. Increase "
-                    "device_buffer_size and label it as a different experiment."
+                    f"V4 verify row {row} references evicted C4 or inconsistent slot metadata for {token}: "
+                    + json.dumps(diagnostic, sort_keys=True)
+                    + "; inspect residency metadata before changing capacity"
                 )
 
 
@@ -370,7 +399,12 @@ class ForwardObservation:
                     result = original(**kwargs)
             tokens, locs = self.residency(layer)
             check_live_locations(
-                rows, result[:width].cpu().tolist(), tokens, locs, self.history_units
+                rows,
+                result[:width].cpu().tolist(),
+                tokens,
+                locs,
+                self.history_units,
+                buffer_size=getattr(coordinator, "device_buffer_size", None),
             )
             self.layers[layer] = {
                 "topk": rows,

@@ -357,6 +357,16 @@ def test_missing_probes_and_current_scratch_are_not_mistaken_for_stale_history()
     check_live_locations([[2, 10, 4]], [[10, -1, -1]], [2], [10], 10)
 
 
+def test_live_reference_accepts_both_hot_and_reserved_copies_but_not_stale_slots():
+    # A newer query may load the formerly-newest C4 into a hot slot, while the
+    # earlier query still references its valid reserved-slot copy.
+    check_live_locations([[7], [7]], [[10], [14]], [7, 7], [10, 14], 8, buffer_size=4)
+    with pytest.raises(RuntimeError, match='"history_union_units": 1') as error:
+        check_live_locations([[7]], [[10]], [6, 7], [10, 14], 8, buffer_size=4)
+    assert '"tokens_at_returned_location": [6]' in str(error.value)
+    assert '"hot_buffer_size": 4' in str(error.value)
+
+
 def test_trace_disabled_has_no_runtime_dependencies(monkeypatch):
     monkeypatch.delenv("SGLANG_OASISKV_TRACE_CONFIG", raising=False)
     assert OasisKVTrace.from_environment(object()) is None
