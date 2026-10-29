@@ -14,12 +14,13 @@ def resolve_lagom_topk(
     compressed_seq_lens: torch.Tensor,
     output_buffer: torch.Tensor,
 ) -> torch.Tensor:
-    """Demand-load real rows and queue only suffix logical IDs as cache hints.
+    """Refill real rows while future-row misses transfer on the side stream.
 
     The indexer has evaluated the target's per-layer hidden states for all
     W+P+1 rows. Forecast attention may use resident history and C4 transaction
-    scratch, but must not trigger demand IO. Publication happens only after the
-    worker commits the real prefix, when prefetch eviction is safe.
+    scratch, but must not wait for their own prefetch misses. The coordinator
+    protects the whole current read set and assigns disjoint refill/prefetch
+    destinations before launching either transfer.
     """
     batch_size = forward_batch.req_pool_indices.numel()
     decode_width = forward_batch.lagom_decode_width
@@ -29,35 +30,18 @@ def resolve_lagom_topk(
     if not 1 < decode_width < full_width:
         raise ValueError("Lagom CSA requires real candidates and a prediction suffix")
     capturing = getattr(forward_batch, "is_lagom_graph_capture", False)
-    prefix_lens_cpu = forward_batch.lagom_prefix_lens_cpu
-    if not capturing and (
-        prefix_lens_cpu is None or len(prefix_lens_cpu) != batch_size
-    ):
-        raise ValueError("Lagom CSA requires the committed prefix lengths")
-
-    result = coordinator.swap_in_lagom_pages(
+    if forward_batch.positions.numel() != batch_size * full_width:
+        raise ValueError("Lagom CSA requires one position per execution row")
+    # The anchor position is the committed prefix. This graph input changes
+    # on replay; CPU mirrors and reserved seq_lens are not valid graph inputs.
+    prefix_lens = forward_batch.positions.reshape(batch_size, full_width)[:, 0]
+    return coordinator.swap_in_lagom_pages(
         req_pool_indices=forward_batch.req_pool_indices,
         compressed_seq_lens=compressed_seq_lens,
         top_k_result=raw_indices,
         layer_id=layer_id,
         decode_width=decode_width,
         output_buffer=output_buffer,
+        source_prefix_lens=prefix_lens,
+        capturing=capturing,
     )
-    predictions = raw_indices.reshape(batch_size, full_width, -1)[:, decode_width:]
-    if capturing:
-        # Keep the final capture's graph-pool addresses, not the warmup
-        # allocations. Python descriptors and live identities are published
-        # after replay; queueing here would submit only once during capture.
-        pending = getattr(forward_batch, "_lagom_pending_prefetch", None)
-        if pending is None:
-            pending = forward_batch._lagom_pending_prefetch = {}
-        pending[layer_id] = (coordinator, predictions)
-        return result
-    coordinator.queue_lagom_prefetch(
-        req_pool_indices=forward_batch.req_pool_indices,
-        req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
-        source_committed_lens_cpu=prefix_lens_cpu,
-        predicted_c4_entries=predictions,
-        layer_id=layer_id,
-    )
-    return result

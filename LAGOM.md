@@ -55,12 +55,16 @@ DSPARK validates the requested `W` against the draft checkpoint's block size.
 model's `index_topk` supplies `K`; the legacy HiSparse `top_k` field does not
 override the DeepSeek-V4 indexer. If the device buffer size is omitted, it
 defaults to `2 * max(W+1, P) * K`. An explicit size must hold at least
-`max(W+1, P) * K` entries. The fused planner additionally requires this working
+`(W+P+1) * K` entries. The fused planner additionally requires this working
 set to be at most 8192 entries and the hot buffer to be at most 32768 entries.
 The example above assumes the model's usual `K=512`.
 
-Both demand loading and prefetch use the same fixed planner width, padding
-unused rows with invalid IDs so the persistent workspace keeps a stable layout.
+Demand loading and prefetch are planned together at the full `W+P+1` width.
+The cache must protect both sets simultaneously because their transfers run
+concurrently. The default buffer size is unchanged, but explicit sizes that
+only held the larger of the two windows are no longer sufficient. Pool sizing
+also reserves the persistent per-layer split-transfer plans and live-request
+counts used by CUDA Graph replay.
 
 Optional `prefetcher_config.size` limits the number of selected C4 entries from
 each prediction row. It defaults to `K` and must be between 1 and `K`. Reducing
@@ -74,22 +78,26 @@ discard the prefetched working set and is rejected in Lagom mode.
 
 1. DSPARK proposes `W+P` candidates. The target executes the anchor followed by
    all candidates with the normal causal relation.
-2. At each CSA layer, the first `W+1` rows use the existing one-shot demand
-   swap-in. The final `P` rows look up resident historical KV and current
-   transaction scratch; a prediction-row miss does not trigger demand H2D.
-   These rows therefore provide approximate future hidden states and Top-K
-   selections without adding their own synchronous KV loading.
-3. Acceptance uses only the original `W` candidates. The C4 transaction commits
+2. At each CSA layer, the indexer produces both windows' Top-K selections.
+   A single planner protects their union and assigns distinct destinations to
+   demand misses and prediction-only misses. A miss needed by both windows is
+   classified as demand, so it is loaded only once.
+3. The main stream refills the first `W+1` rows while a side stream prefetches
+   the final `P` rows' misses for the following verify. Prefetch starts as soon
+   as that layer's plan is ready, during the current verify; it does not wait
+   for acceptance or C4 commit. Future hints are restricted to history that
+   was already committed before this verify window.
+4. Prediction attention can use resident history, current demand loads, and
+   transaction scratch. It does not wait for its asynchronous prediction-only
+   transfers: those missing entries are excluded from its attention locations.
+   This provides approximate future hidden states without adding synchronous
+   H2D for the prediction suffix.
+5. Acceptance uses only the original `W` candidates. The C4 transaction commits
    accepted entries, restores speculative mappings, and rejects the suffix.
    Offline C128 state for unaccepted rows is cleared. Compressor rings and KV
    reservation are sized for the full physical execution window.
-4. After commit, each layer's prediction IDs become an asynchronous prefetch
-   task. Filtering, fused cache selection/deduplication, and H2D run on the side
-   stream. Tasks only load C4 entries already committed before the source
-   verify window, excluding speculative scratch and newly predicted entries.
-5. The next verify waits for the relevant layer's prefetch event before its
-   cache lookup. Subsequent layers' H2D can overlap earlier layers' target
-   computation and the preceding draft work. Request release drains outstanding
+6. The next verify waits for the relevant layer's prefetch event before reusing
+   its cache state and transfer plan. Request release drains outstanding
    transfers before host/device storage can be reused.
 
 Demand loading and prefetch share the persistent hash/CLOCK state from
@@ -105,17 +113,18 @@ CUDA graphs remain enabled by default for both target and draft. Their buffer
 and capture geometry use the physical execution widths: `W+P+1` for target and
 `W+P` for draft. Acceptance and scheduler transport retain `W+1`.
 
-The target graph retains stable per-layer prediction views. After replay, the
-runner queues only live, unpadded requests using their current request IDs and
-committed prefix lengths. Queue ownership protects prediction tensors from
-being overwritten by later replay. Prefetch submission still occurs after C4
-commit, outside capture.
+The target graph retains stable per-layer transfer plans and records a plan-ready
+event at each CSA layer before demand refill. A separate side-stream transfer
+graph is launched immediately after the target graph is enqueued. Each transfer
+waits on its layer's readiness event, allowing H2D to run while the target graph
+is still executing that verify. Live-request counts exclude padded graph rows;
+committed source lengths are derived from graph-updated device inputs.
 
 Persistent external CUDA events provide per-layer wait nodes inside the target
 graph. Side-stream prefetch records those events for the following replay;
-there is no global prefetch wait at target entry. The fused acceptance/commit
-epilogue is not used for Lagom because its original single-width buffers would
-mix the decoding and prediction boundaries.
+there is no global prefetch wait at target entry or foreground graph-tail join.
+The fused acceptance/commit epilogue is not used for Lagom because its original
+single-width buffers would mix the decoding and prediction boundaries.
 
 Use `--disable-cuda-graph` with the same launch command for an eager comparison.
 
@@ -146,6 +155,7 @@ python -m pytest -q \
   test/registered/unit/spec/test_lagom_windows.py \
   test/registered/unit/models/test_lagom_csa.py \
   test/registered/unit/managers/test_lagom_prefetch.py \
+  test/registered/unit/managers/test_lagom_commit_lifecycle.py \
   test/registered/unit/spec/test_lagom_cuda_graph.py \
   test/registered/unit/spec/test_lagom_graph_startup.py \
   test/registered/unit/managers/test_hisparse_dspark.py \
@@ -153,12 +163,14 @@ python -m pytest -q \
 ```
 
 CPU coverage exercises configuration, request-major window boundaries, cache
-ownership, graph publication, and stream dependencies with tensors/mocks. The
-graph test also includes a CUDA runtime case that is skipped without a GPU.
+ownership, C4 commit boundaries, split-transfer plans, graph launch, and stream
+dependencies with tensors/mocks. The graph test also includes a CUDA runtime
+case that is skipped without a GPU.
 These checks do not establish full-model GPU correctness, numerical parity, or
 throughput.
 
-On a CUDA machine, also exercise resident lookup and repeated graph/side-stream
+On a CUDA machine, also exercise union planning, demand/prefetch ownership,
+concurrent attention reads, resident lookup, and repeated graph/side-stream
 cache updates against reference KV bytes:
 
 ```bash
@@ -182,6 +194,7 @@ For GPU validation, run the same prompts with graphs enabled and with
   identical RNG consumption when additional draft candidates are generated.
 
 Use a CUDA profiler to check that prediction prefetch runs on the side stream
-and that waits occur at the consuming layer. Measure latency, demand H2D bytes,
+concurrently with the source verify, including with CUDA Graph enabled, and
+that waits occur at the consuming layer. Measure latency, demand H2D bytes,
 cache hits, and acceptance separately. This implementation does not include a
 GPU performance or prediction-accuracy claim.

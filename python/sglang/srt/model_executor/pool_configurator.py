@@ -754,6 +754,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             kvc.server_args.disaggregation_decode_extra_slots or 0
         )
         self.hisparse_spec_layout = None
+        self.hisparse_lagom_plan = False
         if kvc.server_args.enable_hisparse and not kvc.is_draft_worker:
             from sglang.srt.mem_cache.hisparse_spec import (
                 HiSparseSpecLayout,
@@ -780,7 +781,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 )
             ):
                 top_k = getattr(cfg.hf_text_config, "index_topk", hisparse_cfg.top_k)
-                work_width = (
+                # Keep the existing resident-buffer default while reserving
+                # metadata for the complete real + prediction planning union.
+                buffer_sizing_width = (
                     max(
                         kvc.server_args.speculative_num_draft_tokens or 0,
                         kvc.server_args.lagom_prefetch_tokens,
@@ -792,12 +795,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                     hisparse_cfg = resolve_dspark_device_buffer_size(
                         hisparse_cfg,
                         raw_hisparse_config=kvc.server_args.hisparse_config,
-                        verify_width=work_width,
+                        verify_width=buffer_sizing_width,
                         effective_top_k=top_k,
                     )
                 self.hisparse_spec_layout = HiSparseSpecLayout(
-                    hisparse_cfg.device_buffer_size, work_width, top_k
+                    hisparse_cfg.device_buffer_size, verify_width, top_k
                 )
+                self.hisparse_lagom_plan = kvc.server_args.is_lagom
         else:
             self.c4_shrink_factor = 1
         assert self.c4_shrink_factor >= 1
@@ -991,10 +995,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         num_reqs = min(
             estimated if requested is None else requested, token_capacity // 2
         )
-        return layout.fixed_state_bytes(
+        num_req_slots = self._get_num_req_slots(num_reqs)
+        fixed = layout.fixed_state_bytes(
             num_layers=self.num_layers_ca4,
-            num_req_slots=self._get_num_req_slots(num_reqs),
+            num_req_slots=num_req_slots,
         )
+        if getattr(self, "hisparse_lagom_plan", False):
+            fixed += layout.lagom_plan_bytes(
+                num_layers=self.num_layers_ca4, num_req_slots=num_req_slots
+            )
+        return fixed
 
     def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:
         full = sizes.full_max_total_num_tokens

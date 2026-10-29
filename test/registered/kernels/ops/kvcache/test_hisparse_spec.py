@@ -4,10 +4,13 @@ import pytest
 import torch
 
 from sglang.kernels.ops.kvcache.hisparse_spec import (
+    LagomCachePlan,
     allocate_hisparse_spec_states,
+    copy_lagom_cache_plan,
     initialize_hisparse_spec_state,
     load_cache_to_device_buffer_spec_mla,
     lookup_hisparse_spec_resident,
+    plan_lagom_cache,
 )
 from sglang.srt.mem_cache.hisparse_spec import HiSparseSpecLayout
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -20,6 +23,188 @@ pytestmark = pytest.mark.skipif(
 )
 
 PAGE_BYTES = ((584 * 64 + 575) // 576) * 576
+
+
+@pytest.mark.parametrize("prefetch_top_k", [8, 16])
+@pytest.mark.parametrize("graph_replay", [False, True])
+def test_lagom_union_plan_splits_concurrent_refill_and_prefetch(
+    prefetch_top_k, graph_replay
+):
+    """Real reads stay correct while future-only destinations are being copied."""
+    hot, width, decode_width, top_k, slots, host_rows = 128, 7, 3, 16, 3, 2048
+    active = hot + 3
+    capacity = width * top_k
+    locs = torch.arange(slots * (hot + 64), dtype=torch.int32, device="cuda").view(
+        1, slots, hot + 64
+    )
+    initial_locs = locs.clone()
+    tokens = torch.full_like(locs, -1)
+    state = allocate_hisparse_spec_states(
+        HiSparseSpecLayout(hot, width, top_k),
+        device_buffer_locs=locs,
+        scratch_offset=active,
+    )[0]
+    reqs = torch.tensor([2, 0, 1], dtype=torch.int64, device="cuda")
+    real = torch.tensor([2], dtype=torch.int32, device="cuda")
+    host = torch.empty(
+        (slots * host_rows // 64, PAGE_BYTES), dtype=torch.uint8, pin_memory=True
+    )
+    host.copy_(torch.arange(host.numel()).remainder(251).view_as(host))
+    device = torch.full(
+        (slots * (hot + 64) // 64, PAGE_BYTES), 165, dtype=torch.uint8, device="cuda"
+    )
+    host_locs = torch.arange(slots * host_rows, dtype=torch.int64, device="cuda").view(
+        slots, host_rows
+    )
+    selected = torch.empty((slots, width, top_k), dtype=torch.int32, device="cuda")
+    lengths = torch.full((slots * width,), host_rows, dtype=torch.int32, device="cuda")
+    output = torch.empty_like(selected)
+    samples = torch.empty_like(selected, dtype=torch.uint8)
+    plan = LagomCachePlan(
+        torch.empty((slots, capacity), dtype=torch.int64, device="cuda"),
+        torch.empty((slots, capacity), dtype=torch.int32, device="cuda"),
+        torch.empty(slots, dtype=torch.int32, device="cuda"),
+        torch.empty((slots, capacity), dtype=torch.int32, device="cuda"),
+    )
+    side = torch.cuda.Stream()
+
+    def reset(trial):
+        locs.copy_(initial_locs)
+        tokens.fill_(-1)
+        device.fill_(165)
+        for rid in (0, 2):
+            tokens[0, rid, :hot] = torch.arange(hot, device="cuda")
+            device[rid * 3 : rid * 3 + 2].copy_(
+                host[rid * (host_rows // 64) : rid * (host_rows // 64) + 2]
+            )
+        initialize_hisparse_spec_state(
+            device_buffer_tokens=tokens[0], req_pool_indices=reqs[:2], state=state
+        )
+        offset = 256 + trial * 128
+        selected[:, :decode_width] = (
+            torch.arange(decode_width * top_k, device="cuda")
+            .view(decode_width, top_k)
+            .add(offset)
+        )
+        selected[:, decode_width:] = (
+            torch.arange((width - decode_width) * top_k, device="cuda")
+            .view(width - decode_width, top_k)
+            .add(offset + 24)
+        )
+        selected[:, 0, 0] = 5  # Protected demand hit.
+        selected[:, -1, -1] = 9  # Protected forecast hit beyond the IO budget.
+        selected[:, -1, -2] = offset + 3  # Shared demand miss beyond the budget.
+        selected[:, 1, 1] = -1
+        selected[:, -1, 0] = host_rows  # Invalid forecast must not copy.
+        lengths.fill_(host_rows)
+        # A shorter causal boundary must not recover the same token from a
+        # real row's overflow miss while repairing physical locations.
+        lengths.view(slots, width)[:, decode_width + 1] = offset + 43
+
+    def make_plan():
+        return plan_lagom_cache(
+            top_k_tokens=selected,
+            device_buffer_tokens=tokens[0, :, :active],
+            host_cache_locs=host_locs,
+            device_buffer_locs=locs[0, :, :active],
+            host_cache=host,
+            device_buffer=device,
+            top_k_device_locs=output,
+            req_pool_indices=reqs,
+            seq_lens=lengths,
+            state=state,
+            num_real_reqs=real,
+            decode_width=decode_width,
+            prefetch_top_k=prefetch_top_k,
+            plan=plan,
+        )
+
+    def copy_and_read():
+        main = torch.cuda.current_stream()
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            copy_lagom_cache_plan(
+                plan,
+                demand=False,
+                num_real_reqs=real,
+                host_cache=host,
+                device_buffer=device,
+            )
+        copy_lagom_cache_plan(
+            plan, demand=True, num_real_reqs=real, host_cache=host, device_buffer=device
+        )
+        # Simulate attention reads before joining future H2D. These locations
+        # must all be resident hits or main-stream demand destinations.
+        safe = output.clamp_min(0).to(torch.int64)
+        samples.copy_(device.view(-1)[safe // 64 * PAGE_BYTES + safe % 64 * 576])
+        main.wait_stream(side)
+
+    reset(0)
+    make_plan()
+    copy_and_read()  # Compile the three specializations before capture.
+    graph = None
+    if graph_replay:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            make_plan()
+            copy_and_read()
+
+    for trial in range(4):
+        reset(trial)
+        before = device.clone()
+        if graph is None:
+            assert make_plan() is plan
+            torch.testing.assert_close(device, before)  # Planning moves no KV bytes.
+            copy_and_read()
+        else:
+            graph.replay()
+        torch.cuda.synchronize()
+        out_cpu, selected_cpu = output.cpu(), selected.cpu()
+        lengths_cpu = lengths.view(slots, width).cpu()
+        device_cpu, samples_cpu = device.cpu(), samples.cpu()
+        src, dst, count, demand = (x.cpu() for x in plan)
+        for bid, rid in enumerate((2, 0)):
+            real_tokens = set(selected_cpu[bid, :decode_width].flatten().tolist())
+            real_tokens = {token for token in real_tokens if 0 <= token < host_rows}
+            future_tokens = {
+                int(selected_cpu[bid, step, rank])
+                for step in range(decode_width, width)
+                for rank in range(prefetch_top_k)
+                if 0 <= int(selected_cpu[bid, step, rank]) < int(lengths_cpu[bid, step])
+            }
+            planned = {}
+            demand_dsts, future_dsts = set(), set()
+            for i in range(int(count[bid])):
+                token = int(src[bid, i]) - rid * host_rows
+                assert token not in planned  # Shared misses transfer only once.
+                planned[token] = int(dst[bid, i])
+                assert bool(demand[bid, i]) == (token in real_tokens)
+                (demand_dsts if demand[bid, i] else future_dsts).add(int(dst[bid, i]))
+                torch.testing.assert_close(
+                    item(device_cpu, int(dst[bid, i])), item(host, int(src[bid, i]))
+                )
+            assert demand_dsts.isdisjoint(future_dsts)
+            assert set(planned) == {t for t in real_tokens | future_tokens if t >= hot}
+            for step in range(width):
+                for rank in range(top_k):
+                    token = int(selected_cpu[bid, step, rank])
+                    location = int(out_cpu[bid, step, rank])
+                    readable = 0 <= token < int(lengths_cpu[bid, step]) and (
+                        token < hot or token in real_tokens
+                    )
+                    assert (location >= 0) == readable
+                    if readable:
+                        expected = item(host, rid * host_rows + token)
+                        torch.testing.assert_close(item(device_cpu, location), expected)
+                        assert int(samples_cpu[bid, step, rank]) == int(expected[0])
+            assert sorted(locs[0, rid].cpu().tolist()) == sorted(
+                initial_locs[0, rid].cpu().tolist()
+            )
+        assert int(count[2]) == 0
+        assert (out_cpu[2] == 0).all()
+        torch.testing.assert_close(
+            device[3:6], before[3:6]
+        )  # Padded request owns no IO.
 
 
 @pytest.mark.parametrize("degraded", [False, True])
@@ -141,7 +326,7 @@ def test_lagom_preserved_workspace_alternates_graph_verify_and_prefetch(
     )
     tokens = torch.full_like(locs, -1)
     state = allocate_hisparse_spec_states(
-        HiSparseSpecLayout(hot, max(decode_width, prediction_steps), top_k),
+        HiSparseSpecLayout(hot, full_width, top_k),
         device_buffer_locs=locs,
         scratch_offset=active,
     )[0]

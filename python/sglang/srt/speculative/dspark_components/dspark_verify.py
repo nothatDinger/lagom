@@ -320,7 +320,6 @@ class TargetVerifyExecutor:
         batch.seq_lens_sum = seq_lens_sum_backup
         if lagom_decode_width:
             verify_forward_batch.lagom_decode_width = lagom_decode_width
-            verify_forward_batch.lagom_prefix_lens_cpu = seq_lens_cpu_backup
 
         target_out = self.target_worker.forward_batch_generation(
             batch=None,

@@ -539,9 +539,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # absent from ordinary decode and speculative-verify batches.
     is_oasiskv_paired: bool = False
     # Lagom keeps the real W+1 rows separate from the disposable P-row suffix.
-    # Prefix lengths are captured before target metadata adds the full window.
+    # The anchor position supplies the committed prefix on both eager and graph paths.
     lagom_decode_width: int = 0
-    lagom_prefix_lens_cpu: Optional[torch.Tensor] = None
     is_lagom_graph_capture: bool = False
     # Capture-time batches use fixed all-valid paired rows.  This prevents the
     # indexer from performing data-dependent GPU->CPU masking while recording.

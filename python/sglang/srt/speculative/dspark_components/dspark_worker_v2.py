@@ -811,10 +811,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                         accept.commit_lens,
                         self._execution_width,
                     )
-                # The suffix only supplies hints. Publish after the C4 scratch
-                # transaction commits, so side-stream eviction cannot race its
-                # authoritative mapping updates or the current attention reads.
-                hisparse_coordinator.submit_lagom_prefetches()
+                # Per-layer prefetch already runs alongside target verify.
+                # Its protected history destinations are disjoint from these
+                # accepted C4 writes; commit needs no all-layer transfer wait.
 
         finally:
             if hisparse_window is not None and not hisparse_committed:
@@ -835,10 +834,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                             torch.zeros_like(prefix_lens),
                             self._execution_width,
                         )
-            if self._lagom:
-                # Also clears descriptors if target forward or commit raised.
-                # Successful submission has already transferred their ownership.
-                hisparse_coordinator.discard_lagom_prefetches()
 
         if on_publish is not None:
             if confidence is not None:

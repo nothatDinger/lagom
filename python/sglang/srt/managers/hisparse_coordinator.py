@@ -13,10 +13,12 @@ from sglang.kernels.ops.kvcache.hisparse import (
     transfer_cache_dsv4_mla,
 )
 from sglang.kernels.ops.kvcache.hisparse_spec import (
+    LagomCachePlan,
     allocate_hisparse_spec_states,
+    copy_lagom_cache_plan,
     initialize_hisparse_spec_state,
     load_cache_to_device_buffer_spec_mla,
-    lookup_hisparse_spec_resident,
+    plan_lagom_cache,
 )
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
@@ -24,6 +26,7 @@ from sglang.srt.managers.hisparse_prefetcher import (
     create_hisparse_prefetcher,
     validate_hisparse_prefetcher,
 )
+from sglang.srt.managers.lagom_graph import LagomPrefetchGraphs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -154,20 +157,6 @@ class HiSparseTokenStats(NamedTuple):
     device_token_usage: float
     host_tokens: int
     host_token_usage: float
-
-
-@dataclass
-class LagomPrefetch:
-    """One layer's advisory forecast, with scheduler-owned CPU identity."""
-
-    req_slots: torch.Tensor
-    generations: torch.Tensor
-    source_lens: torch.Tensor
-    req_indices: torch.Tensor
-    predicted_entries: torch.Tensor
-    ready: object
-    completion: object = None
-    consumed: bool = False
 
 
 @dataclass
@@ -482,12 +471,7 @@ class HiSparseCoordinator:
             self._spec_states = allocate_hisparse_spec_states(
                 HiSparseSpecLayout(
                     device_buffer_size,
-                    max(
-                        speculative_verify_width - self._lagom_prediction_steps,
-                        self._lagom_prediction_steps,
-                    )
-                    if lagom
-                    else speculative_verify_width,
+                    speculative_verify_width,
                     top_k,
                 ),
                 device_buffer_locs=self.req_device_buffer_token_locs,
@@ -629,16 +613,41 @@ class HiSparseCoordinator:
                 max_num_req_slots, dtype=torch.int32, device=device
             )
             self._previous_prefetch_stream = device_module.Stream()
-            self._lagom_pending: Dict[int, LagomPrefetch] = {}
-            self._lagom_inflight: Dict[int, LagomPrefetch] = {}
-            self._lagom_layer_events = None
+            self._lagom_graphs = None
+            self._lagom_plans = None
+            self._lagom_real_counts = None
             if lagom:
-                self._lagom_layer_events = [
-                    device_module.Event(external=True)
-                    for _ in range(self.mem_pool_device.layer_num)
+                self._lagom_graphs = LagomPrefetchGraphs(self._previous_prefetch_stream)
+                occurrences = speculative_verify_width * self.top_k
+                self._lagom_plans = [
+                    LagomCachePlan(
+                        miss_src=torch.zeros(
+                            (max_num_req_slots, occurrences),
+                            dtype=torch.int64,
+                            device=device,
+                        ),
+                        miss_dst=torch.zeros(
+                            (max_num_req_slots, occurrences),
+                            dtype=torch.int32,
+                            device=device,
+                        ),
+                        miss_count=torch.zeros(
+                            max_num_req_slots, dtype=torch.int32, device=device
+                        ),
+                        is_demand=torch.zeros(
+                            (max_num_req_slots, occurrences),
+                            dtype=torch.int32,
+                            device=device,
+                        ),
+                    )
+                    for _ in range(layer_num)
                 ]
-                for event in self._lagom_layer_events:
-                    event.record(device_module.current_stream())
+                # The next batch may overwrite the scheduler's shared scalar
+                # before the previous side graph has reached its later layers.
+                self._lagom_real_counts = [
+                    torch.zeros(1, dtype=torch.int32, device=device)
+                    for _ in range(layer_num)
+                ]
             self._previous_prefetch_event = device_module.Event()
             self._previous_prefetch_target_layer = None
             self._previous_prefetch_num_reqs = 0
@@ -1845,199 +1854,122 @@ class HiSparseCoordinator:
         self._oasiskv_next_slot[layer_id] = 1 - ring_slot
         return self._oasiskv_ring[layer_id][ring_slot]
 
-    def queue_lagom_prefetch(
-        self,
-        *,
-        req_pool_indices: torch.Tensor,
-        req_pool_indices_cpu: torch.Tensor,
-        source_committed_lens_cpu: torch.Tensor,
-        predicted_c4_entries: torch.Tensor,
-        layer_id: int,
-    ) -> None:
-        """Retain a layer forecast until accepted C4 promotion has completed.
-
-        Snapshot request-major [B, P, K] outputs before a subsequent CUDA Graph
-        replay may overwrite them. No cache planning or IO is launched here.
-        """
-        if self.prefetcher_name != "lagom" or self.prefetcher is None:
-            raise RuntimeError("Lagom forecasts require the lagom prefetcher")
-        if (
-            req_pool_indices_cpu.device.type != "cpu"
-            or source_committed_lens_cpu.device.type != "cpu"
-        ):
-            raise ValueError("Lagom requires scheduler-owned CPU metadata")
-        batch = req_pool_indices.numel()
-        if predicted_c4_entries.shape != (
-            batch,
-            self._lagom_prediction_steps,
-            self.top_k,
-        ):
-            raise ValueError(
-                "Lagom prediction shape must be [batch, prediction_steps, top_k]"
-            )
-        if (
-            req_pool_indices_cpu.numel() != batch
-            or source_committed_lens_cpu.numel() != batch
-        ):
-            raise ValueError("Lagom forecast identities must match the request count")
-        slots = req_pool_indices_cpu.to(torch.int64).clone()
-        ready = device_module.Event()
-        # A scheduler may reuse its device identity vector while the side
-        # stream runs. Own this small vector; layer predictions are fresh.
-        req_indices = req_pool_indices.to(torch.int64).clone()
-        predicted_c4_entries = predicted_c4_entries.clone()
-        ready.record(device_module.current_stream())
-        self._lagom_pending[layer_id] = LagomPrefetch(
-            req_slots=slots,
-            generations=self._prefetch_generation[slots].clone(),
-            source_lens=source_committed_lens_cpu.to(torch.int64).clone(),
-            req_indices=req_indices,
-            predicted_entries=predicted_c4_entries,
-            ready=ready,
-        )
-
-    def submit_lagom_prefetches(self) -> None:
-        """Warm future verify working sets on the side stream after C4 commit.
-
-        Selection, history filtering, hash/CLOCK maintenance, and H2D all run
-        off the target stream. The ordinary fused engine owns both real and
-        predicted residency, so its persistent hash never diverges from KV.
-        """
-        pending = getattr(self, "_lagom_pending", None)
-        if not pending:
-            return
-        if self._active_dspark_window is not None:
-            raise RuntimeError("Lagom prefetch must follow C4 commit or rollback")
-        self._lagom_pending = {}
-        stream = self._previous_prefetch_stream
-        stream.wait_stream(device_module.current_stream())
-        for layer_id, task in pending.items():
-            if not torch.equal(
-                task.generations, self._prefetch_generation[task.req_slots]
-            ):
-                self.prefetcher.stats.stale_tasks += 1
-                continue
-            task.ready.wait(stream)
-            for tensor in (task.req_indices, task.predicted_entries):
-                tensor.record_stream(stream)
-            task.completion = self._lagom_layer_events[layer_id]
-            # Retain completion even after a consumer enqueues its wait: host
-            # page reclamation must wait for actual DMA completion.
-            self._lagom_inflight[layer_id] = task
-            with device_module.stream(stream):
-                try:
-                    batch, steps, _ = task.predicted_entries.shape
-                    # Only history committed before this verify is predicted.
-                    # Rejected probes and unaccepted C4 writers never become
-                    # host-cache sources, irrespective of acceptance length.
-                    lengths = (task.source_lens // self.compress_ratio).to(
-                        device=self.device, dtype=torch.int32, non_blocking=True
-                    )
-                    candidates = task.predicted_entries.to(torch.int32).contiguous()
-                    candidates.masked_fill_(
-                        (candidates < 0) | (candidates >= lengths[:, None, None]), -1
-                    )
-                    if self.prefetcher.logical_entries < self.top_k:
-                        candidates[:, :, self.prefetcher.logical_entries :].fill_(-1)
-                    real_reqs = torch.full(
-                        (1,), batch, dtype=torch.int32, device=self.device
-                    )
-                    output = torch.empty_like(candidates)
-                    self._run_swap_in_verify_window(
-                        req_pool_indices=task.req_indices,
-                        compressed_seq_lens=lengths,
-                        top_k_result=candidates.reshape(-1, self.top_k),
-                        layer_id=layer_id,
-                        verify_width=steps,
-                        output_buffer=output,
-                        num_real_reqs=real_reqs,
-                    )
-                    entries = batch * steps * self.prefetcher.logical_entries
-                    self.prefetcher.stats.selected_entries += entries
-                    self.prefetcher.stats.submitted_entries += entries
-                finally:
-                    task.completion.record(stream)
-
     def consume_lagom_prefetch(self, layer_id: int) -> None:
-        """Join a layer's writer only when real attention needs its residency."""
-        # Always record this dependency, including CUDA Graph capture. An
-        # external event is re-recorded by every post-replay side-stream task.
-        self._lagom_layer_events[layer_id].wait(device_module.current_stream())
-        task = getattr(self, "_lagom_inflight", {}).get(layer_id)
-        if task is not None and not task.consumed:
-            task.consumed = True
-            self.prefetcher.stats.prefetch_wait_submissions += 1
-
-    def discard_lagom_prefetches(self) -> None:
-        """Abort unsubmitted forecasts; submitted tasks retain their drain events."""
-        if hasattr(self, "_lagom_pending"):
-            self._lagom_pending = {}
+        """Join only this layer before reusing its plan and resident slots."""
+        self._lagom_graphs.consume_layer(layer_id)
 
     def _drain_lagom_before_request_release(self, req_pool_idx: int) -> None:
-        pending = getattr(self, "_lagom_pending", {})
-        for layer_id, task in list(pending.items()):
-            if bool((task.req_slots == req_pool_idx).any()):
-                del pending[layer_id]
-        # The shared side stream serializes all generations. Draining every
-        # retained latest layer event also covers older tasks replaced by a
-        # new batch, including requests absent from that replacement batch.
-        inflight = getattr(self, "_lagom_inflight", {})
-        for task in inflight.values():
-            task.completion.synchronize()
-        inflight.clear()
+        # Host-page reclamation needs CPU completion, not an enqueued GPU wait.
+        # Plans contain absolute host/device addresses and may include any live
+        # request. Drain retained layer writers before allocator slot reuse.
+        pipeline = getattr(self, "_lagom_graphs", None)
+        if pipeline is not None:
+            pipeline.synchronize()
 
     def swap_in_lagom_pages(
         self,
         *,
         req_pool_indices: torch.Tensor,
         compressed_seq_lens: torch.Tensor,
+        source_prefix_lens: torch.Tensor,
         top_k_result: torch.Tensor,
         layer_id: int,
         decode_width: int,
+        capturing: bool = False,
         output_buffer: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Resolve real verify rows and read resident history for forecast rows."""
+        """Plan one protected union, then refill and prefetch on separate streams.
+
+        The planner mutates hash/CLOCK metadata once and pins the union of real
+        and forecast selections. Its two transfer subsets have disjoint physical
+        destinations: current attention never reads a future-only miss while the
+        side stream writes it. Shared misses belong to the real window.
+        """
         batch = req_pool_indices.numel()
         width = decode_width + self._lagom_prediction_steps
-        if top_k_result.shape != (batch * width, self.top_k):
-            raise ValueError(
-                "Lagom indexer rows must contain decode then prediction windows"
-            )
+        if width != self._speculative_verify_width or top_k_result.shape != (
+            batch * width,
+            self.top_k,
+        ):
+            raise ValueError("Lagom indexer rows must contain the fixed full window")
+        if source_prefix_lens.shape != (batch,):
+            raise ValueError("Lagom needs one committed device prefix per request")
         self.consume_lagom_prefetch(layer_id)
         raw = top_k_result.reshape(batch, width, self.top_k)
+        tokens = raw.clone()
+        history = (source_prefix_lens // self.compress_ratio).to(torch.int32)
+        probes = tokens[:, decode_width:]
+        probes.masked_fill_((probes < 0) | (probes >= history[:, None, None]), -1)
         lengths = compressed_seq_lens.reshape(batch, -1)
         if lengths.shape[1] == 1:
             lengths = lengths.expand(batch, width)
         if lengths.shape[1] != width:
             raise ValueError("Lagom needs one compressed length per request or query")
-        real = raw[:, :decode_width].contiguous()
-        real_output = torch.empty_like(real, dtype=torch.int32)
-        self._run_swap_in_verify_window(
-            req_pool_indices=req_pool_indices,
-            compressed_seq_lens=lengths[:, :decode_width].contiguous(),
-            top_k_result=real.reshape(-1, self.top_k),
-            layer_id=layer_id,
-            verify_width=decode_width,
-            output_buffer=real_output,
-        )
-        probes = raw[:, decode_width:].contiguous()
-        probe_output = torch.empty_like(probes, dtype=torch.int32)
-        active = self._pr_verify_layout["active_slots"]
-        lookup_hisparse_spec_resident(
-            top_k_tokens=probes,
-            device_buffer_tokens=self.req_device_buffer_tokens[layer_id, :, :active],
-            device_buffer_locs=self.req_device_buffer_token_locs[layer_id, :, :active],
-            req_pool_indices=req_pool_indices,
-            seq_lens=lengths[:, decode_width:].contiguous(),
-            state=self._spec_states[layer_id],
-            num_real_reqs=self.num_real_reqs,
-            output=probe_output,
-        )
+        lengths = lengths.to(torch.int32).contiguous().clone()
+        lengths[:, decode_width:] = history[:, None]
         if output_buffer is None:
             output_buffer = torch.empty_like(top_k_result, dtype=torch.int32)
-        output = output_buffer.reshape(batch, width, self.top_k)
-        output[:, :decode_width].copy_(real_output)
-        output[:, decode_width:].copy_(probe_output)
+        persistent = self._lagom_plans[layer_id]
+        plan = LagomCachePlan(*(tensor[:batch] for tensor in persistent))
+        real_count = self._lagom_real_counts[layer_id]
+        real_count.copy_(self.num_real_reqs)
+        active = self._pr_verify_layout["active_slots"]
+        try:
+            plan_lagom_cache(
+                top_k_tokens=tokens,
+                device_buffer_tokens=self.req_device_buffer_tokens[
+                    layer_id, :, :active
+                ],
+                host_cache_locs=self.req_to_host_pool,
+                device_buffer_locs=self.req_device_buffer_token_locs[
+                    layer_id, :, :active
+                ],
+                host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                top_k_device_locs=output_buffer.view(batch, width, self.top_k),
+                req_pool_indices=req_pool_indices.to(torch.int64),
+                seq_lens=lengths.view(-1),
+                state=self._spec_states[layer_id],
+                num_real_reqs=real_count,
+                decode_width=decode_width,
+                prefetch_top_k=self.prefetcher.logical_entries,
+                plan=plan,
+                transfer_kind="dsv4_paged",
+                item_size_bytes=self.item_size_bytes,
+            )
+
+            def transfer():
+                copy_lagom_cache_plan(
+                    plan,
+                    demand=False,
+                    num_real_reqs=real_count,
+                    host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                    device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                    transfer_kind="dsv4_paged",
+                    item_size_bytes=self.item_size_bytes,
+                )
+
+            # Record readiness BEFORE demand IO. Eager launches immediately; graph
+            # mode captures a separate transfer graph and launches it immediately
+            # after the foreground graph enqueue, released by each layer's event.
+            self._lagom_graphs.plan_ready(
+                layer_id, batch, transfer, capturing=capturing
+            )
+            copy_lagom_cache_plan(
+                plan,
+                demand=True,
+                num_real_reqs=real_count,
+                host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                transfer_kind="dsv4_paged",
+                item_size_bytes=self.item_size_bytes,
+            )
+        except Exception as error:
+            # Planning publishes residency before IO. A launch failure cannot
+            # be retried against that state: a partial copy would look like a
+            # hit. Keep completion events drainable, but require a fresh cache.
+            self._lagom_graphs.fail(error)
+            raise
         return output_buffer
 
     def consume_ema_prefetch(self) -> None:
@@ -2312,6 +2244,10 @@ class HiSparseCoordinator:
             )
         if skip_io or self.skip_io:
             raise ValueError("pr_fused cannot skip KV IO")
+        if getattr(self, "_lagom_prediction_steps", 0):
+            # Ordinary decode/speculative fallback shares the union planner's
+            # metadata and physical slots, including across graph/eager switches.
+            self.consume_lagom_prefetch(layer_id)
         self._invalidate_hot_buffer_residency(req_pool_indices, layer_id)
         num_reqs = req_pool_indices.numel()
         active = self._pr_verify_layout["active_slots"]
@@ -2322,9 +2258,7 @@ class HiSparseCoordinator:
         output = output_buffer.view(num_reqs, verify_width, self.top_k)
         prediction_steps = getattr(self, "_lagom_prediction_steps", 0)
         planning_width = (
-            max(self._speculative_verify_width - prediction_steps, prediction_steps)
-            if prediction_steps
-            else verify_width
+            self._speculative_verify_width if prediction_steps else verify_width
         )
         if verify_width > planning_width:
             raise ValueError(
@@ -2334,7 +2268,7 @@ class HiSparseCoordinator:
             # The persistent miss workspace partitions table/index/compact
             # arrays by NUM_STEPS * TOP_K. Alternating W+1 and P without this
             # padding would reinterpret old compact metadata as tagged hash
-            # entries. Keep one kernel geometry for real, forecast, and decode
+            # entries. Keep one kernel geometry for union plans and decode
             # fallback calls; padded rows cannot read or mutate residency.
             padded_tokens = torch.full(
                 (num_reqs, planning_width, self.top_k),

@@ -3,7 +3,8 @@
 // Extracted from perf/hisparse-h2d-diagnosis at 3f9ff3a49.
 // PR #40670 (70bc9e9a) gather/commit and initialization, including the
 // CAS retry-budget correction from cbaea63b2; accepted-C4 finalization stays
-// with HiSparseCoordinator. Kernel bodies and launch shapes are preserved.
+// with HiSparseCoordinator. Lagom separates union planning from disjoint
+// demand/prefetch transfers while preserving the ordinary fused IO path.
 
 #include <sgl_kernel/tensor.h>  // TensorMatcher and symbolic tensor validation
 #include <sgl_kernel/utils.h>   // RuntimeCheck and host utilities
@@ -32,6 +33,7 @@ constexpr int32_t COMPACT_HASH_BITS = 13;
 constexpr int32_t COMPACT_HASH_MASK = (1 << COMPACT_HASH_BITS) - 1;
 constexpr int32_t COMPACT_APPROX_CLAIM_FLAG = int32_t{1} << 29;
 constexpr int32_t COMPACT_APPROX_ADMIT_FLAG = int32_t{1} << 30;
+constexpr int32_t COMPACT_DEMAND_FLAG = int32_t{1} << 28;
 constexpr int32_t APPROX_ADMISSION_STEPS = 1;
 constexpr int32_t CLOCK_VICTIM_SAMPLES = 6;
 constexpr uint32_t HASH_DEGRADED_FLAG = uint32_t{1} << 31;
@@ -348,6 +350,8 @@ template <
     int HOT_BUFFER_SIZE,
     int NUM_STEPS,
     bool RecordMissPlan,
+    int DecodeWidth,
+    int PrefetchTopK,
     typename KVTransferPolicy>
 __global__ void load_cache_to_device_buffer_spec_gather_kernel(
     const int32_t* __restrict__ top_k_tokens,
@@ -460,7 +464,7 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
         req_ring_hash_keys, req_ring_hash_vals, cache_state.hash_size, token, req_device_buffer_tokens, hash_degraded);
     if (cache_slot >= 0) {
       loc = req_device_buffer_locs[cache_slot];
-    } else {
+    } else if (DecodeWidth == 0 || occ < DecodeWidth * NUM_TOP_K || occ % NUM_TOP_K < PrefetchTopK) {
       src_loc = req_host_cache_locs[token];
       if (src_loc >= 0) {
         int32_t hash_pos = hash_slot(token, static_cast<int>(total_occurrences));
@@ -476,7 +480,8 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
               if constexpr (RecordMissPlan) {
                 miss_idx = unique_idx;
               }
-              req_compact_hash_positions[unique_idx] = hash_pos;
+              req_compact_hash_positions[unique_idx] =
+                  hash_pos | (DecodeWidth > 0 && occ < DecodeWidth * NUM_TOP_K ? COMPACT_DEMAND_FLAG : 0);
               __threadfence();
               atomicExch(req_scratch_indices + hash_pos, epoch_bits | static_cast<uint32_t>(unique_idx));
               if (unique_idx < miss_workspace.loc_capacity) {
@@ -495,6 +500,13 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
               index_entry = atomicCAS(req_scratch_indices + hash_pos, 0ull, 0ull);
             }
             const int32_t unique_idx = static_cast<int32_t>(static_cast<uint32_t>(index_entry));
+            if constexpr (DecodeWidth > 0) {
+              if (occ < DecodeWidth * NUM_TOP_K) {
+                // A forecast lane may win the first claim. Any real query
+                // promotes that unique miss to the main-stream copy plan.
+                atomicOr(req_compact_hash_positions + unique_idx, COMPACT_DEMAND_FLAG);
+              }
+            }
             if (unique_idx < miss_workspace.loc_capacity) {
               loc = req_scratch_locs[unique_idx];
             }
@@ -535,7 +547,9 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
           miss_dst_out[bid * plan_stride + copy_miss_idx] = copy_loc;
         }
       }
-      KVTransferPolicy::copy_warp(lane_id, host_cache_k, device_buffer_k, copy_src_loc, static_cast<int64_t>(copy_loc));
+      if constexpr (DecodeWidth == 0) {
+        KVTransferPolicy::copy_warp(lane_id, host_cache_k, device_buffer_k, copy_src_loc, static_cast<int64_t>(copy_loc));
+      }
     }
     copy_mask &= ~(static_cast<BallotMask>(1) << owner_lane);
   }
@@ -546,6 +560,7 @@ template <
     int HOT_BUFFER_SIZE,
     int NUM_STEPS,
     bool RecordMissPlan,
+    int DecodeWidth,
     typename KVTransferPolicy,
     bool USE_PDL>
 __global__ void load_cache_to_device_buffer_spec_commit_kernel(
@@ -557,12 +572,14 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
     const void* __restrict__ host_cache_k,
     void* __restrict__ device_buffer_k,
     const int64_t* __restrict__ req_pool_indices,
+    const int32_t* __restrict__ seq_lens,
     SpecCacheState cache_state,
     SpecMissWorkspace miss_workspace,
     const int32_t* __restrict__ num_real_reqs,
     int64_t* __restrict__ miss_src_out,
     int32_t* __restrict__ miss_dst_out,
     int32_t* __restrict__ miss_count_out,
+    int32_t* __restrict__ miss_is_demand_out,
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
     int64_t buffer_stride_0,
@@ -606,6 +623,29 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
   const bool scratch_overflow = miss_count > miss_workspace.loc_capacity;
   const int64_t compact_iterations = (miss_count + blockDim.x - 1) / blockDim.x;
   const bool lock_free_single_pass = compact_iterations == 1;
+
+  if constexpr (DecodeWidth > 0) {
+    // This is still the gather's unique-index view: commit below may replace
+    // overflow indices with physical locations. Keep resident hits and shared
+    // demand misses visible to forecast attention, but mark future-only misses
+    // unreadable while their H2D runs concurrently on the side stream.
+    for (int64_t occ = DecodeWidth * NUM_TOP_K + threadIdx.x; occ < total_occurrences; occ += blockDim.x) {
+      const int32_t token = req_top_k_tokens[occ];
+      if (token < 0 || token >= seq_lens[bid * NUM_STEPS + occ / NUM_TOP_K]) continue;
+      const int32_t unique_idx = scratch_union_lookup(
+          req_scratch_table, req_scratch_indices, static_cast<int32_t>(total_occurrences),
+          static_cast<uint32_t>(scratch_epoch), token);
+      if (unique_idx < 0) continue;
+      if ((req_compact_hash_positions[unique_idx] & COMPACT_DEMAND_FLAG) == 0) {
+        req_top_k_device_locs[occ] = -2;
+      } else if (unique_idx < miss_workspace.loc_capacity) {
+        // Also recover a shared demand miss when this forecast rank lies
+        // outside the optional prefetch budget and did not claim a miss.
+        req_top_k_device_locs[occ] = req_scratch_locs[unique_idx];
+      }
+    }
+    __syncthreads();
+  }
 
   // The union fast path can preserve every token needed by this speculative group.
   // Its victim selection below partitions the ring by miss ordinal, avoiding
@@ -813,7 +853,9 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
             miss_dst_out[bid * plan_stride + miss_idx] = dst_loc;
           }
         }
-        KVTransferPolicy::copy_warp(lane_id, host_cache_k, device_buffer_k, src_loc, static_cast<int64_t>(dst_loc));
+        if constexpr (DecodeWidth == 0) {
+          KVTransferPolicy::copy_warp(lane_id, host_cache_k, device_buffer_k, src_loc, static_cast<int64_t>(dst_loc));
+        }
       }
       copy_mask &= ~(static_cast<BallotMask>(1) << owner_lane);
     }
@@ -822,11 +864,11 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
   __syncthreads();
   if (scratch_overflow) {
     for (int64_t occ = threadIdx.x; occ < total_occurrences; occ += blockDim.x) {
-      if (req_top_k_device_locs[occ] >= 0) {
+      if (req_top_k_device_locs[occ] >= 0 || req_top_k_device_locs[occ] == -2) {
         continue;
       }
       const int32_t token = req_top_k_tokens[occ];
-      if (token < 0) {
+      if (token < 0 || token >= seq_lens[bid * NUM_STEPS + occ / NUM_TOP_K]) {
         continue;
       }
 
@@ -851,6 +893,15 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
     }
   }
 
+  if constexpr (DecodeWidth > 0) {
+    for (int32_t i = threadIdx.x; i < miss_count; i += blockDim.x) {
+      miss_is_demand_out[bid * plan_stride + i] =
+          (req_compact_hash_positions[i] & COMPACT_DEMAND_FLAG) != 0;
+    }
+    for (int64_t occ = DecodeWidth * NUM_TOP_K + threadIdx.x; occ < total_occurrences; occ += blockDim.x) {
+      if (req_top_k_device_locs[occ] == -2) req_top_k_device_locs[occ] = -1;
+    }
+  }
   __syncthreads();
   if (threadIdx.x == 0) {
     miss_workspace.counters[rid] = miss_count;
@@ -873,6 +924,8 @@ template <
     int HOT_BUFFER_SIZE,
     int NUM_STEPS,
     bool RecordMissPlan,
+    int DecodeWidth,
+    int PrefetchTopK,
     typename KVTransferPolicy,
     bool USE_PDL>
 void load_cache_to_device_buffer_spec(
@@ -893,11 +946,16 @@ void load_cache_to_device_buffer_spec(
     int64_t active_tail_slots,
     tvm::ffi::TensorView miss_src_out,
     tvm::ffi::TensorView miss_dst_out,
-    tvm::ffi::TensorView miss_count_out) {
+    tvm::ffi::TensorView miss_count_out,
+    tvm::ffi::TensorView miss_is_demand_out) {
   using namespace host;
 
   static_assert(NUM_STEPS > 0, "HiSparse speculative swap requires at least one step.");
   static_assert(NUM_TOP_K > 0, "HiSparse speculative swap requires a positive top_k.");
+  static_assert(DecodeWidth == 0 || (DecodeWidth > 0 && DecodeWidth < NUM_STEPS && RecordMissPlan),
+                "Lagom requires a real window, forecast suffix, and miss plans.");
+  static_assert(DecodeWidth == 0 || NUM_STEPS * NUM_TOP_K <= HOT_BUFFER_SIZE,
+                "Lagom must protect the entire current/future union.");
   static_assert(NUM_STEPS * NUM_TOP_K <= 8192, "HiSparse speculative swap supports at most 8192 occurrences.");
 
   const int64_t bs = top_k_tokens.shape()[0];
@@ -946,6 +1004,7 @@ void load_cache_to_device_buffer_spec(
   int64_t* const miss_src_ptr = RecordMissPlan ? static_cast<int64_t*>(miss_src_out.data_ptr()) : nullptr;
   int32_t* const miss_dst_ptr = RecordMissPlan ? static_cast<int32_t*>(miss_dst_out.data_ptr()) : nullptr;
   int32_t* const miss_count_ptr = RecordMissPlan ? static_cast<int32_t*>(miss_count_out.data_ptr()) : nullptr;
+  int32_t* const miss_is_demand_ptr = DecodeWidth > 0 ? static_cast<int32_t*>(miss_is_demand_out.data_ptr()) : nullptr;
   const int64_t plan_stride = RecordMissPlan ? miss_src_out.strides()[0] : 0;
   if constexpr (RecordMissPlan) {
     RuntimeCheck(
@@ -958,6 +1017,11 @@ void load_cache_to_device_buffer_spec(
         miss_count_out.ndim() == 1 && miss_count_out.shape()[0] >= bs,
         "speculative miss_count must have shape [batch].");
     RuntimeCheck(miss_dst_out.strides()[0] == plan_stride, "speculative miss_src/miss_dst row strides differ.");
+  }
+  if constexpr (DecodeWidth > 0) {
+    RuntimeCheck(miss_is_demand_out.ndim() == 2 && miss_is_demand_out.shape()[0] >= bs &&
+                     miss_is_demand_out.shape()[1] >= total_occurrences && miss_is_demand_out.strides()[0] == plan_stride,
+                 "Lagom classification must match the miss-plan capacity and stride.");
   }
 
   // Preserve the device kernels' independent restrict-qualified views while
@@ -996,6 +1060,8 @@ void load_cache_to_device_buffer_spec(
           HOT_BUFFER_SIZE,
           NUM_STEPS,
           RecordMissPlan,
+          DecodeWidth,
+          PrefetchTopK,
           KVTransferPolicy>,
       static_cast<const int32_t*>(top_k_tokens.data_ptr()),
       static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
@@ -1026,6 +1092,7 @@ void load_cache_to_device_buffer_spec(
               HOT_BUFFER_SIZE,
               NUM_STEPS,
               RecordMissPlan,
+              DecodeWidth,
               KVTransferPolicy,
               USE_PDL>,
           static_cast<const int32_t*>(top_k_tokens.data_ptr()),
@@ -1036,17 +1103,85 @@ void load_cache_to_device_buffer_spec(
           host_cache_k.data_ptr(),
           device_buffer_k.data_ptr(),
           static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+          static_cast<const int32_t*>(seq_lens.data_ptr()),
           cache_state,
           miss_workspace,
           static_cast<const int32_t*>(num_real_reqs.data_ptr()),
           miss_src_ptr,
           miss_dst_ptr,
           miss_count_ptr,
+          miss_is_demand_ptr,
           top_k_tokens_stride,
           top_k_device_locs_stride,
           buffer_stride_0,
           host_stride,
           plan_stride);
+}
+
+template <int BLOCK_SIZE, bool Demand, typename KVTransferPolicy>
+__global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_lagom_cache_plan_kernel(
+    const int64_t* __restrict__ miss_src,
+    const int32_t* __restrict__ miss_dst,
+    const int32_t* __restrict__ miss_count,
+    const int32_t* __restrict__ is_demand,
+    const int32_t* __restrict__ num_real_reqs,
+    const void* __restrict__ host_cache,
+    void* __restrict__ device_buffer,
+    int64_t plan_stride) {
+  constexpr int num_warps = BLOCK_SIZE / WARP_SIZE;
+  const int lane = threadIdx.x % WARP_SIZE;
+  const int global_warp = blockIdx.x * num_warps + threadIdx.x / WARP_SIZE;
+  const int total_warps = gridDim.x * num_warps;
+  const int real = num_real_reqs[0];
+  int start = 0;
+  // Match the existing small-footprint planned-copy scheduling: four CTAs
+  // walk the batch's flattened miss space, leaving SMs available to attention.
+  for (int base = 0; base < real; base += WARP_SIZE) {
+    const int row = base + lane;
+    const int lane_count = row < real ? miss_count[row] : 0;
+    const int rows = min(real - base, WARP_SIZE);
+    for (int j = 0; j < rows; ++j) {
+      const int count = __shfl_sync(FULL_WARP_MASK, lane_count, j);
+      if (count == 0) continue;
+      int first = (global_warp - start) % total_warps;
+      if (first < 0) first += total_warps;
+      const int64_t offset = static_cast<int64_t>(base + j) * plan_stride;
+      for (int i = first; i < count; i += total_warps) {
+        if ((is_demand[offset + i] != 0) != Demand) continue;
+        const int64_t src = miss_src[offset + i];
+        const int32_t dst = miss_dst[offset + i];
+        if (src >= 0 && dst >= 0) {
+          KVTransferPolicy::copy_warp(lane, host_cache, device_buffer, src, dst);
+        }
+      }
+      start += count;
+    }
+  }
+}
+
+template <int BLOCK_SIZE, bool Demand, typename KVTransferPolicy>
+void copy_lagom_cache_plan(
+    tvm::ffi::TensorView miss_src,
+    tvm::ffi::TensorView miss_dst,
+    tvm::ffi::TensorView miss_count,
+    tvm::ffi::TensorView is_demand,
+    tvm::ffi::TensorView num_real_reqs,
+    tvm::ffi::TensorView host_cache,
+    tvm::ffi::TensorView device_buffer,
+    int64_t num_blocks) {
+  using namespace host;
+  const int64_t stride = miss_src.strides()[0];
+  RuntimeCheck(miss_dst.strides()[0] == stride && is_demand.strides()[0] == stride,
+               "Lagom miss-plan row strides differ.");
+  const auto device = LaunchKernel::resolve_device(miss_src.device());
+  LaunchKernel(dim3(static_cast<uint32_t>(num_blocks)), BLOCK_SIZE, device)(
+      copy_lagom_cache_plan_kernel<BLOCK_SIZE, Demand, KVTransferPolicy>,
+      static_cast<const int64_t*>(miss_src.data_ptr()),
+      static_cast<const int32_t*>(miss_dst.data_ptr()),
+      static_cast<const int32_t*>(miss_count.data_ptr()),
+      static_cast<const int32_t*>(is_demand.data_ptr()),
+      static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+      host_cache.data_ptr(), device_buffer.data_ptr(), stride);
 }
 
 template <int HOT_BUFFER_SIZE>

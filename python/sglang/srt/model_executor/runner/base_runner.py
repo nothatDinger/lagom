@@ -628,11 +628,13 @@ class BaseRunner(ABC):
         ):
             # Autotuning executes the same full W+P+1 shape as target capture.
             # Keep demand IO at W+1 rows, with a resident-only prediction tail.
-            # Dummy requests must never publish live CPU prefetch descriptors.
+            # Register stable side-copy plans without launching eager transfers;
+            # the independent side graph is captured after target capture.
             forward_batch.lagom_decode_width = (
                 mr.server_args.speculative_num_draft_tokens
             )
             forward_batch.is_lagom_graph_capture = True
+            mr.hisparse_coordinator.num_real_reqs.zero_()
         mr.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():

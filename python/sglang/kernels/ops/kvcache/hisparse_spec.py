@@ -41,6 +41,20 @@ class HiSparseSpecState(NamedTuple):
     scratch_state: torch.Tensor
 
 
+class LagomCachePlan(NamedTuple):
+    """One deduplicated miss plan partitioned between main and side streams.
+
+    The two copy passes select complementary ``is_demand`` values. Their
+    destinations are therefore disjoint, including a token selected by both
+    windows: any real query makes its unique miss a main-stream refill.
+    """
+
+    miss_src: torch.Tensor
+    miss_dst: torch.Tensor
+    miss_count: torch.Tensor
+    is_demand: torch.Tensor
+
+
 def allocate_hisparse_spec_states(
     layout: HiSparseSpecLayout,
     *,
@@ -98,6 +112,8 @@ def _jit_spec_module(
     num_steps: int,
     record_miss_plan: bool,
     transfer_policy: str,
+    decode_width: int = 0,
+    prefetch_top_k: int = 0,
 ) -> Module:
     template_args = make_cpp_args(
         block_size,
@@ -105,6 +121,8 @@ def _jit_spec_module(
         hot_buffer_size,
         num_steps,
         record_miss_plan,
+        decode_width,
+        prefetch_top_k,
         transfer_policy,
         is_arch_support_pdl(),
     )
@@ -221,6 +239,153 @@ def load_cache_to_device_buffer_spec_mla(
         miss_src,
         miss_dst,
         miss_count,
+        torch.empty(0),
+    )
+
+
+def plan_lagom_cache(
+    *,
+    top_k_tokens: torch.Tensor,
+    device_buffer_tokens: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    device_buffer_locs: torch.Tensor,
+    host_cache: torch.Tensor,
+    device_buffer: torch.Tensor,
+    top_k_device_locs: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    state: HiSparseSpecState,
+    num_real_reqs: torch.Tensor,
+    decode_width: int,
+    prefetch_top_k: int | None = None,
+    plan: LagomCachePlan | None = None,
+    transfer_kind: str = _DSV4_PAGED_TRANSFER,
+    item_size_bytes: int | None = None,
+) -> LagomCachePlan:
+    """Reserve a protected current/future union without transferring KV bytes.
+
+    The full window must fit in the hot buffer. All resident forecast entries
+    remain readable; future-only misses are returned as -1, while misses shared
+    with real queries are readable after the demand copy. ``prefetch_top_k``
+    limits future IO without removing resident hits outside that rank budget.
+    Caller-owned plans support graph-stable, per-layer storage.
+    """
+    batch, steps, top_k = top_k_tokens.shape
+    capacity = steps * top_k
+    if not 0 < decode_width < steps:
+        raise ValueError("Lagom requires nonempty real and prediction windows")
+    if not 0 < capacity <= min(state.cache_policy.size(1), 8192):
+        raise ValueError(
+            "Lagom current/future union must fit hot slots and 8192 entries"
+        )
+    prefetch_top_k = top_k if prefetch_top_k is None else prefetch_top_k
+    if not 0 < prefetch_top_k <= top_k:
+        raise ValueError("Lagom prefetch_top_k must be between 1 and top_k")
+    if plan is None:
+        plan = LagomCachePlan(
+            torch.empty(
+                (batch, capacity), dtype=torch.int64, device=top_k_tokens.device
+            ),
+            torch.empty(
+                (batch, capacity), dtype=torch.int32, device=top_k_tokens.device
+            ),
+            torch.empty((batch,), dtype=torch.int32, device=top_k_tokens.device),
+            torch.empty(
+                (batch, capacity), dtype=torch.int32, device=top_k_tokens.device
+            ),
+        )
+    for tensor, dtype in (
+        (plan.miss_src, torch.int64),
+        (plan.miss_dst, torch.int32),
+        (plan.is_demand, torch.int32),
+    ):
+        if (
+            tensor.dtype != dtype
+            or tensor.device != top_k_tokens.device
+            or tensor.ndim != 2
+            or tensor.size(0) < batch
+            or tensor.size(1) < capacity
+            or tensor.stride(1) != 1
+            or tensor.stride(0) != plan.miss_src.stride(0)
+        ):
+            raise ValueError(
+                "Lagom plan arrays must share device, capacity and row stride"
+            )
+    if (
+        plan.miss_count.dtype != torch.int32
+        or plan.miss_count.device != top_k_tokens.device
+        or plan.miss_count.ndim != 1
+        or plan.miss_count.numel() < batch
+        or plan.miss_count.stride(0) != 1
+    ):
+        raise ValueError("Lagom plan counts must be a contiguous int32 batch vector")
+    if transfer_kind == _LINEAR_TRANSFER and item_size_bytes is None:
+        item_size_bytes = host_cache.stride(0) * host_cache.element_size()
+    module = _jit_spec_module(
+        _GATHER_BLOCK_SIZE,
+        top_k,
+        state.cache_policy.size(1),
+        steps,
+        True,
+        _spec_transfer_policy(transfer_kind, item_size_bytes),
+        decode_width,
+        prefetch_top_k,
+    )
+    module.load_cache_to_device_buffer_spec(
+        top_k_tokens,
+        device_buffer_tokens,
+        host_cache_locs,
+        device_buffer_locs,
+        host_cache,
+        device_buffer,
+        top_k_device_locs,
+        req_pool_indices,
+        seq_lens,
+        state.cache_index,
+        state.cache_policy,
+        state.scratch_locs,
+        state.scratch_state,
+        num_real_reqs,
+        device_buffer_tokens.size(1) - state.cache_policy.size(1),
+        *plan,
+    )
+    return plan
+
+
+@cache_once
+def _jit_lagom_copy_module(
+    block_size: int, demand: bool, transfer_policy: str
+) -> Module:
+    args = make_cpp_args(block_size, demand, transfer_policy)
+    return load_jit(
+        "hisparse_lagom_copy",
+        *args,
+        cuda_files=["hisparse_spec.cuh"],
+        cuda_wrappers=[("copy_lagom_cache_plan", f"copy_lagom_cache_plan<{args}>")],
+    )
+
+
+def copy_lagom_cache_plan(
+    plan: LagomCachePlan,
+    *,
+    demand: bool,
+    num_real_reqs: torch.Tensor,
+    host_cache: torch.Tensor,
+    device_buffer: torch.Tensor,
+    transfer_kind: str = _DSV4_PAGED_TRANSFER,
+    item_size_bytes: int | None = None,
+    num_blocks: int = 4,
+) -> None:
+    """Copy one disjoint plan partition without touching cache metadata."""
+    if num_blocks <= 0:
+        raise ValueError("Lagom copy requires a positive block count")
+    if transfer_kind == _LINEAR_TRANSFER and item_size_bytes is None:
+        item_size_bytes = host_cache.stride(0) * host_cache.element_size()
+    module = _jit_lagom_copy_module(
+        1024, demand, _spec_transfer_policy(transfer_kind, item_size_bytes)
+    )
+    module.copy_lagom_cache_plan(
+        *plan, num_real_reqs, host_cache, device_buffer, num_blocks
     )
 
 

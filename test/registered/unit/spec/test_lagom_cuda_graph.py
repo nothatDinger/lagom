@@ -1,4 +1,4 @@
-"""Replay publication and external stream ordering for Lagom's CSA forecasts."""
+"""Independent side graphs and per-layer ordering for Lagom's CSA forecasts."""
 
 import ast
 import sys
@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 from sglang.srt.layers.attention.dsv4.lagom import resolve_lagom_topk
+from sglang.srt.managers.lagom_graph import LagomPrefetchGraphs
 
 
 def _runner_method(filename, class_name, method_name, namespace=None):
@@ -41,22 +42,22 @@ def _runner_method(filename, class_name, method_name, namespace=None):
     return namespace[method.name]
 
 
-def _publish():
+def _replay():
     return _runner_method(
         "decode_cuda_graph_runner.py",
         "DecodeCudaGraphRunner",
-        "_publish_lagom_graph_prefetch",
+        "_replay_lagom_prefetch",
     )
 
 
-def test_target_autotune_uses_real_demand_window_and_does_not_queue_dummy_requests():
+def test_target_autotune_registers_split_plans_with_inactive_dummy_requests():
     """Exercise BaseRunner warmup through the real CSA routing helper."""
     batch, decode_width, prediction_width, topk = 2, 3, 2, 4
     total = decode_width + prediction_width
     physical = torch.full((batch * total, topk), 33, dtype=torch.int32)
     coordinator = SimpleNamespace(
         swap_in_lagom_pages=Mock(return_value=physical),
-        queue_lagom_prefetch=Mock(),
+        num_real_reqs=torch.ones(1, dtype=torch.int32),
     )
     seen = {}
 
@@ -94,6 +95,7 @@ def test_target_autotune_uses_real_demand_window_and_does_not_queue_dummy_reques
         prepare_dummy_forward_batch=lambda fb: fb,
         attn_backend=SimpleNamespace(init_forward_metadata=Mock()),
         tp_group=SimpleNamespace(barrier=Mock()),
+        hisparse_coordinator=coordinator,
     )
     buffers = SimpleNamespace(
         input_ids=torch.zeros(batch * total, dtype=torch.int64),
@@ -129,7 +131,7 @@ def test_target_autotune_uses_real_demand_window_and_does_not_queue_dummy_reques
             create_dummy_verify_input=lambda *_a: SimpleNamespace(
                 capture_hidden_mode=1
             ),
-            ForwardBatch=lambda **kw: SimpleNamespace(lagom_prefix_lens_cpu=None, **kw),
+            ForwardBatch=lambda **kw: SimpleNamespace(**kw),
             DpPaddingMode=SimpleNamespace(
                 get_default_mode_in_cuda_graph=lambda: SimpleNamespace(
                     is_max_len=lambda: False
@@ -148,12 +150,10 @@ def test_target_autotune_uses_real_demand_window_and_does_not_queue_dummy_reques
     assert (
         coordinator.swap_in_lagom_pages.call_args.kwargs["decode_width"] == decode_width
     )
-    assert captured._lagom_pending_prefetch[1][1].shape == (
-        batch,
-        prediction_width,
-        topk,
-    )
-    coordinator.queue_lagom_prefetch.assert_not_called()
+    kwargs = coordinator.swap_in_lagom_pages.call_args.kwargs
+    assert kwargs["capturing"]
+    assert kwargs["source_prefix_lens"].tolist() == [0, 0]
+    assert coordinator.num_real_reqs.item() == 0
 
 
 @pytest.mark.parametrize("is_draft,physical_width", [(False, 15), (True, 14)])
@@ -204,118 +204,289 @@ def test_dummy_spec_metadata_uses_physical_lagom_width(
     assert result.draft_token_num == physical_width
 
 
-def test_replay_publishes_live_request_order_and_excludes_bucket_padding():
-    coordinator = SimpleNamespace(queue_lagom_prefetch=Mock())
-    predictions = torch.arange(4 * 2 * 3).reshape(4, 2, 3)
+@pytest.mark.parametrize("live_size", [0, 1, 3])
+def test_replay_launches_captured_bucket_without_cpu_metadata(live_size):
+    pipeline = Mock()
     runner = SimpleNamespace(
-        _replay_graph_key="bucket4",
-        _lagom_graph_prefetch={"bucket4": {7: (coordinator, predictions)}},
+        bs=4,
+        model_runner=SimpleNamespace(
+            hisparse_coordinator=SimpleNamespace(_lagom_graphs=pipeline)
+        ),
     )
-    live = SimpleNamespace(
-        lagom_decode_width=3,
-        batch_size=2,
-        req_pool_indices=torch.tensor([11, 4]),
-        req_pool_indices_cpu=torch.tensor([11, 4]),
-        lagom_prefix_lens_cpu=torch.tensor([4096, 2048]),
+    _replay()(runner, SimpleNamespace(lagom_decode_width=3, batch_size=live_size))
+    pipeline.replay.assert_called_once_with(4)
+    pipeline.wait.assert_not_called()
+    pipeline.synchronize.assert_not_called()
+
+
+def test_non_lagom_graph_does_not_launch_prefetch():
+    _replay()(SimpleNamespace(), SimpleNamespace())
+
+
+@pytest.mark.parametrize("fail_target", [False, True])
+def test_runner_launches_side_graph_immediately_after_asynchronous_target(fail_target):
+    calls = []
+    error = RuntimeError("target graph launch failed")
+    pipeline = SimpleNamespace(
+        check_healthy=lambda: calls.append("health"),
+        replay=lambda _bs: calls.append("side"),
+        fail=Mock(),
     )
-    publish = _publish()
-    publish(runner, live)
-    call = coordinator.queue_lagom_prefetch.call_args.kwargs
-    assert call["layer_id"] == 7
-    assert call["req_pool_indices"].tolist() == [11, 4]
-    assert call["source_committed_lens_cpu"].tolist() == [4096, 2048]
-    torch.testing.assert_close(call["predicted_c4_entries"], predictions[:2])
 
-    # The graph tensor is reused, but the next descriptor must take live
-    # identities from the new batch rather than capture-time or previous IDs.
-    live.req_pool_indices = torch.tensor([8])
-    live.req_pool_indices_cpu = torch.tensor([8])
-    live.lagom_prefix_lens_cpu = torch.tensor([8192])
-    live.batch_size = 1
-    predictions.add_(100)
-    publish(runner, live)
-    call = coordinator.queue_lagom_prefetch.call_args.kwargs
-    assert call["req_pool_indices"].tolist() == [8]
-    assert call["predicted_c4_entries"].shape == (1, 2, 3)
-    torch.testing.assert_close(call["predicted_c4_entries"], predictions[:1])
+    def target(*_args):
+        calls.append("target")
+        if fail_target:
+            raise error
+        return "logits"
+
+    runner = SimpleNamespace(
+        bs=4,
+        model_runner=SimpleNamespace(
+            device_timer=None,
+            hisparse_coordinator=SimpleNamespace(_lagom_graphs=pipeline),
+        ),
+        backend=SimpleNamespace(replay_session=nullcontext, replay=target),
+        _resolve_shared_read_ends=lambda *_a: None,
+        _replay_attn_backend=lambda: None,
+        load_batch=lambda *_a: None,
+        _prepare_oasiskv_graph_replay=lambda *_a: None,
+        _prepare_ema_graph_replay=lambda: None,
+        _replay_graph_key=4,
+        _publish_oasiskv_graph_prefetch=lambda *_a: calls.append("other_publish"),
+        _submit_ema_graph_prefetch=lambda *_a: None,
+        _submit_previous_graph_prefetch=lambda *_a: None,
+        _slice_replay_output=lambda output, _batch: output,
+    )
+    runner._replay_lagom_prefetch = lambda batch: _replay()(runner, batch)
+    execute = _runner_method(
+        "decode_cuda_graph_runner.py",
+        "DecodeCudaGraphRunner",
+        "execute",
+        dict(
+            device_timer_ctx=lambda *_a: nullcontext(),
+            envs=SimpleNamespace(
+                SGLANG_LOG_DECODE_GRAPH_KEY=SimpleNamespace(get=lambda: False)
+            ),
+            SharedReadEnds=SimpleNamespace(PRE_REPLAY=1, IN_REPLAY=2, POST_REPLAY=3),
+        ),
+    )
+    batch = SimpleNamespace(
+        lagom_decode_width=3, forward_mode=SimpleNamespace(name="TARGET_VERIFY")
+    )
+    if fail_target:
+        with pytest.raises(RuntimeError, match="target graph"):
+            execute(runner, batch)
+        assert calls == ["health", "target"]
+        pipeline.fail.assert_called_once_with(error)
+    else:
+        assert execute(runner, batch) == "logits"
+        assert calls == ["health", "target", "side", "other_publish"]
 
 
-def test_idle_graph_does_not_queue_or_require_a_prediction_template():
-    runner = SimpleNamespace(_lagom_graph_prefetch={})
-    _publish()(runner, SimpleNamespace(lagom_decode_width=3, batch_size=0))
+class _FakeCuda:
+    def __init__(self):
+        self.calls = []
+        self.main = self.Stream("main", self)
+        self.current = self.main
+        self.capturing = False
+        self.event_count = 0
+
+    class Stream:
+        def __init__(self, name, cuda):
+            self.name, self.cuda = name, cuda
+
+        def wait_stream(self, other):
+            self.cuda.calls.append(("wait_stream", self.name, other.name))
+
+        def synchronize(self):
+            self.cuda.calls.append(("stream_sync", self.name))
+
+    def current_stream(self):
+        return self.current
+
+    def is_current_stream_capturing(self):
+        return self.capturing
+
+    def Event(self, *, external):
+        assert external
+        name = self.event_count
+        self.event_count += 1
+        return SimpleNamespace(
+            record=lambda stream=None: self.calls.append(
+                ("record", name, (stream or self.current).name)
+            ),
+            wait=lambda stream=None: self.calls.append(
+                ("wait", name, (stream or self.current).name)
+            ),
+            synchronize=lambda: self.calls.append(("event_sync", name)),
+        )
+
+    def stream(self, stream):
+        cuda = self
+
+        class Context:
+            def __enter__(self):
+                self.previous = cuda.current
+                cuda.current = stream
+
+            def __exit__(self, *_exc):
+                cuda.current = self.previous
+
+        return Context()
+
+    def CUDAGraph(self):
+        return SimpleNamespace(
+            replay=lambda: self.calls.append(("replay", self.current.name))
+        )
+
+    def graph(self, graph, *, stream):
+        return self.stream(stream)
 
 
-def test_active_lagom_graph_fails_if_predictions_were_not_captured():
-    runner = SimpleNamespace(_replay_graph_key=2, _lagom_graph_prefetch={})
-    with pytest.raises(RuntimeError, match="did not capture"):
-        _publish()(runner, SimpleNamespace(lagom_decode_width=3, batch_size=2))
+@pytest.fixture
+def fake_pipeline(monkeypatch):
+    import sglang.srt.managers.lagom_graph as module
+
+    cuda = _FakeCuda()
+    monkeypatch.setattr(module, "torch", SimpleNamespace(cuda=cuda))
+    pipeline = LagomPrefetchGraphs(cuda.Stream("side", cuda))
+    return cuda, pipeline
+
+
+def test_eager_launch_forks_at_plan_readiness_without_target_tail_wait(fake_pipeline):
+    cuda, pipeline = fake_pipeline
+    pipeline.consume_layer(0)
+    cuda.calls.clear()
+    pipeline.plan_ready(
+        0,
+        2,
+        lambda: cuda.calls.append(("copy_future", cuda.current.name)),
+        capturing=False,
+    )
+    cuda.calls.append(("copy_demand", cuda.current.name))
+    assert cuda.calls == [
+        ("record", 0, "main"),
+        ("wait", 0, "side"),
+        ("copy_future", "side"),
+        ("record", 1, "side"),
+        ("copy_demand", "main"),
+    ]
+    assert pipeline.pending
+    pipeline.consume_layer(0)
+    assert cuda.calls[-1] == ("wait", 1, "main")
+    pipeline.synchronize()
+    assert cuda.calls[-1] == ("event_sync", 1)
+    assert not pipeline.pending
+
+
+def test_graph_transfer_waits_each_layer_and_replays_without_foreground_join(
+    fake_pipeline,
+):
+    cuda, pipeline = fake_pipeline
+    for layer in (0, 2):
+        pipeline.consume_layer(layer)
+        pipeline.plan_ready(
+            layer,
+            4,
+            lambda layer=layer: cuda.calls.append(
+                ("copy_future", layer, cuda.current.name)
+            ),
+            capturing=True,
+        )
+    assert not any(call[0] == "copy_future" for call in cuda.calls)
+    pipeline.capture(4)
+    assert pipeline.has_shape(4)
+    # The captured copy sequence has independent layer-ready dependencies.
+    assert cuda.calls[-6:] == [
+        ("wait", 0, "side"),
+        ("copy_future", 0, "side"),
+        ("record", 1, "side"),
+        ("wait", 2, "side"),
+        ("copy_future", 2, "side"),
+        ("record", 3, "side"),
+    ]
+    cuda.calls.clear()
+    pipeline.replay(4)
+    assert cuda.calls == [("replay", "side")]
+    pipeline.synchronize()
+    assert cuda.calls[-2:] == [("event_sync", 1), ("event_sync", 3)]
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_failed_transfer_remains_drainable_but_cache_cannot_be_reused(
+    fake_pipeline, graph
+):
+    cuda, pipeline = fake_pipeline
+    pipeline.consume_layer(0)
+    error = RuntimeError("injected launch failure")
+
+    def fail():
+        raise error
+
+    if graph:
+        pipeline.graphs[2] = (SimpleNamespace(replay=fail), (0,))
+        launch = lambda: pipeline.replay(2)
+    else:
+        launch = lambda: pipeline.plan_ready(0, 2, fail, capturing=False)
+    with pytest.raises(RuntimeError, match="injected"):
+        launch()
+    assert pipeline.pending
+    assert cuda.calls[-1] == ("record", 1, "side")
+    for operation in (
+        lambda: pipeline.consume_layer(0),
+        lambda: pipeline.plan_ready(0, 2, lambda: None, capturing=False),
+        lambda: pipeline.capture(2),
+        lambda: pipeline.replay(2),
+    ):
+        with pytest.raises(RuntimeError, match="rebuild") as exc:
+            operation()
+        assert exc.value.__cause__ is error
+    pipeline.synchronize()
+    assert cuda.calls[-1] == ("event_sync", 1)
+    assert not pipeline.pending
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Graph runtime")
-def test_external_event_wait_and_prediction_tensor_survive_multiple_replays():
-    """Run the actual capture helper with an externally recorded layer event."""
-    device = "cuda"
-    producer = torch.cuda.Stream()
-    ready = torch.cuda.Event(external=True)
-    ready.record()
-    inputs = torch.zeros((2 * 5, 3), dtype=torch.int32, device=device)
-    output = torch.empty_like(inputs)
-    resident = torch.zeros((), dtype=torch.int32, device=device)
-    predictions = []
-    resolved = []
+def test_independent_transfer_graph_consumes_live_plans_across_replays():
+    """Real external-event edges join independent target/side graph launches."""
+    pipeline = LagomPrefetchGraphs(torch.cuda.Stream())
+    inputs = torch.zeros((2, 3), dtype=torch.int32, device="cuda")
+    count = torch.zeros(1, dtype=torch.int32, device="cuda")
+    plan = torch.empty_like(inputs)
+    plan_count = torch.empty_like(count)
+    current = torch.empty_like(inputs)
+    future = torch.empty_like(inputs)
+    rows = torch.arange(2, device="cuda")[:, None]
 
-    def swap(**kwargs):
-        ready.wait(torch.cuda.current_stream())
-        kwargs["output_buffer"].copy_(kwargs["top_k_result"] + resident)
-        return kwargs["output_buffer"]
+    def transfer():
+        future.copy_(torch.where(rows < plan_count, plan + 10, -1))
 
-    def queue(**kwargs):
-        predictions.append(kwargs["predicted_c4_entries"].clone())
+    def target():
+        pipeline.consume_layer(0)
+        plan.copy_(inputs)
+        plan_count.copy_(count)
+        pipeline.plan_ready(0, 2, transfer, capturing=True)
+        current.copy_(inputs + 1)
 
-    coordinator = SimpleNamespace(swap_in_lagom_pages=swap, queue_lagom_prefetch=queue)
-    capture_batch = SimpleNamespace(
-        req_pool_indices=torch.tensor([1, 2], device=device),
-        lagom_decode_width=3,
-        lagom_prefix_lens_cpu=None,
-        is_lagom_graph_capture=True,
-    )
-    lengths = torch.full((10,), 1024, device=device)
+    target()
+    torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    torch.cuda.synchronize()
     with torch.cuda.graph(graph):
-        raw = inputs + 1
-        resolve_lagom_topk(
-            coordinator=coordinator,
-            forward_batch=capture_batch,
-            layer_id=0,
-            raw_indices=raw,
-            compressed_seq_lens=lengths,
-            output_buffer=output,
-        )
-    runner = SimpleNamespace(
-        _replay_graph_key=2,
-        _lagom_graph_prefetch={2: capture_batch._lagom_pending_prefetch},
-    )
-    live = SimpleNamespace(
-        lagom_decode_width=3,
-        batch_size=1,
-        req_pool_indices=capture_batch.req_pool_indices[:1],
-        req_pool_indices_cpu=torch.tensor([1]),
-        lagom_prefix_lens_cpu=torch.tensor([4096]),
-    )
-    for value in (5, 9):
+        target()
+    pipeline.capture(2)
+    results = []
+    for value, live_count in ((5, 2), (9, 1), (12, 0)):
         inputs.fill_(value)
-        producer.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(producer):
-            resident.fill_(value)
-            ready.record(producer)
+        count.fill_(live_count)
         graph.replay()
-        _publish()(runner, live)
-        resolved.append(output.clone())
+        pipeline.replay(2)
+        pipeline.wait()
+        results.append((current.clone(), future.clone()))
+    pipeline.synchronize()
     torch.cuda.synchronize()
-    assert len(predictions) == 2
-    assert predictions[0].shape == (1, 2, 3)
-    assert torch.all(predictions[0] == 6)
-    assert torch.all(predictions[1] == 10)
-    assert torch.all(resolved[0] == 11)
-    assert torch.all(resolved[1] == 19)
+    for (value, live_count), (real, prefetched) in zip(
+        ((5, 2), (9, 1), (12, 0)), results
+    ):
+        assert torch.all(real == value + 1)
+        assert torch.all(prefetched[:live_count] == value + 10)
+        assert torch.all(prefetched[live_count:] == -1)

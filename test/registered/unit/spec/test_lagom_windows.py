@@ -167,7 +167,7 @@ def test_target_executes_all_rows_but_returns_only_decode_logits_and_hidden(samp
 
 @pytest.mark.parametrize("fail_forward", [False, True])
 @pytest.mark.parametrize("folded_confidence", [False, True])
-def test_worker_commits_only_decode_prefix_and_submits_after_commit(
+def test_worker_commits_only_decode_prefix_with_prefetch_already_in_verify(
     monkeypatch, fail_forward, folded_confidence
 ):
     events = []
@@ -206,6 +206,7 @@ def test_worker_commits_only_decode_prefix_and_submits_after_commit(
         assert kwargs["verify_ids_2d"].shape == (2, 5)
         assert kwargs["lagom_decode_width"] == 3
         events.append("forward")
+        events.append("prefetch")
         if fail_forward:
             raise RuntimeError("target failed")
         return SimpleNamespace(
@@ -244,8 +245,6 @@ def test_worker_commits_only_decode_prefix_and_submits_after_commit(
         prepare_dspark_verify_window=Mock(return_value=object()),
         commit_dspark_verify_window=lambda *args: events.append("commit"),
         rollback_dspark_verify_window=lambda *args: events.append("rollback"),
-        submit_lagom_prefetches=lambda: events.append("submit"),
-        discard_lagom_prefetches=lambda: events.append("discard"),
     )
     runner = SimpleNamespace(
         model=object(),
@@ -312,18 +311,17 @@ def test_worker_commits_only_decode_prefix_and_submits_after_commit(
     if fail_forward:
         with pytest.raises(RuntimeError, match="target failed"):
             forward(worker, batch, None)
-        assert events == ["forward", "rollback", "clear", "discard"]
+        assert events == ["forward", "prefetch", "rollback", "clear"]
     else:
         result = forward(worker, batch, None)
         assert result.speculative_num_draft_tokens == 3
         assert result.accept_lens.tolist() == [1, 3]
         assert events == [
             "forward",
+            "prefetch",
             "accept",
             "commit",
             "clear",
-            "submit",
-            "discard",
             "inject",
         ]
     assert (

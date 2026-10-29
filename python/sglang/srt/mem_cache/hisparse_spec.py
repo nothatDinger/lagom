@@ -48,6 +48,15 @@ class HiSparseSpecLayout:
             + (num_req_slots + 1) * self.state_width(num_req_slots) * 4
         )
 
+    def lagom_plan_bytes(self, *, num_layers: int, num_req_slots: int) -> int:
+        """Stable split-transfer plans plus counts for each captured CSA layer.
+
+        Each occurrence owns an int64 source, int32 destination and int32
+        demand flag. Counts are int32 per request, with one additional live
+        request-count scalar per layer for graph padding.
+        """
+        return num_layers * (num_req_slots * (16 * self.occurrences + 4) + 4)
+
 
 def validate_pr_fused_config(
     *,
@@ -94,10 +103,13 @@ def validate_pr_fused_config(
         )
     if prefetcher and not lagom:
         raise ValueError("pr_fused experiment does not support a named prefetcher")
-    work_width = max(width - prediction_steps, prediction_steps) if lagom else width
-    if work_width * top_k > min(hot, 8192):
+    # Lagom plans the real and prediction windows as one protected union.
+    # Their H2D transfers can then run on different streams without either
+    # evicting a location that the other transfer or current attention uses.
+    if width * top_k > min(hot, 8192):
         raise ValueError(
-            "pr_fused verify occurrences must fit hot slots and PR capacity"
+            "pr_fused full verify union must fit hot slots and PR capacity "
+            "(verify_width * top_k <= min(hot_slots, 8192))"
         )
     # Canonical and unused E placeholders stay fixed; only the remaining tail
     # slots rotate with hot. They belong to the request's existing allocation,

@@ -13,16 +13,16 @@ def make_batch():
         req_pool_indices_cpu=torch.tensor([3, 8]),
         lagom_decode_width=3,
         lagom_prefix_lens_cpu=torch.tensor([1024, 2048]),
+        positions=(torch.tensor([1024, 2048])[:, None] + torch.arange(5)).reshape(-1),
     )
 
 
-def test_lagom_csa_queues_each_requests_suffix_as_logical_ids():
+def test_lagom_csa_passes_both_windows_and_device_prefix_to_split_planner():
     batch = make_batch()
     logical_ids = torch.arange(2 * 5 * 4).reshape(10, 4)
     physical_locs = torch.full((10, 4), 500, dtype=torch.int32)
     coordinator = SimpleNamespace(
         swap_in_lagom_pages=Mock(return_value=physical_locs),
-        queue_lagom_prefetch=Mock(),
     )
     result = resolve_lagom_topk(
         coordinator=coordinator,
@@ -34,24 +34,19 @@ def test_lagom_csa_queues_each_requests_suffix_as_logical_ids():
     )
     assert result is physical_locs
     swap = coordinator.swap_in_lagom_pages.call_args.kwargs
-    assert swap["decode_width"] == 3  # anchor + W; P never demand-loads
+    assert swap["decode_width"] == 3  # anchor + W; suffix has a separate copy plan
     assert swap["top_k_result"] is logical_ids
-    queued = coordinator.queue_lagom_prefetch.call_args.kwargs
-    torch.testing.assert_close(
-        queued["predicted_c4_entries"], logical_ids.reshape(2, 5, 4)[:, 3:]
-    )
-    assert queued["source_committed_lens_cpu"] is batch.lagom_prefix_lens_cpu
-    assert queued["req_pool_indices"] is batch.req_pool_indices
-    assert queued["layer_id"] == 7
+    assert swap["source_prefix_lens"].tolist() == [1024, 2048]
+    assert swap["req_pool_indices"] is batch.req_pool_indices
+    assert swap["layer_id"] == 7
+    assert not swap["capturing"]
 
 
-@pytest.mark.parametrize(
-    "width,rows,prefix", [(5, 10, [1, 2]), (3, 9, [1, 2]), (3, 10, None)]
-)
-def test_invalid_lagom_geometry_cannot_publish_prefetch(width, rows, prefix):
+@pytest.mark.parametrize("width,rows,positions", [(5, 10, 10), (3, 9, 10), (3, 10, 9)])
+def test_invalid_lagom_geometry_cannot_launch_prefetch(width, rows, positions):
     batch = make_batch()
     batch.lagom_decode_width = width
-    batch.lagom_prefix_lens_cpu = prefix
+    batch.positions = torch.arange(positions)
     coordinator = Mock()
     with pytest.raises(ValueError):
         resolve_lagom_topk(
@@ -63,17 +58,15 @@ def test_invalid_lagom_geometry_cannot_publish_prefetch(width, rows, prefix):
             output_buffer=torch.empty((rows, 4), dtype=torch.int32),
         )
     coordinator.swap_in_lagom_pages.assert_not_called()
-    coordinator.queue_lagom_prefetch.assert_not_called()
 
 
-def test_graph_capture_retains_only_tensor_descriptors_until_live_replay():
+def test_graph_capture_uses_live_device_metadata_without_postreplay_descriptors():
     batch = make_batch()
     batch.is_lagom_graph_capture = True
     batch.lagom_prefix_lens_cpu = None
     coordinator = Mock()
-    # Warmup and capture have different allocations. Only the latest tensor
-    # may be published when a real batch replays this graph bucket.
     for fill in (11, 22):
+        batch.positions.add_(fill)
         raw = torch.full((10, 4), fill, dtype=torch.int32)
         resolve_lagom_topk(
             coordinator=coordinator,
@@ -83,8 +76,8 @@ def test_graph_capture_retains_only_tensor_descriptors_until_live_replay():
             compressed_seq_lens=torch.zeros(10),
             output_buffer=torch.empty_like(raw),
         )
-    coordinator.queue_lagom_prefetch.assert_not_called()
-    captured_coordinator, predictions = batch._lagom_pending_prefetch[1]
-    assert captured_coordinator is coordinator
-    torch.testing.assert_close(predictions, raw.view(2, 5, 4)[:, 3:])
-    assert predictions.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
+    args = coordinator.swap_in_lagom_pages.call_args.kwargs
+    assert args["capturing"]
+    assert args["top_k_result"] is raw
+    assert args["source_prefix_lens"].tolist() == [1057, 2081]
+    assert not hasattr(batch, "_lagom_pending_prefetch")
