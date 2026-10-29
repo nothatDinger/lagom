@@ -1,3 +1,5 @@
+import os
+import subprocess
 import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -152,7 +154,10 @@ def _dsv4_ptrs(cache: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("history", [4096, 8192])
 @pytest.mark.parametrize("duplicate_newest", [False, True])
 @pytest.mark.parametrize("width", [6, 12])
-def test_v4_verify_rows_keep_live_kv_at_3072_capacity(history, duplicate_newest, width):
+@pytest.mark.parametrize("block_size", [256, 960, 1024])
+def test_v4_verify_rows_keep_live_kv_at_3072_capacity(
+    history, duplicate_newest, width, block_size
+):
     """Actual fused H2D kernel, native 6 rows or exact shadow with 12 rows.
 
     The reserved slot has the last prefill C4, as retained by the V4 allocator.
@@ -243,6 +248,7 @@ def test_v4_verify_rows_keep_live_kv_at_3072_capacity(history, duplicate_newest,
                 num_top_k=k,
                 hot_buffer_size=hot,
                 page_size=1,
+                block_size=block_size,
                 num_real_reqs=real_reqs,
             )
             if workspace is not None:
@@ -282,6 +288,123 @@ def test_v4_verify_rows_keep_live_kv_at_3072_capacity(history, duplicate_newest,
     assert torch.equal(
         scales, (wanted.flatten() // 256).to(torch.uint8)[:, None].expand_as(scales)
     )
+
+
+@pytest.mark.parametrize("block_size", [256, 960, 1024])
+@pytest.mark.parametrize("plan_only", [False, True])
+def test_v4_swap_plan_at_3072_capacity_without_copy(block_size, plan_only):
+    """Separate the hit/LRU scan from IO, including the graph planning variant."""
+    hot, top_k, history = 3072, 512, 8192
+    tokens = torch.arange(hot + 1, dtype=torch.int32, device=DEVICE).view(1, -1)
+    locations = tokens.clone()
+    lru = torch.arange(hot, dtype=torch.int16, device=DEVICE).view(1, -1)
+    original_tokens, original_lru = tokens.clone(), lru.clone()
+    host_locs = torch.arange(history, dtype=torch.int64, device=DEVICE).view(1, -1)
+    src = torch.full((1, top_k), -1, dtype=torch.int64, device=DEVICE)
+    dst = torch.full((1, top_k), -1, dtype=torch.int32, device=DEVICE)
+    count = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+    out = torch.full((1, top_k), -1, dtype=torch.int32, device=DEVICE)
+    planned_tokens = torch.empty((1, hot), dtype=torch.int32, device=DEVICE)
+    planned_lru = torch.empty_like(lru)
+    # skip_io never dereferences these pointers; no pinned-memory bandwidth or
+    # page layout can explain a failure in this metadata-only regression.
+    host = torch.empty(0, dtype=torch.uint8)
+    device = torch.empty(0, dtype=torch.uint8, device=DEVICE)
+    ref_tokens, ref_lru = list(range(hot)), list(range(hot))
+    for step in range(3):
+        query = list(range(1024 + step * 128, 1280 + step * 128)) + list(
+            range(4096 + step * 128, 4352 + step * 128)
+        )
+        current = {token: slot for slot, token in enumerate(ref_tokens)}
+        hits = [slot for slot in ref_lru if ref_tokens[slot] in set(query)]
+        evictable = [slot for slot in ref_lru if ref_tokens[slot] not in set(query)]
+        missing = [token for token in query if token not in current]
+        next_tokens = ref_tokens.copy()
+        for token, slot in zip(missing, evictable):
+            next_tokens[slot] = token
+            current[token] = slot
+        next_lru = evictable[len(missing) :] + evictable[: len(missing)] + hits
+        load_cache_to_device_buffer_dsv4_mla(
+            top_k_tokens=torch.tensor([query], dtype=torch.int32, device=DEVICE),
+            device_buffer_tokens=tokens,
+            device_buffer_locs=locations,
+            host_cache_locs=host_locs,
+            host_cache=host,
+            device_buffer=device,
+            top_k_device_locs=out,
+            req_pool_indices=torch.tensor([0], device=DEVICE),
+            seq_lens=torch.tensor([history], dtype=torch.int32, device=DEVICE),
+            lru_slots=lru,
+            item_size_bytes=DSV4_ITEM_BYTES,
+            num_top_k=top_k,
+            hot_buffer_size=hot,
+            block_size=block_size,
+            miss_src=src,
+            miss_dst=dst,
+            miss_count=count,
+            skip_io=True,
+            planned_tokens=planned_tokens if plan_only else None,
+            planned_lru=planned_lru if plan_only else None,
+        )
+        n = count.item()
+        assert n == len(missing)
+        assert src[0, :n].tolist() == missing
+        assert dst[0, :n].tolist() == evictable[:n]
+        assert out[0].tolist() == [current[token] for token in query]
+        assert (planned_tokens if plan_only else tokens[:, :hot])[
+            0
+        ].tolist() == next_tokens
+        assert (planned_lru if plan_only else lru)[0].tolist() == next_lru
+        if plan_only:
+            assert torch.equal(tokens, original_tokens)
+            assert torch.equal(lru, original_lru)
+        else:
+            ref_tokens, ref_lru = next_tokens, next_lru
+
+
+def _invalid_hot_location_probe():
+    """Run in a child: device assert poisons its CUDA context by design."""
+    load_cache_to_device_buffer_mla(
+        top_k_tokens=torch.tensor([[5, 6]], dtype=torch.int32, device=DEVICE),
+        device_buffer_tokens=torch.tensor(
+            [[0, 1, 2, 3, 8]], dtype=torch.int32, device=DEVICE
+        ),
+        device_buffer_locs=torch.tensor(
+            [[-1, 1, 2, 3, 4]], dtype=torch.int32, device=DEVICE
+        ),
+        host_cache_locs=torch.arange(9, device=DEVICE).view(1, -1),
+        host_cache=torch.zeros((9, 1, 4), pin_memory=True),
+        device_buffer=torch.zeros((5, 1, 4), device=DEVICE),
+        top_k_device_locs=torch.empty((1, 2), dtype=torch.int32, device=DEVICE),
+        req_pool_indices=torch.tensor([0], device=DEVICE),
+        seq_lens=torch.tensor([9], dtype=torch.int32, device=DEVICE),
+        lru_slots=torch.arange(4, dtype=torch.int16, device=DEVICE).view(1, -1),
+        item_size_bytes=16,
+        num_top_k=2,
+        hot_buffer_size=4,
+    )
+    torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(
+    not is_cuda(), reason="CUDA assert diagnostics and isolated context"
+)
+def test_invalid_hot_location_fails_before_copy():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import runpy,sys; runpy.run_path(sys.argv[1])['_invalid_hot_location_probe']()",
+            __file__,
+        ],
+        env={**os.environ, "CUDA_LAUNCH_BLOCKING": "1"},
+        check=False,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert result.returncode != 0
+    assert "HiSparse hot slot has no device location" in result.stderr, result.stderr
 
 
 def _run_kernel(

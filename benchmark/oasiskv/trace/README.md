@@ -345,6 +345,30 @@ python benchmark/oasiskv/trace/run.py --mode paired --topk-order logical-all \
 
 16K 同进程 audit 通过后，再按原方案采集 32K。CPU 回归不代替上述 GPU kernel 和完整模型验证；4K 已有结果仍只作为全驻留 smoke。
 
+### Miss kernel 崩溃：先检查计数扫描，再检查物理地址
+
+`9bf6867e7` 的 GPU 测试被报告在 `hisparse.cuh` 的 kernel launch 处出现 illegal instruction。
+失败的无模型测试直接把物理地址设为 `0..3072`，不经过 coordinator 的 hold/release；因此仅凭这一报错不能断定存在未分配的 `dst_loc=-1`。
+
+已复现并修复一个 CUDA 计数扫描缺陷：256 线程每轮只有 8 个 warp 计数，旧代码却用 32 个 lane 扫描并写回后续计数区。
+这会把前缀和当作下一轮计数再次累加，破坏 hit/eviction 数和 shared-memory 槽位索引。生产默认的 960 线程（30 个 warp）也受影响。
+hit/eviction 与 miss 两处扫描现统一限制在本轮 `NUM_WARPS` 个计数内；ROCm 原有正确边界保留。
+另增加 LRU、淘汰槽、物理地址断言，无效地址会明确拒绝，不会静默漏载历史 KV。
+
+CPU 回归编译并执行实际 CUDA/ROCm 扫描函数及调用片段，用 barrier 模拟 warp shuffle；旧代码 4 项失败，修复后 16 项通过。
+这证实了扫描错误，不替代完整 GPU kernel 验证，也不单凭 CPU 结果断言现场全部崩溃都已解决。
+GPU 机器先按顺序运行下面两项；第一项只更新元数据、完全不读取 host KV，可区分扫描与搬运故障：
+
+```bash
+PYTHONPATH=python python -m pytest -q test/registered/kernels/ops/kvcache/test_hisparse.py \
+  -k swap_plan_at_3072_capacity_without_copy
+PYTHONPATH=python python -m pytest -q test/registered/kernels/ops/kvcache/test_hisparse.py \
+  -k verify_rows_keep_live_kv
+```
+
+两项均覆盖 256/960/1024 线程。第二项保留 6 行无 workspace 和 12 行带 workspace、16K/32K 历史、真实 H2D/D2D 及最终 KV 字节校验。
+若 CUDA 报错，使用新进程重试；出错后的 context 不可继续用来判断后续参数组合。两项通过后再加载模型运行 paired 实验。
+
 可用参数见 `python benchmark/oasiskv/trace/run.py --help`。`--max-windows` 是每个请求的采集上限；不会伪造接受长度来凑窗口。若生成太短、没有连续两个验证窗口，分析会拒绝给出结果。想覆盖生成中后期，应增加 `--output-length` 和 `--max-windows`，并相应增加 `--context-length`。
 
 ## 配对基线及独立参考组
@@ -462,6 +486,7 @@ CPU 验证命令：
 
 ```bash
 PYTHONPATH=python SGLANG_USE_CPU_ENGINE=0 python -m pytest -q \
+  test/registered/unit/kernels/test_hisparse_scan.py \
   test/registered/unit/spec/test_oasiskv_trace.py \
   test/registered/unit/spec/test_oasiskv_trace_startup.py \
   test/registered/unit/spec/test_oasiskv_trace_workspace.py \

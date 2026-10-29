@@ -8,6 +8,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include <cassert>
 #include <stdexcept>
 #include <stdint.h>
 #include <string>
@@ -187,6 +188,10 @@ __device__ __forceinline__ void copy_miss_item(
     int64_t dst_loc,
     int64_t item_size_bytes) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
+  // Invalid plans must fail at their source, not turn a sentinel into a paged
+  // pointer before the start of a cache. The kvcache JIT keeps device asserts.
+  assert(src_loc >= 0 && "HiSparse miss source must be allocated");
+  assert(dst_loc >= 0 && "HiSparse miss destination must be allocated");
   if constexpr (IsDsv4Layout) {
 #ifdef USE_ROCM
     // ROCm path: host cache and device buffer both use the page-padded C4
@@ -424,7 +429,7 @@ __global__ void load_cache_to_device_buffer_kernel(
       int32_t device_loc = -1;
       if (i < count) {
         int32_t token_pos = req_top_k_tokens[i];
-        if (token_pos >= 0) {
+        if (token_pos >= 0 && token_pos < seq_len) {
           device_loc = req_device_buffer_locs[token_pos];
         }
       }
@@ -524,6 +529,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int slot_idx = chunk_idx * WARP_SIZE + lane_id;
     const bool has_valid_slot = has_valid_chunk && (slot_idx < HOT_BUFFER_SIZE);
     const int16_t buf_slot = has_valid_slot ? req_lru_slots[slot_idx] : -1;
+    assert((!has_valid_slot || (buf_slot >= 0 && buf_slot < HOT_BUFFER_SIZE)) && "HiSparse invalid LRU slot");
     int32_t my_buffer_token = (buf_slot >= 0) ? req_device_buffer_tokens[buf_slot] : -1;
     int my_found_top_k_idx = -1;
     if (my_buffer_token >= 0) {
@@ -562,23 +568,15 @@ __global__ void load_cache_to_device_buffer_kernel(
     __syncthreads();
 
     if (warp_id == 0) {
-#ifdef USE_ROCM
-      // ROCm wavefront64: WARP_SIZE (64) > NUM_WARPS (16 at block_size=1024),
-      // so the wide-count form below would let lanes beyond this iteration's
-      // NUM_WARPS-wide window write the accumulator into s_chunk_offset
-      // positions belonging to future iterations, corrupting their reads.
-      // Bound the scan window to NUM_WARPS lanes.
+      // Only NUM_WARPS counts were produced in this iteration. This bound is
+      // required on CUDA too (e.g. 256 threads -> 8 counts, not 32). Scanning
+      // further writes prefix sums into future tiles, then reads them back as
+      // counts, corrupting the hit totals and compacted eviction slot indices.
       const int scan_offset = iter * NUM_WARPS + 1;
       const int scan_count = min(scan_offset + NUM_WARPS, NUM_BUFFER_CHUNKS + 1);
       total_hit_count = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_hit_count);
       total_evict_count =
           warp_inclusive_scan(s_evict_chunk_offset, lane_id, scan_offset, scan_count, total_evict_count);
-#else
-      total_hit_count =
-          warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_hit_count);
-      total_evict_count =
-          warp_inclusive_scan(s_evict_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_evict_count);
-#endif
       if (tid == 0) {
         s_total_hits = total_hit_count;
       }
@@ -588,11 +586,13 @@ __global__ void load_cache_to_device_buffer_kernel(
     // Hits grow forward from index 0
     if (is_hit) {
       int hit_offset = s_chunk_offset[chunk_idx] + local_hit_offset;
+      assert(hit_offset >= 0 && hit_offset < HOT_BUFFER_SIZE);
       s_lru_slots_out[hit_offset] = buf_slot;
     }
     // Evictables grow backward from HOT_BUFFER_SIZE - 1
     if (is_evictable) {
       int evict_offset = s_evict_chunk_offset[chunk_idx] + local_evict_offset;
+      assert(evict_offset >= 0 && evict_offset < HOT_BUFFER_SIZE);
       s_lru_slots_out[HOT_BUFFER_SIZE - 1 - evict_offset] = buf_slot;
     }
   }
@@ -646,19 +646,20 @@ __global__ void load_cache_to_device_buffer_kernel(
     __syncthreads();
 
     if (warp_id == 0) {
-#ifdef USE_ROCM
       const int scan_offset = iter * NUM_WARPS + 1;
       const int scan_count = min(scan_offset + NUM_WARPS, NUM_TOKEN_CHUNKS + 1);
       total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_misses);
-#else
-      total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, total_misses);
-#endif
     }
     __syncthreads();
 
     if (is_miss) {
       int miss_offset = s_chunk_offset[chunk_idx] + local_miss_offset;
+      assert(miss_offset >= 0 && miss_offset < NUM_TOP_K);
       int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_offset];
+      assert(evict_slot >= 0 && evict_slot < HOT_BUFFER_SIZE);
+      // Check before publishing a hit/plan for this token. Silently skipping
+      // the copy would let attention consume missing KV on this or later rows.
+      assert(req_device_buffer_locs[evict_slot] >= 0 && "HiSparse hot slot has no device location");
       // Reuse s_top_k_tokens as miss scratch: miss_offset < my_token_idx always
       // holds (hits are skipped), so compacted writes never overrun pending reads.
       s_top_k_tokens[miss_offset] = my_token;
@@ -675,6 +676,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   __syncthreads();
 
   total_misses = NUM_TOP_K - s_total_hits - s_newest_hit - s_invalid_count;
+  assert(total_misses >= 0 && total_misses <= NUM_TOP_K);
   if constexpr (RecordMissPlan) {
     if (tid == 0) {
       miss_count_out[bid] = total_misses;
