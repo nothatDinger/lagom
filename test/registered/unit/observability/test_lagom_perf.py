@@ -49,7 +49,8 @@ def test_three_modes_change_only_prefetch_and_offload():
     settings = args()
     commands = {mode: run.server_command(settings, mode, 30000) for mode in run.MODES}
     for command in commands.values():
-        assert command[command.index("--speculative-num-draft-tokens") + 1] == "4"
+        assert command[command.index("--speculative-num-draft-tokens") + 1] == "8"
+        assert command[command.index("--speculative-dspark-block-size") + 1] == "7"
         assert command[command.index("--max-running-requests") + 1] == "1"
         assert (
             command[command.index("--cuda-graph-config") + 1] == '{"decode":{"bs":[1]}}'
@@ -60,9 +61,10 @@ def test_three_modes_change_only_prefetch_and_offload():
         if m != "dspark"
     }
     assert configurations["lagom"]["prefetcher"] == "lagom"
+    assert configurations["lagom"]["prefetcher_config"]["prediction_steps"] == 7
     assert "prefetcher" not in configurations["hisparse"]
     assert all(
-        c["force_h2d_each_step"] is False and c["device_buffer_size"] == 4096
+        c["force_h2d_each_step"] is False and c["device_buffer_size"] == 8192
         for c in configurations.values()
     )
     assert "--enable-hisparse" not in commands["dspark"]
@@ -71,7 +73,7 @@ def test_three_modes_change_only_prefetch_and_offload():
 
 def test_capacity_and_trace_length_follow_physical_window():
     with pytest.raises(ValueError, match="W\\+P\\+1"):
-        args("--w", "7", "--p", "7")
+        args("--hot", "4096")
     value = args("--w", "7", "--p", "7", "--hot", "8192", "--trace-output", "16")
     assert value.trace_output > (value.trace_skip + value.trace_steps) * (value.w + 1)
     assert value.input_len == 32000 and value.output_len == 1024

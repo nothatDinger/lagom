@@ -22,10 +22,10 @@ concurrency=1、TP、采样参数、W、prompt 和 CUDA Graph；两个 HiSparse 
 
 - 输入 **32000 token**，输出 **1024 token**；每组 1 个 32-token 输出预热请求，
   然后测量 **2 个完整请求**。可以用 `--requests 1` 做更短 smoke test。
-- 默认 `W=3, P=3, K=512, hot=4096`。并集上界 `(W+P+1)*K=3584`，可以放入
-  hot 缓存；32k 输入约有 8000 个 C4 KV，因此能形成缓存压力。
-- 如果设 `W=7,P=7`，必须用 `hot>=7680`，例如 `--hot 8192`。这时 32k 输入
-  几乎全驻留，实验未出现加速不能直接归因于预取无效。
+- 默认 `W=7, P=7, K=512, hot=8192`。并集上界 `(W+P+1)*K=7680`，可以放入
+  hot 缓存；两个 HiSparse 组均使用 8192 个 C4 KV 槽位。
+- 32k 输入约有 8000 个 C4 KV，在这一配置下几乎全驻留，实验未出现加速不能
+  直接归因于预取无效。需要补充缓存压力实验时，可显式使用 `--w 3 --p 3 --hot 4096`。
 - Decode Graph 只 capture batch size 1，减少启动时间，使用 static verify。
 - 默认额外跑 **Lagom 一组 trace**：输入仍为 32000，输出默认 160；跳过前 2
   个 verify step，再记录 12 个 step。W 较大时自动增加 trace 输出长度，确保
