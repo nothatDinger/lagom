@@ -4,7 +4,6 @@ from typing import Optional
 
 import msgspec
 import torch
-
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
@@ -29,6 +28,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.observability.lagom_perf import timed
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
@@ -100,6 +100,7 @@ class TargetVerifyExecutor:
         self._simulate_acc_len = float(simulate_acc_len)
         self._simulated_correct_drafts_buf: Optional[torch.Tensor] = None
 
+    @timed("accept")
     def accept_and_finalize(
         self,
         *,
@@ -304,6 +305,7 @@ class TargetVerifyExecutor:
 
         return result
 
+    @timed("target_verify")
     def _forward_prepared_verify(
         self,
         *,
@@ -332,6 +334,7 @@ class TargetVerifyExecutor:
             can_run_cuda_graph=target_out.can_run_cuda_graph,
         )
 
+    @timed("draft_inject")
     def commit_hidden(
         self,
         *,

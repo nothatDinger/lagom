@@ -4,6 +4,9 @@ Lagom extends DeepSeek-V4 DSPARK speculative decoding with a disposable predicti
 suffix. The suffix supplies per-layer CSA Top-K hints for the following verify
 round while the original candidates retain normal speculative acceptance.
 
+For a short, reproducible three-mode throughput comparison and CUDA Graph
+per-step timing, see [the performance experiment guide](benchmark/lagom/README.md).
+
 ## Window conventions
 
 | Quantity | Meaning |

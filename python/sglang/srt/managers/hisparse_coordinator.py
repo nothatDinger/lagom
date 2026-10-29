@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Mapping, NamedTuple, Optional, Tuple, Union
 
 import torch
-
 from sglang.kernels.ops.kvcache.hisparse import (
     copy_cache_planned_mla,
     load_cache_to_device_buffer_dsv4_mla,
@@ -42,6 +41,7 @@ from sglang.srt.mem_cache.hisparse_spec import (
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.observability.lagom_perf import phase, prefetch_slot, timed
 from sglang.srt.utils import get_device_module, is_hip
 
 device_module = get_device_module()
@@ -1916,39 +1916,42 @@ class HiSparseCoordinator:
         real_count.copy_(self.num_real_reqs)
         active = self._pr_verify_layout["active_slots"]
         try:
-            plan_lagom_cache(
-                top_k_tokens=tokens,
-                device_buffer_tokens=self.req_device_buffer_tokens[
-                    layer_id, :, :active
-                ],
-                host_cache_locs=self.req_to_host_pool,
-                device_buffer_locs=self.req_device_buffer_token_locs[
-                    layer_id, :, :active
-                ],
-                host_cache=self.mem_pool_host.kv_buffer[layer_id],
-                device_buffer=self.mem_pool_device.kv_buffer[layer_id],
-                top_k_device_locs=output_buffer.view(batch, width, self.top_k),
-                req_pool_indices=req_pool_indices.to(torch.int64),
-                seq_lens=lengths.view(-1),
-                state=self._spec_states[layer_id],
-                num_real_reqs=real_count,
-                decode_width=decode_width,
-                prefetch_top_k=self.prefetcher.logical_entries,
-                plan=plan,
-                transfer_kind="dsv4_paged",
-                item_size_bytes=self.item_size_bytes,
-            )
-
-            def transfer():
-                copy_lagom_cache_plan(
-                    plan,
-                    demand=False,
-                    num_real_reqs=real_count,
+            with phase("kv_plan", layer=layer_id):
+                plan_lagom_cache(
+                    top_k_tokens=tokens,
+                    device_buffer_tokens=self.req_device_buffer_tokens[
+                        layer_id, :, :active
+                    ],
+                    host_cache_locs=self.req_to_host_pool,
+                    device_buffer_locs=self.req_device_buffer_token_locs[
+                        layer_id, :, :active
+                    ],
                     host_cache=self.mem_pool_host.kv_buffer[layer_id],
                     device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                    top_k_device_locs=output_buffer.view(batch, width, self.top_k),
+                    req_pool_indices=req_pool_indices.to(torch.int64),
+                    seq_lens=lengths.view(-1),
+                    state=self._spec_states[layer_id],
+                    num_real_reqs=real_count,
+                    decode_width=decode_width,
+                    prefetch_top_k=self.prefetcher.logical_entries,
+                    plan=plan,
                     transfer_kind="dsv4_paged",
                     item_size_bytes=self.item_size_bytes,
                 )
+            trace_slot = prefetch_slot(layer_id)
+
+            def transfer():
+                with phase("kv_prefetch", layer=layer_id, slot=trace_slot):
+                    copy_lagom_cache_plan(
+                        plan,
+                        demand=False,
+                        num_real_reqs=real_count,
+                        host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                        device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                        transfer_kind="dsv4_paged",
+                        item_size_bytes=self.item_size_bytes,
+                    )
 
             # Record readiness BEFORE demand IO. Eager launches immediately; graph
             # mode captures a separate transfer graph and launches it immediately
@@ -1956,15 +1959,16 @@ class HiSparseCoordinator:
             self._lagom_graphs.plan_ready(
                 layer_id, batch, transfer, capturing=capturing
             )
-            copy_lagom_cache_plan(
-                plan,
-                demand=True,
-                num_real_reqs=real_count,
-                host_cache=self.mem_pool_host.kv_buffer[layer_id],
-                device_buffer=self.mem_pool_device.kv_buffer[layer_id],
-                transfer_kind="dsv4_paged",
-                item_size_bytes=self.item_size_bytes,
-            )
+            with phase("kv_refill", layer=layer_id):
+                copy_lagom_cache_plan(
+                    plan,
+                    demand=True,
+                    num_real_reqs=real_count,
+                    host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                    device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                    transfer_kind="dsv4_paged",
+                    item_size_bytes=self.item_size_bytes,
+                )
         except Exception as error:
             # Planning publishes residency before IO. A launch failure cannot
             # be retried against that state: a partial copy would look like a
@@ -2221,6 +2225,7 @@ class HiSparseCoordinator:
                     )
         return anchor_locs
 
+    @timed("kv_refill_fused")
     def _run_swap_in_verify_window(
         self,
         *,
@@ -2426,6 +2431,7 @@ class HiSparseCoordinator:
                 ]
         return result
 
+    @timed("kv_prepare")
     def prepare_dspark_verify_window(
         self,
         *,
@@ -2581,16 +2587,18 @@ class HiSparseCoordinator:
         self._dspark_commit_done_event.record(device_module.current_stream())
         self._has_pending_dspark_commit = True
 
+    @timed("kv_commit")
     def commit_dspark_verify_window(
         self, window: HiSparseDSparkWindow, commit_lens: torch.Tensor
     ) -> None:
         """Back up accepted C4 entries, then reset fixed scratch metadata."""
         if window.compressed_locs.numel() == 0:
             return
-        commit_cpu = commit_lens.to("cpu").tolist()
-        accepted = speculative_accepted_c4_indices(
-            window, commit_cpu, self.compress_ratio
-        )
+        with phase("cpu_dependency_commit"):
+            commit_cpu = commit_lens.to("cpu").tolist()
+            accepted = speculative_accepted_c4_indices(
+                window, commit_cpu, self.compress_ratio
+            )
         if accepted:
             accepted_idx = torch.tensor(accepted, dtype=torch.int64, device=self.device)
             host_locs = []

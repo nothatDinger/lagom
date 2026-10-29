@@ -18,11 +18,10 @@ from typing import (
     Union,
 )
 
+import sglang.srt.models.deepseek_v2 as deepseek_v2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.kernels.ops.attention.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
@@ -152,6 +151,7 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
+from sglang.srt.observability.lagom_perf import timed
 from sglang.srt.runtime_context import get_device, get_exec, get_forward, get_parallel
 
 if not _is_hip:
@@ -262,7 +262,6 @@ def _flashinfer_hc_pre(
     sinkhorn_iters: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from flashinfer.mhc import mhc_pre_big_fuse
-
     from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
 
     num_tokens, hc_mult, hidden_size = x.shape
@@ -1384,6 +1383,7 @@ class MQALayer(MqaAttentionBase):
 
         return q, kv
 
+    @timed("attention_block", layer=True)
     def forward(
         self,
         x: torch.Tensor,
@@ -1551,7 +1551,6 @@ class MQALayer(MqaAttentionBase):
 
         if _FP8_WO_A_GEMM:
             import deep_gemm
-
             from sglang.srt.layers import deep_gemm_wrapper
 
             T, G, D = o.shape
@@ -2031,6 +2030,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # cross-layer fusion, and the final layer is completed in DeepseekV4Model.
         return hidden_states, residual, post, comb
 
+    @timed("mlp", layer=True)
     def _run_moe_ffn_dp_sync(
         self,
         hidden_states: torch.Tensor,

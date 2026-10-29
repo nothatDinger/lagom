@@ -11,6 +11,8 @@ from typing import Callable
 
 import torch
 
+from sglang.srt.observability.lagom_perf import phase, register_side_stream
+
 
 @dataclass
 class _Layer:
@@ -22,6 +24,7 @@ class _Layer:
 class LagomPrefetchGraphs:
     def __init__(self, transfer_stream):
         self.transfer_stream = transfer_stream
+        register_side_stream(transfer_stream)
         self.layers: dict[int, _Layer] = {}
         self.functions: dict[int, dict[int, Callable[[], None]]] = {}
         self.graphs: dict[int, tuple[torch.cuda.CUDAGraph, tuple[int, ...]]] = {}
@@ -62,7 +65,8 @@ class LagomPrefetchGraphs:
         self.check_healthy()
         # Unconditional during capture: the next target must not overwrite a
         # prior transfer's plan or read a resident slot whose H2D is unfinished.
-        self._layer(layer_id).done.wait(torch.cuda.current_stream())
+        with phase("prefetch_wait", layer=layer_id):
+            self._layer(layer_id).done.wait(torch.cuda.current_stream())
 
     def plan_ready(
         self,

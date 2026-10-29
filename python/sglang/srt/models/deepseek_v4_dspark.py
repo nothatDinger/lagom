@@ -6,8 +6,6 @@ from typing import Iterable, List, Optional, Tuple
 import msgspec
 import torch
 import torch.nn.functional as F
-from torch import nn
-
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
@@ -49,6 +47,7 @@ from sglang.srt.models.dspark import (
     gather_and_crop_vocab,
     run_markov_block,
 )
+from sglang.srt.observability.lagom_perf import model_role, timed
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
@@ -59,6 +58,7 @@ from sglang.srt.speculative.ragged_verify import (
 )
 from sglang.srt.utils import add_prefix, is_blackwell_supported, is_npu
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
+from torch import nn
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +193,6 @@ class DSparkAttention(MqaAttentionBase):
         else:
             if _is_npu:
                 import torch_npu
-
                 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
                     Dsv4NpuRoPE,
                 )
@@ -226,6 +225,7 @@ class DSparkAttention(MqaAttentionBase):
                 return q_out
             return q
 
+    @timed("attention_block", layer=True)
     def forward(
         self,
         positions: torch.Tensor,
@@ -825,6 +825,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         x = x.unsqueeze(1).repeat(1, self.hc_mult, 1)
         return x
 
+    @model_role("draft")
+    @timed("model")
     def forward(
         self,
         input_ids: torch.Tensor,

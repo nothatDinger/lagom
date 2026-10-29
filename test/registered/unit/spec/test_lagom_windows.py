@@ -104,6 +104,9 @@ def _load_method(filename, class_name, method_name, namespace):
         type_ignores=[],
     )
     # Only compile the named method from this repository, never external input.
+    from sglang.srt.observability.lagom_perf import timed, verify_step
+
+    namespace.update(timed=timed, verify_step=verify_step)
     exec(compile(ast.fix_missing_locations(ast_module), str(path), "exec"), namespace)  # noqa: S102
     return namespace[method_name]
 
