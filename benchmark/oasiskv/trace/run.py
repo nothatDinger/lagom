@@ -119,6 +119,13 @@ def server_command(args, gamma):
 
 
 def validate_args(args, gamma):
+    if (
+        getattr(args, "mode", None) == "untraced"
+        and getattr(args, "topk_order", "native") != "native"
+    ):
+        raise ValueError(
+            "Untraced mode has no ordering hook; use replay-check or control"
+        )
     v = (
         args.verify_candidates
         if args.verify_candidates is not None
@@ -553,9 +560,22 @@ def main():
     parser.add_argument("--requests", type=int, default=2)
     parser.add_argument(
         "--mode",
-        choices=["experiment", "untraced", "control", "probes", "full-control"],
+        choices=[
+            "experiment",
+            "untraced",
+            "control",
+            "probes",
+            "full-control",
+            "replay-check",
+        ],
         default="experiment",
         help="Single modes collect diagnostics only; experiment runs paired groups and analysis",
+    )
+    parser.add_argument(
+        "--topk-order",
+        choices=["native", "logical"],
+        default="native",
+        help="Offline diagnostic only: sort selected IDs before attention; native remains default",
     )
     parser.add_argument(
         "--diagnostics",
@@ -660,7 +680,8 @@ def main():
             "output": str(directory),
             "verify_candidates": gamma if mode == "full-control" else v,
             "probes": args.probes if mode == "probes" else [],
-            "shadows": mode == "probes",
+            "shadows": mode in ("probes", "replay-check"),
+            "topk_order": args.topk_order,
             "max_windows": args.max_windows,
             "snapshot_gib": args.snapshot_gib,
             "request_ids": [

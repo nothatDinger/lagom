@@ -241,8 +241,12 @@ def analyze(records, cap):
     if type(cap) is not int or cap < 0:
         raise ValueError("prefetch cap must be a nonnegative integer")
     windows, probes = {}, {}
+    orders = set()
     for record in records:
         validate(record)
+        orders.add(record.get("topk_order", "native"))
+        if not orders <= {"native", "logical"} or len(orders) > 1:
+            raise ValueError("Cannot mix different topk_order experiments")
         key = _key(record)
         table = windows if record["kind"] == "window" else probes
         if record["kind"] == "probe":
@@ -289,6 +293,7 @@ def analyze(records, cap):
         summary.append(entry)
     return {
         "schema_version": VERSION,
+        "topk_order": next(iter(orders), "native"),
         "prefetch_cap_units": cap,
         "candidate_policy": "probe-frequency; ties-by-logical-ID; dedup; committed-history; subtract-residency; cap",
         "measurement": "offline prediction potential; no eviction or asynchronous timing simulation",

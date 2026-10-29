@@ -21,6 +21,8 @@
 
 **验证状态：GPU 测试方报告 `ae1545f24` 的 untraced/control 已通过，probes 在恢复校验处失败；本次顺序比较修复只完成了 CPU 回归，尚待 GPU 复测。** 需要使用已能运行该仓库 V4/DSPARK 的 CUDA、FlashMLA、DeepGEMM 等环境。脚本检查本地 checkpoint、GPU 和配置，不自动安装或下载模型依赖。
 
+后续 GPU 证据已确认：第 0 个 C4 层仅换序，第 1–20 层存在逐渐扩大的集合差异。`e2c921d6b` 的集合比较不能消除这种真实差异；下面新增固定访问顺序的诊断，尚未据此宣称模型恢复已经正确或实验已跑通。
+
 ## 执行
 
 在 GPU 机器的仓库根目录执行，使用原来运行 SGLang 的 Python 环境：
@@ -159,6 +161,60 @@ V4 HiSparse 的原生 `topk_v1.cuh::radix_topk()` 用 `atomicAdd` 分配输出�
 
 P 行是 P 个 query 的 Top-K，和搬运次数没有直接等价关系。4K 输入约有 1024 C4 单元，容量 3072 时完全可能全部驻留；此时 exact 和 resident 的 `probe_demand_h2d_bytes=0` 正常。
 先用上方 4K experiment smoke 验证采集与隔离，再跑 16K/32K 研究容量压力；不能用全驻留的 smoke 推导预取命中率收益。
+
+### 后续证据：首层换序、深层集合漂移
+
+一种需要验证的因果链是：首层选中 ID 相同但排列不同 → attention 浮点归约顺序改变 → hidden state 微小差异 → 后续 indexer 分数/Top-K 改变。
+此时后续 indexer 接收到的张量未必位相同，不能直接归因于“相同 indexer 输入产生不同分数”。
+`1024` 选 `512` 本身也不能证明边界存在大量同分候选，需要实际分数证据。
+全驻留时不同 Top-K 都可能零 miss 且不改变驻留集合，这两个相同字段对排除恢复问题的约束有限。
+最终三行 argmax 相同不是“21 层的 logits 位相同”；仍须保留隔离检查。
+
+新增两个显式诊断选项：
+
+- `--mode replay-check`：相同快照 → 基线 forward → 恢复 → 基线 forward，不运行 P 个 probe 或任何变宽 shadow；仍执行真实模型与全部严格校验。只产出诊断，不生成覆盖率报告。
+- `--topk-order logical`：仅在 trace 的 target verify 路径，原生 Top-K 选择后、HiSparse 换入及 scratch 映射前，按逻辑 C4 ID 排序，同时对原始 ID 和 page 索引施加同一排列，padding 放末尾。随后 attention 使用固定的逻辑顺序。此选项不更改当前集合，不规定同分候选的取舍，也不保证其余 kernel 确定性。
+
+默认仍为 `--topk-order native`。`logical` 是单独标记的实验变体，会影响浮点计算顺序，不能保证与 native 逐 token 相同。
+控制/探针组必须使用同一种设置；`runtime.json`、每条 trace、`analysis/report.json` 都标记 `topk_order`，audit/analyze 拒绝混用。
+untraced 不安装该 hook，因此只允许 native。prefill 不在此诊断排序范围；跨进程 audit 若仍失败，也不能跳过。
+
+在已有 CUDA/JIT 环境设置下，可先各跑一个不含 probe 的双重放诊断（每条命令重新加载一次模型）：
+
+```bash
+python benchmark/oasiskv/trace/run.py --mode replay-check --topk-order native \
+  --gpus 1,5,6,7 --input-lengths 4096 --output-length 16 \
+  --requests 1 --max-windows 2 --diagnostics --request-timeout 1800 \
+  --output /srv/oasiskv/replay-native-new --execute
+
+python benchmark/oasiskv/trace/run.py --mode replay-check --topk-order logical \
+  --gpus 1,5,6,7 --input-lengths 4096 --output-length 16 \
+  --requests 1 --max-windows 2 --diagnostics --request-timeout 1800 \
+  --output /srv/oasiskv/replay-logical-new --execute
+```
+
+如果 native 失败而 logical 通过，支持“KV 访问顺序引入数值漂移”的解释；仍不是恢复完整性的独立证明。
+接着执行包含 probes 的完整 smoke：
+
+```bash
+python benchmark/oasiskv/trace/run.py --mode experiment --topk-order logical \
+  --gpus 1,5,6,7 --input-lengths 4096 --output-length 32 \
+  --requests 1 --max-windows 3 --skip-full-control --diagnostics \
+  --request-timeout 1800 --output /srv/oasiskv/probes-logical-new --execute
+```
+
+仅在该模式窗口校验和跨进程 audit 都通过后，才用同一 `--topk-order logical` 跑 16K/32K，并把结果标为 logical-order 变体。
+若固定顺序后仍有集合差异，应继续采集首次分歧层的 indexer 输入、分数和 K/K+1 边界，区分同分选择、分数漂移与状态恢复问题，不能为了生成曲线忽略集合变化。
+`rejection_layer_diffs` 保留逐层 `resident_after_equal` / `miss_events_equal`，`compare_topk()` 进一步区分逐行换序、换 ID、重复次数及缺行。
+
+真实 CUDA kernel 回归不需要加载 checkpoint：
+
+```bash
+PYTHONPATH=python python -m pytest -q \
+  test/registered/kernels/ops/attention/test_oasiskv_trace_topk_order.py
+```
+
+该测试重复调用 V4 原生 v1 Top-K，验证固定分数下的集合、短行/padding，以及排序后的 raw/page 对齐；它不代替上述完整模型双重放和 probes 验证。本地 CPU 测试中的 executor 仍为模拟实现，不应称作真实 GPU replay 已通过。
 
 新实验配置列出允许采集的request IDs：server warmup只执行正常验证，不保存window、不做shadow，
 不进入覆盖率和接受长度统计。原日志中的 `history_units=1–2` 不能代表4K请求；

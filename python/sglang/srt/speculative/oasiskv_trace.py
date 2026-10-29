@@ -11,7 +11,9 @@ from __future__ import annotations
 import gzip
 import json
 import os
+from collections import Counter
 from contextlib import contextmanager
+from itertools import zip_longest
 from pathlib import Path
 
 import torch
@@ -167,6 +169,34 @@ def check_live_locations(raw, selected, tokens, locations, history_units):
                 )
 
 
+def compare_topk(left, right):
+    """Classify rows without discarding repeated IDs, padding or missing rows."""
+    report = {
+        "rows_equal": 0,
+        "rows_reordered_only": 0,
+        "rows_different_ids": 0,
+        "rows": [],
+    }
+    for row, (a, b) in enumerate(zip_longest(left, right)):
+        ca, cb = Counter(a or []), Counter(b or [])
+        if a == b:
+            report["rows_equal"] += 1
+            continue
+        order_only = a is not None and b is not None and ca == cb
+        report["rows_reordered_only" if order_only else "rows_different_ids"] += 1
+        report["rows"].append(
+            {
+                "row": row,
+                "reordered_only": order_only,
+                "trial_row_present": a is not None,
+                "replayed_row_present": b is not None,
+                "trial_only_ids": sorted((ca - cb).elements()),
+                "replayed_only_ids": sorted((cb - ca).elements()),
+            }
+        )
+    return report
+
+
 def compare_observations(trial, replay):
     """Compare KV membership, not the atomic scatter order of native Top-K.
 
@@ -200,6 +230,7 @@ def compare_observations(trial, replay):
 
 def replay_diagnostics(trial_layers, layers, trial_logits, logits):
     differences = compare_observations(trial_layers, layers)
+    changed_fields = {item["layer"]: item["fields"] for item in differences}
     finite = torch.isfinite(trial_logits) & torch.isfinite(logits)
     delta = (trial_logits.float() - logits.float()).abs()
     return {
@@ -207,6 +238,19 @@ def replay_diagnostics(trial_layers, layers, trial_logits, logits):
         "replayed_predictions": logits.argmax(-1).tolist(),
         "differing_layers": [item["layer"] for item in differences],
         "layer_differences": differences,
+        "rejection_layer_diffs": {
+            layer: {
+                "topk": compare_topk(
+                    trial_layers[layer]["topk"], layers[layer]["topk"]
+                ),
+                "resident_after_equal": "resident_after"
+                not in changed_fields.get(layer, []),
+                "miss_events_equal": "miss_events" not in changed_fields.get(layer, []),
+            }
+            for layer in sorted(trial_layers.keys() & layers.keys())
+            if layer in changed_fields
+            or trial_layers[layer]["topk"] != layers[layer]["topk"]
+        },
         "topk_order_only_layers": [
             layer
             for layer in sorted(trial_layers.keys() & layers.keys())
@@ -364,6 +408,9 @@ class OasisKVTrace:
         self.probes = config["probes"]
         self.max_windows = config["max_windows"]
         self.shadows = config.get("shadows", True)
+        topk_order = config.get("topk_order", "native")
+        if topk_order not in ("native", "logical"):
+            raise ValueError("Trace topk_order must be native or logical")
         if type(self.v) is not int or not 1 <= self.v <= worker.gamma:
             raise ValueError("Trace V must be in [1, checkpoint gamma]")
         if any(
@@ -391,6 +438,7 @@ class OasisKVTrace:
         hisparse_state = validate_trace_hisparse(self.runner)
         # Validate the state inventory at startup, before the first request.
         list(target_state_tensors(self.runner))
+        self.coordinator.oasiskv_trace_topk_order = topk_order
         self.writer = None
         if worker.ps.tp_rank == 0:
             directory = Path(config["output"])
@@ -488,6 +536,7 @@ class OasisKVTrace:
             "bytes_per_unit": self.coordinator.item_size_bytes,
             "head": 0,
             "target_forward_ms": None,
+            "topk_order": self.config.get("topk_order", "native"),
         }
 
         def observe(mode, p):
@@ -508,7 +557,7 @@ class OasisKVTrace:
         # pre-forward image. Only one image is retained, in host memory.
         snapshot = None
         records = []
-        if self.shadows and self.probes:
+        if self.shadows:
             log_progress("snapshot-sync-enter", batch.reqs)
             torch.cuda.synchronize()
             log_progress("snapshot-copy-enter", batch.reqs)
@@ -586,7 +635,7 @@ class OasisKVTrace:
             del snapshot
 
         result, layers = observe("exact", 0)
-        if self.shadows and self.probes:
+        if self.shadows:
             logits = (
                 result[0]
                 .logits_output.next_token_logits[: self.v + 1]

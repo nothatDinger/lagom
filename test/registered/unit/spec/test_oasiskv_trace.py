@@ -27,11 +27,13 @@ from sglang.srt.speculative.oasiskv_trace import (
     TensorSnapshot,
     check_live_locations,
     compare_observations,
+    compare_topk,
     replace_method,
     replay_diagnostics,
     resident_lookup,
     validate_trace_hisparse,
 )
+from sglang.srt.speculative.oasiskv_trace_topk import canonicalize_topk_
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
@@ -416,7 +418,10 @@ def test_startup_guard_accepts_real_io_zero_environment(monkeypatch):
 
 
 @pytest.mark.parametrize("active_phase", [None, "decode", "prefill"])
-def test_trace_startup_uses_resolved_graph_backends(monkeypatch, active_phase):
+@pytest.mark.parametrize("topk_order", ["native", "logical"])
+def test_trace_startup_uses_resolved_graph_backends(
+    monkeypatch, active_phase, topk_order
+):
     from sglang.srt import runtime_context
     from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
     from sglang.srt.speculative import oasiskv_trace
@@ -451,7 +456,12 @@ def test_trace_startup_uses_resolved_graph_backends(monkeypatch, active_phase):
         model_runner=trace_startup_runner(),
         ps=NS(tp_rank=1),
     )
-    config = {"verify_candidates": 1, "probes": [1, 2], "max_windows": 2}
+    config = {
+        "verify_candidates": 1,
+        "probes": [1, 2],
+        "max_windows": 2,
+        "topk_order": topk_order,
+    }
     with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
         if active_phase:
             with pytest.raises(ValueError, match="ordinary DSPARK, eager"):
@@ -459,6 +469,7 @@ def test_trace_startup_uses_resolved_graph_backends(monkeypatch, active_phase):
         else:
             trace = OasisKVTrace(worker, config)
             assert trace.coordinator is worker.model_runner.hisparse_coordinator
+            assert trace.coordinator.oasiskv_trace_topk_order == topk_order
 
 
 def test_fixed_trace_does_not_need_confidence_head_but_backend_keeps_compact_mode():
@@ -647,7 +658,8 @@ def test_native_acceptance_cannot_accept_the_reserved_suffix(v):
 
 
 @pytest.mark.parametrize(
-    "variant", ["normal", "permutation", "changed_ids", "changed_logits"]
+    "variant",
+    ["normal", "permutation", "changed_ids", "changed_logits", "replay_check"],
 )
 @pytest.mark.parametrize("fail_shadow", [False, True])
 def test_whole_shadow_loop_restores_target_state_and_never_commits(
@@ -677,6 +689,8 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
         hisparse_coordinator=c,
     )
     trace.v, trace.probes, trace.shadows, trace.max_windows = 1, [1, 2], True, 3
+    if variant == "replay_check":
+        trace.probes = []
     trace.config = {"snapshot_gib": 0.01, "run_id": "test"}
     trace.coordinator, trace.writer, trace.windows = c, tmp_path / "trace.jsonl.gz", {}
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
@@ -724,7 +738,7 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
         "draft_tokens": torch.tensor([[21, 22, 23]]),
         "sampling_info": None,
     }
-    if fail_shadow:
+    if fail_shadow and variant != "replay_check":
         with pytest.raises(RuntimeError, match="shadow failed inside target"):
             trace.run(**kwargs)
         assert state.item() == 0
@@ -751,8 +765,8 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
         trace.run(**kwargs)
         assert state.item() == 1  # Only the final baseline forward survives.
         assert c.req_device_buffer_tokens.tolist() == [[[0, 1, 2, 3, -1, -1]]]
-        assert calls == [2, 3, 3, 4, 4, 2]
-        assert len(trace.pending) == 5
+        assert calls == ([2, 2] if variant == "replay_check" else [2, 3, 3, 4, 4, 2])
+        assert len(trace.pending) == (1 if variant == "replay_check" else 5)
         assert all(
             r["probe_demand_h2d_bytes"] == 0
             for r in trace.pending
@@ -800,6 +814,53 @@ def test_comparison_preserves_query_boundaries_duplicates_and_miss_counts():
     assert compare_observations(left, {}) == [
         {"layer": 0, "fields": ["layer_presence"]}
     ]
+
+
+def test_row_diagnostics_distinguish_order_membership_and_multiplicity():
+    report = compare_topk(
+        [[0, 2, 1], [94, 10], [5, 5, -1], [9]],
+        [[2, 1, 0], [232, 10], [5, -1, -1]],
+    )
+    assert report["rows_reordered_only"] == 1
+    assert report["rows_different_ids"] == 3
+    assert report["rows"][0]["trial_only_ids"] == []
+    assert report["rows"][1]["trial_only_ids"] == [94]
+    assert report["rows"][1]["replayed_only_ids"] == [232]
+    assert report["rows"][2]["trial_only_ids"] == [5]
+    assert report["rows"][2]["replayed_only_ids"] == [-1]
+    assert not report["rows"][3]["replayed_row_present"]
+
+
+@pytest.mark.parametrize("noncontiguous", [False, True])
+def test_canonical_order_keeps_raw_page_scratch_alignment_and_storage(noncontiguous):
+    raw = torch.tensor([[7, 3, -1, 5], [-1, -1, -1, -1]], dtype=torch.int32)
+    # Physical pages do NOT have the same order as logical C4 IDs.
+    pages = torch.tensor([[20, 500, -1, 90], [-1, -1, -1, -1]], dtype=torch.int32)
+    if noncontiguous:
+        raw = torch.stack((raw, raw), dim=-1)[..., 0]
+        pages = torch.stack((pages, pages), dim=-1)[..., 0]
+    pointers = raw.data_ptr(), pages.data_ptr()
+    canonicalize_topk_(raw, pages)
+    assert (raw.data_ptr(), pages.data_ptr()) == pointers
+    assert raw.tolist() == [[3, 5, 7, -1], [-1, -1, -1, -1]]
+    assert pages.tolist() == [[500, 90, 20, -1], [-1, -1, -1, -1]]
+    # These are the aligned logical page indices later cloned for scratch lookup.
+    saved = pages.clone()
+    canonicalize_topk_(raw, pages)
+    assert torch.equal(saved, pages)
+    with pytest.raises(ValueError, match="matching 2D"):
+        canonicalize_topk_(raw, pages[:, :2])
+
+
+def test_analysis_rejects_mixing_attention_visitation_order():
+    source, following, probe = records()
+    changed = dict(probe, topk_order="logical")
+    with pytest.raises(ValueError, match="different topk_order"):
+        analyzer.analyze([source, following, changed], 256)
+    report = analyzer.analyze(
+        [dict(r, topk_order="logical") for r in (source, following, probe)], 256
+    )
+    assert report["topk_order"] == "logical"
 
 
 @pytest.mark.parametrize(
@@ -875,6 +936,24 @@ def test_cross_process_audit_accepts_scatter_order_but_rejects_failed_runs(tmp_p
         auditor.audit(control, experiment)
     with pytest.raises(ValueError, match="Rejected shadow replay"):
         list(analyzer.read_records([experiment / "trace.jsonl.gz"]))
+
+
+def test_cross_process_audit_rejects_different_visitation_order(tmp_path):
+    source, following, probe = records()
+    control, experiment = tmp_path / "control", tmp_path / "probes"
+    write_run(control, [source, following], [1, 2, 3])
+    write_run(
+        experiment,
+        [dict(record, topk_order="logical") for record in (source, following, probe)],
+        [1, 2, 3],
+    )
+    with pytest.raises(ValueError, match="trajectory/residency"):
+        auditor.audit(control, experiment)
+
+
+def test_untraced_cannot_claim_fixed_attention_order():
+    with pytest.raises(ValueError, match="no ordering hook"):
+        runner.validate_args(NS(mode="untraced", topk_order="logical"), 5)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper and /proc")

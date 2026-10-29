@@ -52,6 +52,7 @@ def windows(directory):
             # Native Top-K uses atomic scatter, not score/rank order. Keep row
             # boundaries, duplicate IDs and miss multiplicity (also for old files).
             result[key]["topk"] = [sorted(row) for row in r["topk"]]
+            result[key]["topk_order"] = r.get("topk_order", "native")
             result[key]["miss_events"] = [
                 dict(event, ids=sorted(event["ids"])) for event in r["miss_events"]
             ]

@@ -899,6 +899,17 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
+        if (
+            hisparse_verify
+            and getattr(hisparse_coordinator, "oasiskv_trace_topk_order", "native")
+            == "logical"
+        ):
+            from sglang.srt.speculative.oasiskv_trace_topk import canonicalize_topk_
+
+            # Offline diagnostic only. Keep raw, page and later scratch indices
+            # aligned before any swap-in or attention observes the ordering.
+            canonicalize_topk_(raw_indices, c4_sparse_page_indices)
+
         prefetch_candidates = None
         if hisparse_decode and hisparse_coordinator.prefetcher is not None:
             assert hisparse_coordinator.indexer_prefetch_candidates_buffer is not None
