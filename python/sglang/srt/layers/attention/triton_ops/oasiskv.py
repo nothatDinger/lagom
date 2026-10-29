@@ -79,6 +79,77 @@ def _slot_pointer(
 
 
 @triton.jit
+def append_chunk(
+    Packed,
+    Low,
+    High,
+    Pages,
+    Data,
+    prefix,
+    count,
+    capacity,
+    KD: tl.constexpr,
+    STORAGE: tl.constexpr,
+    SLOTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    POOLED: tl.constexpr,
+    DENSE: tl.constexpr,
+    NATIVE: tl.constexpr,
+    DTYPE: tl.constexpr,
+    ROWS: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    """One launch updates a whole committed chunk's summaries and device pages.
+
+    Pinned-host backup uses contiguous per-head DMA outside this kernel. Each
+    CTA owns one block/head/dimension tile, so partial-block summaries need no
+    atomics. History not resident on device is not written into sparse slots.
+    """
+    h = tl.program_id(0)
+    active = (prefix + count - 1) // BLOCK
+    if NATIVE and not DENSE:
+        block = active
+    else:
+        block = prefix // BLOCK + tl.program_id(1)
+    d = tl.program_id(2) * TILE + tl.arange(0, TILE)
+    r = tl.arange(0, ROWS)
+    offset = block * BLOCK + r - prefix
+    valid = (r < BLOCK) & (offset >= 0) & (offset < count)
+    values = tl.load(
+        Packed + (h * count + offset[:, None]) * STORAGE + d[None, :],
+        valid[:, None] & (d[None, :] < STORAGE),
+        0,
+    )
+    if not NATIVE:  # noqa: SIM102 - compile out summary pointers for native DSA
+        if tl.program_id(2) * TILE < KD:
+            index = (h * capacity + block) * KD + d
+            low = tl.min(
+                tl.where(valid[:, None], values.to(tl.float32), float("inf")), 0
+            )
+            high = tl.max(
+                tl.where(valid[:, None], values.to(tl.float32), -float("inf")), 0
+            )
+            old_low = tl.load(Low + index, d < KD, float("inf"))
+            old_high = tl.load(High + index, d < KD, -float("inf"))
+            tl.store(Low + index, tl.minimum(old_low, low), d < KD)
+            tl.store(High + index, tl.maximum(old_high, high), d < KD)
+    if DENSE or block == active:
+        slot = tl.where(block == active, SLOTS, block)
+        if POOLED:
+            address = tl.load(Pages + h * (SLOTS + 1) + slot)
+            target = address.to(tl.pointer_type(DTYPE))
+        else:
+            target = Data + (h * (SLOTS + 1) + slot) * BLOCK * STORAGE
+        # When a new active block is first written, clear its unused tail.
+        reset = (block == active) & (prefix <= block * BLOCK)
+        tl.store(
+            target + r[:, None] * STORAGE + d[None, :],
+            values,
+            ((valid | reset) & (r < BLOCK))[:, None] & (d[None, :] < STORAGE),
+        )
+
+
+@triton.jit
 def append_token(
     Table,
     Key,

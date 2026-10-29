@@ -280,10 +280,69 @@ class OasisKVLayerCache:
         self.join()
         end = prefix + key.shape[0]
         self._prefetch_base = None
-        block_size = self.config.block_size
         self.prepare_append(end)
         packed = torch.cat((key, value), dim=-1).transpose(0, 1).contiguous()
         packed = F.pad(packed, (0, self.storage_dim - self.key_dim - self.value_dim))
+        if self.pipeline.cuda and key.shape[0]:
+            self._append_batched(packed, prefix)
+        else:
+            self._append_reference(packed, prefix)
+        self.length = end
+        if self.pipeline.cuda:
+            self.backup_done = torch.cuda.Event()
+            self.backup_done.record(torch.cuda.current_stream(self.device))
+
+    def _append_batched(self, packed, prefix):
+        """CUDA chunk write: one summary/page kernel and one DMA per KV head."""
+        import triton
+        import triton.language as tl
+        from sglang.srt.layers.attention.triton_ops import oasiskv as kernels
+
+        count = packed.shape[1]
+        end = prefix + count
+        block = self.config.block_size
+        tile = min(triton.next_power_of_2(self.storage_dim), 128)
+        blocks = (
+            1
+            if self.config.native_sparse and self.sparse
+            else triton.cdiv(end, block) - prefix // block
+        )
+        kernels.append_chunk[(self.heads, blocks, triton.cdiv(self.storage_dim, tile))](
+            packed,
+            self.key_min if self.key_min is not None else packed,
+            self.key_max if self.key_max is not None else packed,
+            self.page_table.pointers if self.page_table else packed,
+            self._data if self._data is not None else packed,
+            prefix,
+            count,
+            self.capacity,
+            KD=self.key_dim,
+            STORAGE=self.storage_dim,
+            SLOTS=self.config.history_blocks,
+            BLOCK=block,
+            POOLED=self.page_table is not None,
+            DENSE=not self.sparse,
+            NATIVE=self.config.native_sparse,
+            DTYPE={
+                torch.float16: tl.float16,
+                torch.bfloat16: tl.bfloat16,
+                torch.float32: tl.float32,
+            }[self.dtype],
+            ROWS=triton.next_power_of_2(block),
+            TILE=tile,
+            num_warps=4,
+        )
+        if self.host is not None:
+            # Each view is contiguous. A single strided [heads,tokens,storage]
+            # D2H copy can require temporary packing and CPU-side scatter.
+            host = self.host.view(self.heads, self.capacity * block, self.storage_dim)
+            for head in range(self.heads):
+                host[head, prefix:end].copy_(packed[head], non_blocking=True)
+
+    def _append_reference(self, packed, prefix):
+        """CPU reference and GPU A/B benchmark of the former per-block path."""
+        end = prefix + packed.shape[1]
+        block_size = self.config.block_size
         offset = 0
         while prefix + offset < end:
             pos = prefix + offset
@@ -312,10 +371,6 @@ class OasisKVLayerCache:
             elif not self.sparse:
                 self.block(block)[:, within : within + count].copy_(chunk)
             offset += count
-        self.length = end
-        if self.pipeline.cuda:
-            self.backup_done = torch.cuda.Event()
-            self.backup_done.record(torch.cuda.current_stream(self.device))
 
     def candidates(self, query, explicit=None, *, next_step=False):
         slots = self.config.history_blocks

@@ -432,3 +432,9 @@ PYTHONPATH=python SGLANG_USE_CPU_ENGINE=0 python -m pytest -q \
 BF16 数值误差、真实性能及最终 token 质量需在 H100 上按上述命令确认。
 CPU `TRITON_INTERPRET=1` 可检查 FP16 数值、寻址和 mask；Triton 3.7 的 BF16 dot
 解释器将位模式当 uint16 处理，因此这些 BF16 用例只在 CUDA 上运行。
+
+## Prefill 写入与短输出吞吐诊断
+
+针对逐 block append 导致的高 TTFT，以及256输出下的并发吞吐平台，见
+[PREFILL_DIAGNOSIS.md](PREFILL_DIAGNOSIS.md)：批量写入改造、旧/新 GPU microbenchmark、
+256/2048输出长度对照及 decode 稳态指标的正确口径。
