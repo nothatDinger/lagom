@@ -16,6 +16,8 @@ from pathlib import Path
 
 import torch
 
+from sglang.srt.speculative.oasiskv_trace_diagnostics import log_progress
+
 
 def validate_trace_hisparse(runner):
     """Report actual runtime state, without changing the experiment's IO mode."""
@@ -29,6 +31,7 @@ def validate_trace_hisparse(runner):
         )
 
     prefetcher = getattr(coordinator, "prefetcher", None)
+    allocator = getattr(runner, "token_to_kv_pool_allocator", None)
     state = {
         "coordinator_type": type_name(coordinator),
         "is_dsv4_hisparse": getattr(coordinator, "is_dsv4_hisparse", None),
@@ -44,6 +47,9 @@ def validate_trace_hisparse(runner):
         "coordinator_allocator_type": type_name(
             getattr(coordinator, "token_to_kv_pool_allocator", None)
         ),
+        "full_pool_tokens": getattr(allocator, "size_full", None),
+        "swa_pool_tokens": getattr(allocator, "size_swa", None),
+        "c4_pool_units": getattr(allocator, "_size_hisparse", None),
     }
     failed = []
     if coordinator is None:
@@ -369,6 +375,9 @@ class OasisKVTrace:
         )
 
     def run(self, *, batch, draft_block_ids, draft_tokens, sampling_info):
+        log_progress(
+            "trace-enter", batch.reqs, shadows=self.shadows, probes=self.probes
+        )
         if len(batch.reqs) != 1 or batch.has_grammar or batch.return_logprob:
             raise ValueError("Trace requires B=1, no grammar and no logprob request")
         if sampling_info is not None and not sampling_info.is_all_greedy:
@@ -376,9 +385,6 @@ class OasisKVTrace:
         slot = int(batch.req_pool_indices_cpu[0])
         generation = int(self.runner.req_to_token_pool.req_generation[slot])
         request_id = str(batch.reqs[0].rid)
-        key = (request_id, generation)
-        window = self.windows.get(key, 0)
-        self.windows[key] = window + 1
         executor = self.worker._verify_executor
 
         def forward(width):
@@ -393,6 +399,16 @@ class OasisKVTrace:
                 inject_gate=False,
             )
 
+        request_ids = self.config.get("request_ids")
+        if request_ids is not None and request_id not in request_ids:
+            # Server warmup is not experiment data and must not pay for
+            # snapshots/shadow replays or appear in coverage/acceptance reports.
+            self.pending = None
+            return forward(self.v + 1)
+
+        key = (request_id, generation)
+        window = self.windows.get(key, 0)
+        self.windows[key] = window + 1
         if window >= self.max_windows:
             self.pending = None
             return forward(self.v + 1)
@@ -422,7 +438,13 @@ class OasisKVTrace:
                 self.coordinator, self.v + 1, mode, history_units, slot
             )
             with observer.capture():
+                log_progress(
+                    "trace-forward-enter", batch.reqs, mode=mode, p=p, window=window
+                )
                 result = forward(self.v + 1 + p)
+                log_progress(
+                    "trace-forward-returned", batch.reqs, mode=mode, p=p, window=window
+                )
             return result, observer.layers
 
         # Wait for outstanding prefill/commit writes before taking a complete
@@ -430,10 +452,15 @@ class OasisKVTrace:
         snapshot = None
         records = []
         if self.shadows and self.probes:
+            log_progress("snapshot-sync-enter", batch.reqs)
             torch.cuda.synchronize()
+            log_progress("snapshot-copy-enter", batch.reqs)
             snapshot = TensorSnapshot(
                 target_state_tensors(self.runner),
                 int(self.config["snapshot_gib"] * 2**30),
+            )
+            log_progress(
+                "snapshot-copy-returned", batch.reqs, bytes_per_rank=snapshot.nbytes
             )
             if self.writer is not None and window == 0:
                 (self.writer.parent / "snapshot-inventory.json").write_text(

@@ -865,6 +865,52 @@ class TestPrefillAdder(CustomTestCase):
             adder._swa_req_never_fits(extend_input_len=256, max_new_tokens=64)
         )
 
+    def _v4_ignore_eos_req(self, *, capacity=4096, available=4096, chunk=4096):
+        # V4 defaults: full=40960, swa/full=0.1, page=256. C4 still has
+        # enough space for this prompt; the limiting pool is SWA, not C4.
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=256,
+            rem_swa=available,
+            rem_chunk=chunk,
+            extend_input_len=4096,
+            full_available=20000,
+        )
+        adder.token_to_kv_pool_allocator.size_swa = capacity
+        adder.tree_cache.disable = True
+        req.sampling_params.ignore_eos = True
+        req.sampling_params.max_new_tokens = 32
+        req.origin_input_ids = req.full_untruncated_fill_ids
+        return adder, req
+
+    def test_ignore_eos_v4_4k_prompt_does_not_livelock_empty_swa_pool(self):
+        adder, req = self._v4_ignore_eos_req()
+        self.assertEqual(adder._swa_budget_for_req(4096, 32), 4352)
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+        self.assertNotEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertEqual(req.extend_range, Range(0, 3584))
+
+        # After the first chunk is stashed, only its sliding-window page
+        # remains locked. The existing continuation path admits the last 512.
+        next_adder, _ = self._v4_ignore_eos_req(available=3840)
+        req.prefix_indices = list(range(3584))
+        self.assertIsNone(next_adder.add_chunked_req(req))
+        self.assertEqual(req.extend_range, Range(3584, 4096))
+
+    def test_ignore_eos_swa_transient_pressure_still_waits(self):
+        adder, req = self._v4_ignore_eos_req(capacity=8192)
+        self.assertEqual(adder.add_one_req_ignore_eos(req), AddReqResult.NO_TOKEN)
+        self.assertFalse(adder.can_run_list)
+        req.set_extend_range.assert_not_called()
+
+    def test_ignore_eos_swa_cannot_shrink_without_chunking(self):
+        adder, req = self._v4_ignore_eos_req(chunk=None)
+        self.assertEqual(adder.add_one_req_ignore_eos(req), AddReqResult.NO_TOKEN)
+        req.set_extend_range.assert_not_called()
+
     def test_swa_never_fits_true_when_budget_exceeds_whole_pool(self):
         # A large host-hit load-back charge pushes the budget past the entire
         # pool: it can never fit however far the pool drains -> hatch.

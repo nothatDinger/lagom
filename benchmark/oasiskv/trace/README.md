@@ -16,6 +16,8 @@
 | 首轮范围 | B=1，greedy，固定 V，无 grammar/logprob |
 | 输出 / 采集窗口 | 每请求 256 输出 token；只记录前 32 个验证窗口 |
 | KV | 原生 V4 + HiSparse；Top-K 读取 target 的 `index_topk`；驻留容量默认 `(G+1)×index_topk` |
+| 路由专家 | 显式 `--moe-runner-backend flashinfer_mxfp4`；H100 使用 CUTLASS W4A16，保持 checkpoint MXFP4 存储 |
+| 全局 C4 池 | `host_to_device_ratio=1`，容纳完整 prefill；不改变每请求 decode 的 `resident_units` |
 
 **验证状态：本分支在无 GPU 环境进行了 CPU 单元测试；尚未在上述 checkpoint / 4 × H100 上实测。先跑下面的 smoke。** 需要使用已能运行该仓库 V4/DSPARK 的 CUDA、FlashMLA、DeepGEMM 等环境。脚本检查本地 checkpoint、GPU 和配置，不自动安装或下载模型依赖。
 
@@ -31,11 +33,12 @@ export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
 # 只读 checkpoint 配置并打印命令；不加载模型、不运行 GPU。
 python benchmark/oasiskv/trace/run.py --output /srv/oasiskv/trace-plan
 
-# 首先验证模型入口、快照恢复、接受边界和实际 miss 记录。
+# 首先验证模型入口、快照恢复和接受边界。4K可以没有miss，不作为覆盖率曲线。
 python benchmark/oasiskv/trace/run.py \
   --output /srv/oasiskv/trace-smoke \
   --input-lengths 4096 --output-length 32 \
-  --requests 1 --max-windows 3 --skip-full-control --execute
+  --requests 1 --max-windows 3 --skip-full-control \
+  --diagnostics --request-timeout 600 --execute
 
 # Smoke 成功后，再跑 16K / 32K。
 python benchmark/oasiskv/trace/run.py \
@@ -43,6 +46,8 @@ python benchmark/oasiskv/trace/run.py \
 ```
 
 已有本地实验分支时使用 `git switch exp/oasiskv-trace`。输出目录必须不存在，以防混合旧 trace。默认使用 GPU `0,1,2,3`；可通过 `--gpus` 修改。脚本顺序启动并关闭自己的服务进程，不连接或终止已有服务。每个模式共用同一份 `prompts.npy`，请求串行执行。
+GPU工作区若已有针对 `eb91f01a4` 的未提交修补，请先保存diff，并在新的worktree检出更新后的分支验证，
+避免把旧的初始化补丁重复覆盖到新代码上。运行manifest同时记录HEAD和`source.diff`的SHA256。
 
 启动检查读取最终解析的 decode/prefill graph backend，两者必须都是 `disabled`，不依赖旧的 `disable_cuda_graph` 标志。
 trace 在 `DSparkWorkerV2.alloc_memory_pool()` 完成 draft 池分配后构造，不在 worker 的 `__init__` 中构造。
@@ -57,8 +62,76 @@ trace 校验/状态登记 → attention backend 初始化 → 服务接收请求
 
 `eb91f01a4` 及之前版本在 worker 构造时过早读取尚未分配的 coordinator/allocator，会在这里失败。
 升级后先用**新的输出目录**重跑上方 4K smoke；旧的 `manifest.json` 不是成功 trace，不可与新结果混用。
-只有 control/probes 均产生有效窗口记录、`audit.json` 为 `passed=true`，且 `analysis/report.json` 有匹配样本，
+只有 control/probes 均产生**请求ID为 `trace-i4096-r0` 的**有效窗口记录、`audit.json` 为 `passed=true`，且 `analysis/report.json` 有匹配样本，
 才进入 16K/32K 正式采集。这个修复没有在本地 GPU 上验证，不据启动顺序回归宣称已有实验结果。
+
+## 首个真实请求挂起：修复与定位
+
+旧代码存在可在CPU复现的接纳死循环：V4架构把默认 `swa_full_tokens_ratio` 设为0.1，
+所以 `max_total_tokens=40960` 时SWA池只有4096槽。4096-token chunk加256-token页预留需要4352槽。
+本实验 `ignore_eos=true` 且关闭radix cache，走 `PrefillAdder.add_one_req_ignore_eos()`；
+旧分支直接返回 `NO_TOKEN`，没有普通分支已有的“整个SWA池也装不下时缩小chunk”的处理。
+等待、减少running请求数都不能增加池的总容量，因此256-token warmup能完成，4K请求却一直排队。
+
+修复复用普通接纳路径的SWA chunk上限：4K、输出32的回归按3584＋512处理；
+临时内存压力仍等待，不挤占运行中请求的headroom。不改变输出长度、spec接受规则或trace隔离语义。
+这个根因已经过CPU失败→通过回归，但仍需GPU复测确认现场没有第二个阻塞点。
+普通 `Prefill batch` 日志在结果处理时打印，单凭没有该日志不能区分“未接纳”和“forward未返回”。
+
+现在可分别执行无trace和有trace的4K诊断，保持旧实验的全局C4比例2，以隔离接纳修复。
+每条命令独占4卡、单独加载模型；输出目录必须是新的，不要同时运行：
+
+```bash
+# 不设置 SGLANG_OASISKV_TRACE_CONFIG；脚本也会清除继承的同名变量。
+python benchmark/oasiskv/trace/run.py --mode untraced --diagnostics \
+  --input-lengths 4096 --output-length 32 --requests 1 --max-windows 3 \
+  --host-to-device-ratio 2 --request-timeout 600 --watchdog-timeout 300 \
+  --output /srv/oasiskv/trace-4k-untraced-fixed --execute
+
+# 固定V的control，有观测但不做shadow快照。参数与上面一致。
+python benchmark/oasiskv/trace/run.py --mode control --diagnostics \
+  --input-lengths 4096 --output-length 32 --requests 1 --max-windows 3 \
+  --host-to-device-ratio 2 --request-timeout 600 --watchdog-timeout 300 \
+  --output /srv/oasiskv/trace-4k-control-fixed --execute
+```
+
+单模式只采集，不自动出audit/coverage报告。无trace臂沿用普通DSPARK planner；
+control臂固定V，它们用于判断首次prefill/trace入口的阻塞，不用于证明完整输出轨迹相同。
+两臂都通过后再跑上面的默认experiment smoke（含probes），最后跑16K/32K。
+`control` 本来就不执行shadow的 `torch.cuda.synchronize()`/快照分支；它失败不能直接归罪于shadow重放。
+
+`--diagnostics` 给 `server.log` 增加CPU进度标记，各rank保留PID和request ID：
+
+| 最后可见阶段 | 下一步检查 |
+| --- | --- |
+| `queued` / `admission`返回`NO_TOKEN` | `full_free`、`swa_free`、`swa_capacity`、`swa_needed`；拒绝日志每30秒最多一次 |
+| `prepare-extend-enter`，无`returned` | 接纳后的批次准备和KV分配 |
+| `target-prefill-enter`，无`returned` | target首个真实prefill、CUDA/通信/内核编译；看watchdog栈 |
+| `draft-kv-inject-enter`，无`returned` | DSPARK接收target hidden并写draft KV的路径 |
+| `draft-propose-enter`，无`returned` | DSPARK生成本次proposal的路径 |
+| `trace-enter` / `trace-forward-enter` | decode验证/观测路径，而非首次prefill接纳 |
+| `snapshot-sync-enter` / `snapshot-copy-enter` | probes组的快照阶段 |
+
+这些标记不增加CUDA同步；`returned`只表示Python调用返回，不宣称GPU任务已完成。
+`server_info.json` 保存ready后的完整解析配置，`runtime.json` 另记录full/SWA/C4池容量。
+`request-progress.json` 保存最近请求的提交/完成状态；异常写 `failure.json`，保留server日志。
+client请求超时和scheduler watchdog分别设置，默认后者600秒；长时间shadow可显式调大。
+
+原脚本还有一个32K容量缺口：`host_to_device_ratio=2`、full池40960时，全局C4物理池仅约5120单元，
+且DSPARK scratch还占用其中部分。32K prompt需要8192个C4单元，当前HiSparse在最后一个prefill chunk后才卸载历史，
+所以减小chunk不能解决这一容量问题。脚本现在默认比例1，并在计划阶段拒绝明显装不下的组合。
+这只扩大prefill可用的全局物理池，**每请求decode驻留仍按 `resident_units` 裁剪**；
+G=5、K=512时仍为3072，不会因为全局池扩大而让16K/32K历史全部常驻。
+
+MXFP4方面，脚本显式选 `flashinfer_mxfp4` 并设置 `SGLANG_DSV4_FP4_DEQUANT=0`。
+CUDA上 packed MXFP4 不再静默落到普通FP8 MoE；不支持的runner（包括原来的auto回退）会提前报出可用选择。
+共享专家的FP8路径保留。手工使用 `SGLANG_DSV4_FP4_DEQUANT=1`＋auto仍可走已有解包路径，
+但会扩大专家权重显存，不属于本实验默认配置。
+
+新实验配置列出允许采集的request IDs：server warmup只执行正常验证，不保存window、不做shadow，
+不进入覆盖率和接受长度统计。原日志中的 `history_units=1–2` 不能代表4K请求；
+4K真实历史应约为1024个C4单元，16K约4096、32K约8192。
+4K小于3072驻留容量，miss分母为0是合理的；只有16K/32K正式样本才用于研究预取覆盖率随P的变化。
 
 `G` 从 DSPARK checkpoint 的配置中读取，启动时明确传入 `speculative_num_draft_tokens=G+1`，**不扩大训练 proposal 窗口**。默认 `P=[1,2,3]`，`V=G−3`。例如 G=7 时 V=4。若 checkpoint 的 G 太短，脚本会报错；可选 `--verify-candidates 2 --probes 1 2`，但必须满足 `V+max(P)≤G`。控制组与 probe 组使用相同的 G 和 V。
 
@@ -112,6 +185,8 @@ trace-v4-16k-32k/
     server.log
     trace.jsonl.gz              # 原始逻辑 C4 ID，只有 TP rank 0 写入
     outputs.jsonl              # 请求输出 token IDs
+    server_info.json / request-progress.json
+    failure.json               # 仅运行异常时存在
   probes/snapshot-inventory.json
   audit.json                    # 独立进程隔离检查，必须 passed=true
   acceptance.json               # 每种 V 的 A 分布、平均提交 token 数
@@ -167,5 +242,7 @@ CPU 验证命令：
 ```bash
 PYTHONPATH=python SGLANG_USE_CPU_ENGINE=0 python -m pytest -q \
   test/registered/unit/spec/test_oasiskv_trace.py \
-  test/registered/unit/spec/test_oasiskv_trace_startup.py
+  test/registered/unit/spec/test_oasiskv_trace_startup.py \
+  test/registered/unit/managers/test_prefill_adder.py \
+  test/registered/unit/layers/quantization/test_fp4_moe_routing.py
 ```

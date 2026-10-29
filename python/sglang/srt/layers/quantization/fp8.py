@@ -414,6 +414,15 @@ class Fp8Config(QuantizationConfig):
                 )
 
                 return Mxfp4FlashinferTrtllmMoEMethod(fp8_method, prefix=prefix)
+            if self.is_fp4_experts and _is_cuda:
+                raise ValueError(
+                    f"Packed MXFP4 experts cannot use MoE runner "
+                    f"{get_moe_runner_backend().value!r} as ordinary FP8. "
+                    "Select --moe-runner-backend flashinfer_mxfp4 (H100/SM90 "
+                    "uses the CUTLASS W4A16 path), marlin, or humming. "
+                    "Explicit SGLANG_DSV4_FP4_DEQUANT=1 with backend=auto is "
+                    "also supported but expands expert weight memory."
+                )
             return fp8_method
         elif isinstance(layer, RadixAttention):
             return Fp8KVCacheMethod(self)

@@ -83,13 +83,15 @@ def server_command(args, gamma):
         "4",
         "--attention-backend",
         "dsv4",
+        "--moe-runner-backend",
+        getattr(args, "moe_runner_backend", "flashinfer_mxfp4"),
         "--enable-hisparse",
         "--hisparse-config",
         json.dumps(
             {
                 "top_k": args.top_k,
                 "device_buffer_size": args.resident_units,
-                "host_to_device_ratio": 2,
+                "host_to_device_ratio": getattr(args, "host_to_device_ratio", 1),
             }
         ),
         "--disable-radix-cache",
@@ -111,7 +113,7 @@ def server_command(args, gamma):
         "--random-seed",
         str(args.seed),
         "--watchdog-timeout",
-        str(args.request_timeout),
+        str(getattr(args, "watchdog_timeout", args.request_timeout)),
     ]
 
 
@@ -146,6 +148,18 @@ def validate_args(args, gamma):
         raise ValueError("Invalid memory fraction or prefetch cap")
     if len(args.gpus.split(",")) != 4:
         raise ValueError("This recipe requires four GPU IDs")
+    ratio = getattr(args, "host_to_device_ratio", 1)
+    if ratio < 1:
+        raise ValueError("host_to_device_ratio must be >= 1")
+    # V4 stages C4 to host after the LAST prefill chunk. All prompt C4s
+    # coexist on device until then; chunking only reduces the SWA peak.
+    prefill_capacity = (args.context_length // 256 * 256) // ratio
+    if max(args.input_lengths) + 256 >= prefill_capacity:
+        raise ValueError(
+            "Prompt cannot fit the global prefill C4 pool (including scratch/page "
+            "headroom). Use --host-to-device-ratio 1 or increase --context-length; "
+            "--resident-units controls the separate per-request decode working set."
+        )
     return v
 
 
@@ -260,28 +274,39 @@ def stop(process):
             process.wait(timeout=30)
 
 
-def run_one(args, directory, config, command, prompts):
-    directory.mkdir()
-    config_path = directory / "config.json"
-    write_json(config_path, config)
+def run_environment(args, config_path):
     env = {
         **os.environ,
         "PYTHONPATH": str(ROOT / "python")
         + os.pathsep
         + os.environ.get("PYTHONPATH", ""),
         "CUDA_VISIBLE_DEVICES": args.gpus,
-        "SGLANG_OASISKV_TRACE_CONFIG": str(config_path),
         "SGLANG_RAGGED_VERIFY_MODE": "compact",
         "SGLANG_OPT_USE_ONLINE_COMPRESS": "0",
         "SGLANG_SIMULATE_ACC_LEN": "0",
         "SGLANG_DEBUG_HISPARSE_SKIP_IO": "0",
+        "SGLANG_DSV4_FP4_DEQUANT": "0",
+        "SGLANG_OASISKV_TRACE_DIAGNOSTICS": "1" if args.diagnostics else "0",
+        "PYTHONUNBUFFERED": "1",
     }
+    # Crucially remove any inherited trace configuration in the no-hook arm.
+    env.pop("SGLANG_OASISKV_TRACE_CONFIG", None)
+    if config_path is not None:
+        env["SGLANG_OASISKV_TRACE_CONFIG"] = str(config_path)
+    return env
+
+
+def run_one(args, directory, config, command, prompts):
+    directory.mkdir()
+    config_path = directory / "config.json"
+    write_json(config_path, config)
+    env = run_environment(args, config_path if config is not None else None)
     write_json(
         directory / "launch.json",
         {
             "command": command,
             "environment": {
-                k: env[k]
+                k: env.get(k)
                 for k in (
                     "CUDA_VISIBLE_DEVICES",
                     "SGLANG_RAGGED_VERIFY_MODE",
@@ -289,6 +314,8 @@ def run_one(args, directory, config, command, prompts):
                     "SGLANG_SIMULATE_ACC_LEN",
                     "SGLANG_DEBUG_HISPARSE_SKIP_IO",
                     "SGLANG_OASISKV_TRACE_CONFIG",
+                    "SGLANG_OASISKV_TRACE_DIAGNOSTICS",
+                    "SGLANG_DSV4_FP4_DEQUANT",
                 )
             },
         },
@@ -308,10 +335,24 @@ def run_one(args, directory, config, command, prompts):
         )
         try:
             wait_ready(process, url, args.startup_timeout)
+            write_json(directory / "server_info.json", request(url + "/server_info"))
             with (directory / "outputs.jsonl").open("x") as stream:
                 for length in args.input_lengths:
                     for i, prompt in enumerate(prompts):
                         rid = f"trace-i{length}-r{i}"
+                        write_json(
+                            directory / "request-progress.json",
+                            {
+                                "request_id": rid,
+                                "input_length": length,
+                                "status": "submitted",
+                                "submitted_unix_s": time.time(),
+                            },
+                        )
+                        print(
+                            f"{directory.name}: submitting {rid}, input={length}",
+                            flush=True,
+                        )
                         result = request(
                             url + "/generate",
                             {
@@ -340,10 +381,28 @@ def run_one(args, directory, config, command, prompts):
                             + "\n"
                         )
                         stream.flush()
+                        write_json(
+                            directory / "request-progress.json",
+                            {
+                                "request_id": rid,
+                                "input_length": length,
+                                "status": "completed",
+                                "output_tokens": len(result["output_ids"]),
+                            },
+                        )
                         print(
                             f"{directory.name}: {rid}, output={len(result['output_ids'])}",
                             flush=True,
                         )
+        except Exception as error:
+            write_json(
+                directory / "failure.json",
+                {
+                    "error": f"{type(error).__name__}: {error}",
+                    "unix_s": time.time(),
+                },
+            )
+            raise
         finally:
             stop(process)
 
@@ -368,6 +427,28 @@ def main():
     parser.add_argument("--input-lengths", type=int, nargs="+", default=[16384, 32768])
     parser.add_argument("--output-length", type=int, default=256)
     parser.add_argument("--requests", type=int, default=2)
+    parser.add_argument(
+        "--mode",
+        choices=["experiment", "untraced", "control", "probes", "full-control"],
+        default="experiment",
+        help="Single modes collect diagnostics only; experiment runs paired groups and analysis",
+    )
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="Log CPU admission/forward stages, including in untraced mode",
+    )
+    parser.add_argument(
+        "--moe-runner-backend",
+        choices=["flashinfer_mxfp4", "marlin", "humming"],
+        default="flashinfer_mxfp4",
+    )
+    parser.add_argument(
+        "--host-to-device-ratio",
+        type=int,
+        default=1,
+        help="Global C4 prefill pool shrink ratio, distinct from resident-units",
+    )
     parser.add_argument("--max-windows", type=int, default=32)
     parser.add_argument(
         "--snapshot-gib",
@@ -394,6 +475,12 @@ def main():
     parser.add_argument("--startup-timeout", type=int, default=1800)
     parser.add_argument("--request-timeout", type=int, default=21600)
     parser.add_argument(
+        "--watchdog-timeout",
+        type=int,
+        default=600,
+        help="Scheduler forward watchdog; independent of client request timeout",
+    )
+    parser.add_argument(
         "--skip-full-control",
         action="store_true",
         help="Smoke runs only: omit the full-G acceptance reference",
@@ -406,7 +493,7 @@ def main():
     v = validate_args(args, gamma)
     command = server_command(args, gamma)
     print(
-        f"G={gamma}, V={v}, P={args.probes}, index_topk={args.top_k}, resident_C4={args.resident_units}; B=1, TP=4; quality experiment, graphs disabled"
+        f"mode={args.mode}; G={gamma}, V={v}, P={args.probes}, index_topk={args.top_k}, resident_C4={args.resident_units}; B=1, TP=4; quality experiment, graphs disabled"
     )
     print(shlex.join(command))
     if not args.execute:
@@ -426,6 +513,7 @@ def main():
                 k: str(x) if isinstance(x, Path) else x for k, x in vars(args).items()
             },
             "commit": commit,
+            "source_diff_sha256": digest(output / "source.diff"),
             "hardware": hardware,
             "checkpoint_config_sha256": {
                 p: digest(Path(p) / "config.json") for p in (args.target, args.draft)
@@ -436,7 +524,11 @@ def main():
         },
     )
     prompts = prepare_prompts(args, output)
-    modes = ["control", "probes"] + ([] if args.skip_full_control else ["full-control"])
+    modes = (
+        ["control", "probes"] + ([] if args.skip_full_control else ["full-control"])
+        if args.mode == "experiment"
+        else [args.mode]
+    )
     for mode in modes:
         directory = output / mode
         config = {
@@ -447,8 +539,20 @@ def main():
             "shadows": mode == "probes",
             "max_windows": args.max_windows,
             "snapshot_gib": args.snapshot_gib,
+            "request_ids": [
+                f"trace-i{length}-r{i}"
+                for length in args.input_lengths
+                for i in range(args.requests)
+            ],
         }
-        run_one(args, directory, config, command, prompts)
+        run_one(
+            args, directory, None if mode == "untraced" else config, command, prompts
+        )
+    if args.mode != "experiment":
+        print(
+            f"Collected {args.mode}; no cross-process audit or coverage report: {output}"
+        )
+        return
     from audit import acceptance_summary
 
     write_json(

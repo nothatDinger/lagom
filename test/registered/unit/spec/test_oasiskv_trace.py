@@ -454,6 +454,120 @@ def test_delivered_server_command_is_accepted_by_real_cli_parser():
     assert parsed.tp_size == 4
     assert parsed.disable_overlap_schedule
     assert parsed.attention_backend == "dsv4"
+    assert parsed.moe_runner_backend == "flashinfer_mxfp4"
+    assert json.loads(parsed.hisparse_config)["host_to_device_ratio"] == 1
+
+
+def test_untraced_arm_removes_inherited_hook_but_keeps_real_io(monkeypatch, tmp_path):
+    monkeypatch.setenv("SGLANG_OASISKV_TRACE_CONFIG", "/old/config.json")
+    monkeypatch.setenv("SGLANG_DEBUG_HISPARSE_SKIP_IO", "1")
+    monkeypatch.setenv("SGLANG_DSV4_FP4_DEQUANT", "1")
+    args = NS(gpus="0,1,2,3", diagnostics=True)
+    plain = runner.run_environment(args, None)
+    assert "SGLANG_OASISKV_TRACE_CONFIG" not in plain
+    assert plain["SGLANG_OASISKV_TRACE_DIAGNOSTICS"] == "1"
+    assert plain["SGLANG_DEBUG_HISPARSE_SKIP_IO"] == "0"
+    assert plain["SGLANG_DSV4_FP4_DEQUANT"] == "0"
+    traced = runner.run_environment(args, tmp_path / "config.json")
+    assert traced.pop("SGLANG_OASISKV_TRACE_CONFIG") == str(tmp_path / "config.json")
+    assert traced == plain
+
+
+@pytest.mark.parametrize(
+    "length,ratio,valid",
+    [(4096, 2, True), (16384, 2, True), (32768, 2, False), (32768, 1, True)],
+)
+def test_prefill_c4_capacity_is_distinct_from_decode_residency(length, ratio, valid):
+    args = NS(
+        verify_candidates=2,
+        probes=[1, 2, 3],
+        input_lengths=[length],
+        context_length=40960,
+        output_length=32,
+        requests=1,
+        snapshot_gib=32,
+        max_windows=3,
+        resident_units=3072,
+        top_k=512,
+        mem_fraction=0.9,
+        prefetch_units=256,
+        gpus="0,1,2,3",
+        host_to_device_ratio=ratio,
+    )
+    if valid:
+        assert runner.validate_args(args, 5) == 2
+    else:
+        with pytest.raises(ValueError, match="global prefill C4 pool"):
+            runner.validate_args(args, 5)
+
+
+def test_server_warmup_is_not_observed_or_shadowed():
+    trace = OasisKVTrace.__new__(OasisKVTrace)
+    trace.config = {"request_ids": ["trace-i4096-r0"]}
+    trace.v, trace.probes, trace.shadows = 2, [1, 2, 3], True
+    trace.runner = NS(req_to_token_pool=NS(req_generation=torch.tensor([1])))
+    trace.windows = {}
+    trace.layout = lambda width: width
+    sentinel = object()
+    calls = []
+
+    def forward(**kwargs):
+        calls.append(kwargs["layout"])
+        return sentinel
+
+    trace.worker = NS(device="cpu", _verify_executor=NS(run_compact=forward))
+    batch = NS(
+        reqs=[NS(rid="server-warmup")],
+        has_grammar=False,
+        return_logprob=False,
+        req_pool_indices_cpu=torch.tensor([0]),
+    )
+    # No snapshot/observer/coordinator exists on this fixture: touching one
+    # fails, proving startup traffic bypasses them even in the probes arm.
+    assert (
+        trace.run(
+            batch=batch, draft_block_ids=None, draft_tokens=None, sampling_info=None
+        )
+        is sentinel
+    )
+    assert calls == [3]
+    assert trace.windows == {}
+    assert trace.pending is None
+
+
+def test_admission_diagnostics_are_opt_in_cpu_only_and_throttled(monkeypatch, caplog):
+    from sglang.srt.speculative import oasiskv_trace_diagnostics as diagnostic
+
+    req = NS(
+        rid="trace-i4096-r0",
+        origin_input_ids=list(range(4096)),
+        full_untruncated_fill_ids=list(range(4096)),
+        prefix_indices=[],
+    )
+    adder = NS(
+        can_run_list=[],
+        rem_total_tokens=20224,
+        rem_chunk_tokens=4096,
+        is_hybrid_swa=True,
+        rem_swa_tokens=4096,
+        token_to_kv_pool_allocator=NS(size_swa=4096),
+        _swa_budget_for_req=lambda *args: 4352,
+        _swa_new_tokens=lambda req: 32,
+    )
+    result = NS(name="NO_TOKEN")
+    monkeypatch.setattr(diagnostic, "ENABLED", False)
+    diagnostic.log_admission(adder, req, result)
+    assert not caplog.records
+    monkeypatch.setattr(diagnostic, "ENABLED", True)
+    monkeypatch.setattr(diagnostic, "_last_log", {})
+    with caplog.at_level("INFO"):
+        diagnostic.log_admission(adder, req, result)
+        diagnostic.log_admission(adder, req, result)
+    assert len(caplog.records) == 1
+    payload = json.loads(caplog.records[0].getMessage().split("OasisKV progress ")[1])
+    assert payload["swa_needed"] == 4352
+    assert payload["swa_free"] == 4096
+    assert not payload["admitted"]
 
 
 def test_finish_rejects_probe_acceptance_and_writes_complete_gzip(tmp_path):

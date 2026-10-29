@@ -296,6 +296,7 @@ from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
+from sglang.srt.speculative.oasiskv_trace_diagnostics import log_admission, log_progress
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -2724,6 +2725,7 @@ class Scheduler(
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
+            log_progress("queued", [req], prompt_tokens=len(req.origin_input_ids))
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -3362,6 +3364,7 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            log_admission(adder, req, res)
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -3440,7 +3443,9 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
+        log_progress("prepare-extend-enter", new_batch.reqs)
         new_batch.prepare_for_extend()
+        log_progress("prepare-extend-returned", new_batch.reqs)
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:

@@ -5,7 +5,6 @@ from dataclasses import replace
 from typing import Optional
 
 import torch
-
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
@@ -61,6 +60,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.oasiskv_trace_diagnostics import log_progress
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
@@ -446,6 +446,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         on_publish=None,
         grammar_barrier=None,
     ) -> GenerationBatchResult:
+        log_progress("dspark-forward-enter", batch.reqs, mode=str(batch.forward_mode))
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
@@ -463,9 +464,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
+        log_progress("target-prefill-enter", batch.reqs)
         batch_output = self.target_worker.forward_batch_generation(
             batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
+        log_progress("target-prefill-returned", batch.reqs)
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         batch_output.new_seq_lens = batch.seq_lens
@@ -510,6 +513,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             final_pos = torch.repeat_interleave(
                 (draft_seq_lens + ctx_lens - 1).to(torch.int64), repeats
             )
+        log_progress("draft-kv-inject-enter", batch.reqs)
         self._kv_injector.inject_target_hidden(
             target_hidden=logits_output.hidden_states,
             cache_loc=batch.out_cache_loc,
@@ -517,6 +521,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             state_slot=state_slot,
             final_pos=final_pos,
         )
+        log_progress("draft-kv-inject-returned", batch.reqs)
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
 
@@ -619,6 +624,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         sampling_info = batch.sampling_info
+        log_progress("draft-propose-enter", batch.reqs)
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
             proposal = self._proposer.propose(
                 batch=batch,
@@ -629,6 +635,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 target_model=target_model,
                 sampling_info=sampling_info,
             )
+        log_progress("draft-propose-returned", batch.reqs)
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
