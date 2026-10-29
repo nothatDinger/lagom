@@ -886,17 +886,22 @@ class ModelRunner:
             self.spec_algorithm.is_dspark()
             and not self.server_args.is_oasiskv_lookahead
         ):
+            from sglang.srt.speculative.oasiskv_trace_workspace import (
+                trace_resident_verify_width,
+            )
+
+            resident_verify_width = trace_resident_verify_width(speculative_verify_width)
             hisparse_cfg = resolve_dspark_device_buffer_size(
                 hisparse_cfg,
                 raw_hisparse_config=self.server_args.hisparse_config,
-                verify_width=speculative_verify_width,
+                verify_width=resident_verify_width,
                 effective_top_k=hisparse_top_k,
             )
             logger.info(
                 "HiSparse DSPARK resident buffer uses %d C4 entries "
                 "(verify_width=%d * effective_top_k=%d).",
                 hisparse_cfg.device_buffer_size,
-                speculative_verify_width,
+                resident_verify_width,
                 hisparse_top_k,
             )
         if hisparse_top_k != hisparse_cfg.top_k:

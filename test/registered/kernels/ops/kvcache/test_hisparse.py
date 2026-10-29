@@ -1,4 +1,6 @@
 import sys
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -149,15 +151,18 @@ def _dsv4_ptrs(cache: torch.Tensor) -> torch.Tensor:
 
 @pytest.mark.parametrize("history", [4096, 8192])
 @pytest.mark.parametrize("duplicate_newest", [False, True])
-def test_v4_six_verify_rows_keep_live_kv_at_3072_capacity(history, duplicate_newest):
-    """Actual fused H2D kernel, 6x512 selections, fixed 3072 hot slots.
+@pytest.mark.parametrize("width", [6, 12])
+def test_v4_verify_rows_keep_live_kv_at_3072_capacity(history, duplicate_newest, width):
+    """Actual fused H2D kernel, native 6 rows or exact shadow with 12 rows.
 
     The reserved slot has the last prefill C4, as retained by the V4 allocator.
     Later rows may also load a hot copy of that token after their C4 length grows.
     """
+    from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
     from sglang.srt.speculative.oasiskv_trace import check_live_locations
+    from sglang.srt.speculative.oasiskv_trace_workspace import ShadowKVWorkspace
 
-    hot, k, width = 3072, 512, 6
+    hot, k = 3072, 512
     host = torch.zeros(
         (history // DSV4_PAGE_SIZE, DSV4_PAGE_BYTES), dtype=torch.uint8, pin_memory=True
     )
@@ -172,12 +177,17 @@ def test_v4_six_verify_rows_keep_live_kv_at_3072_capacity(history, duplicate_new
     ].view(-1, DSV4_PAGE_SIZE, DSV4_SCALE_BYTES).copy_(
         (logical // 256).to(torch.uint8).unsqueeze(-1)
     )
-    device = host[: hot // DSV4_PAGE_SIZE + 1].to(DEVICE)
+    device = torch.zeros(
+        (hot // DSV4_PAGE_SIZE + 3 + width * k // DSV4_PAGE_SIZE, DSV4_PAGE_BYTES),
+        dtype=torch.uint8,
+        device=DEVICE,
+    )
+    device[: hot // DSV4_PAGE_SIZE + 1].copy_(host[: hot // DSV4_PAGE_SIZE + 1])
     # Retained newest at physical slot hot, outside the LRU range.
-    device[-1, :DSV4_VALUE_BYTES] = (history - 1) % 256
-    device[-1, DSV4_SCALE_OFFSET : DSV4_SCALE_OFFSET + DSV4_SCALE_BYTES] = (
-        history - 1
-    ) // 256
+    device[hot // DSV4_PAGE_SIZE, :DSV4_VALUE_BYTES] = (history - 1) % 256
+    device[
+        hot // DSV4_PAGE_SIZE, DSV4_SCALE_OFFSET : DSV4_SCALE_OFFSET + DSV4_SCALE_BYTES
+    ] = (history - 1) // 256
     tokens = (
         torch.cat((torch.arange(hot), torch.tensor([history - 1])))
         .to(device=DEVICE, dtype=torch.int32)
@@ -185,7 +195,9 @@ def test_v4_six_verify_rows_keep_live_kv_at_3072_capacity(history, duplicate_new
     )
     locations = torch.arange(hot + 1, device=DEVICE, dtype=torch.int32).view(1, -1)
     lru = torch.arange(hot, device=DEVICE, dtype=torch.int16).view(1, -1)
-    raw = torch.arange(history - hot, history, dtype=torch.int32).view(width, k)
+    raw = (
+        torch.arange(history - width * k, history, dtype=torch.int32) % history
+    ).view(width, k)
     raw[0, 0], raw[-1, -1] = raw[-1, -1].clone(), raw[0, 0].clone()
     if duplicate_newest:
         raw[-1, 1] = history - 1
@@ -195,33 +207,59 @@ def test_v4_six_verify_rows_keep_live_kv_at_3072_capacity(history, duplicate_new
     real_reqs = torch.ones(1, dtype=torch.int32, device=DEVICE)
     host_locs = torch.arange(history + 1, dtype=torch.int64, device=DEVICE).view(1, -1)
     host_locs[0, history] = -1  # Current-window C4 is resolved through scratch.
-    for row in range(width):
-        load_cache_to_device_buffer_dsv4_mla(
-            top_k_tokens=raw[row : row + 1],
-            device_buffer_tokens=tokens,
-            host_cache_locs=host_locs,
-            device_buffer_locs=locations,
-            host_cache=host,
-            device_buffer=device,
-            top_k_device_locs=output[row : row + 1],
-            req_pool_indices=req,
-            seq_lens=torch.tensor(
-                [history + (row >= 3)], dtype=torch.int32, device=DEVICE
-            ),
-            lru_slots=lru,
-            item_size_bytes=DSV4_ITEM_BYTES,
-            num_top_k=k,
-            hot_buffer_size=hot,
-            page_size=1,
-            num_real_reqs=real_reqs,
-        )
+    allocator = PagedTokenToKVPoolAllocator(
+        size=(device.shape[0] - 1) * DSV4_PAGE_SIZE,
+        page_size=DSV4_PAGE_SIZE,
+        dtype=torch.uint8,
+        device=DEVICE,
+        kvcache=None,
+        need_sort=True,
+    )
+    allocator.alloc(hot + DSV4_PAGE_SIZE)
+    saved_free, saved_release = allocator.free_pages, allocator.release_pages
+    coordinator = SimpleNamespace(
+        top_k=k,
+        mem_pool_host=SimpleNamespace(device_ptrs=_dsv4_ptrs(device)),
+        token_to_kv_pool_allocator=SimpleNamespace(hisparse_attn_allocator=allocator),
+    )
+    copied_tokens, copied_locs = [], []
+    lease = ShadowKVWorkspace(coordinator, width) if width > 6 else nullcontext(None)
+    with lease as workspace:
+        for row in range(width):
+            load_cache_to_device_buffer_dsv4_mla(
+                top_k_tokens=raw[row : row + 1],
+                device_buffer_tokens=tokens,
+                host_cache_locs=host_locs,
+                device_buffer_locs=locations,
+                host_cache=host,
+                device_buffer=device,
+                top_k_device_locs=output[row : row + 1],
+                req_pool_indices=req,
+                seq_lens=torch.tensor(
+                    [history + (row >= 3)], dtype=torch.int32, device=DEVICE
+                ),
+                lru_slots=lru,
+                item_size_bytes=DSV4_ITEM_BYTES,
+                num_top_k=k,
+                hot_buffer_size=hot,
+                page_size=1,
+                num_real_reqs=real_reqs,
+            )
+            if workspace is not None:
+                ids, locs = workspace.copy_row(
+                    0, row, raw[row : row + 1], output[row : row + 1], history
+                )
+                copied_tokens.extend(ids)
+                copied_locs.extend(locs)
+    assert allocator.free_pages is saved_free
+    assert allocator.release_pages is saved_release
     torch.cuda.synchronize()
     selected, wanted = output.cpu(), raw.cpu()
     check_live_locations(
         wanted.tolist(),
         selected.tolist(),
-        tokens[0].cpu().tolist(),
-        locations[0].cpu().tolist(),
+        tokens[0].cpu().tolist() + copied_tokens,
+        locations[0].cpu().tolist() + copied_locs,
         history,
         buffer_size=hot,
     )

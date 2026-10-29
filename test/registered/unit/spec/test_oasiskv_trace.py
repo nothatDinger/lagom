@@ -500,7 +500,10 @@ def test_fixed_trace_does_not_need_confidence_head_but_backend_keeps_compact_mod
             DSparkVerifyPlanner(**kwargs)
 
 
-def test_delivered_server_command_is_accepted_by_real_cli_parser():
+@pytest.mark.parametrize("wide", [False, True])
+def test_delivered_server_command_is_accepted_by_real_cli_parser(wide):
+    from sglang.srt.arg_groups.speculative_hook import _handle_dspark
+
     args = NS(
         target=runner.TARGET,
         draft=runner.DRAFT,
@@ -512,16 +515,29 @@ def test_delivered_server_command_is_accepted_by_real_cli_parser():
         seed=42,
         request_timeout=21600,
     )
-    command = runner.server_command(args, 7)
+    if wide:
+        args.verify_width, args.probes = 6, [1, 2, 3, 4, 5, 6]
+    command = runner.server_command(args, 5 if wide else 7)
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     parsed = parser.parse_args(command[3:])
-    assert parsed.speculative_num_draft_tokens == 8
+    assert parsed.speculative_num_draft_tokens == (12 if wide else 8)
+    assert parsed.speculative_dspark_block_size == (11 if wide else 7)
     assert parsed.tp_size == 4
     assert parsed.disable_overlap_schedule
     assert parsed.attention_backend == "dsv4"
     assert parsed.moe_runner_backend == "flashinfer_mxfp4"
     assert json.loads(parsed.hisparse_config)["host_to_device_ratio"] == 1
+    # Exercise the semantic gamma cross-check too, not just argparse. Passing
+    # num-draft-tokens alone would be rejected for the trained G=5 checkpoint.
+    server_args = ServerArgs(model_path="dummy")
+    server_args.device = "cuda"
+    server_args.speculative_algorithm = "DSPARK"
+    server_args.speculative_draft_model_path = args.draft
+    server_args.speculative_dspark_block_size = parsed.speculative_dspark_block_size
+    server_args.speculative_num_draft_tokens = parsed.speculative_num_draft_tokens
+    _handle_dspark(server_args)
+    assert server_args.speculative_num_draft_tokens == (12 if wide else 8)
 
 
 def test_untraced_arm_removes_inherited_hook_but_keeps_real_io(monkeypatch, tmp_path):
@@ -665,17 +681,18 @@ def test_finish_rejects_acceptance_that_disagrees_with_pre_shadow_control(tmp_pa
     assert not (tmp_path / "paired-baseline.jsonl.gz").exists()
 
 
-@pytest.mark.parametrize("v", [1, 2, 3])
+@pytest.mark.parametrize("v", [1, 2, 3, 5])
 def test_native_acceptance_cannot_accept_the_reserved_suffix(v):
     # Even when *every* candidate matches, only V may be accepted. The bonus
     # must come from target row V, not a later probe row or a zero-padded row.
-    candidates = torch.tensor([[1, 2, 3, 4, 5]])
-    logits = torch.full((5, 10), -100.0)
-    logits[torch.arange(5), torch.tensor([2, 3, 4, 5, 6])] = 1
+    width = 12
+    candidates = torch.arange(1, width + 1).view(1, -1)
+    logits = torch.full((width, width + 2), -100.0)
+    logits[torch.arange(width), torch.arange(2, width + 2)] = 1
     accepted, bonus, _ = AcceptGreedy.execute(
         candidates=candidates,
         target_logits=logits,
-        verify_num_draft_tokens=5,
+        verify_num_draft_tokens=width,
         cutoff_verify_lens=torch.tensor([v + 1]),
     )
     assert accepted.tolist() == [v]

@@ -12,6 +12,14 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 
+def proposal_protocol(record):
+    return {
+        "checkpoint_gamma": record.get("checkpoint_gamma"),
+        "proposal_gamma": record.get("proposal_gamma"),
+        "probe_workspace": record.get("probe_workspace", "none"),
+    }
+
+
 def outputs(directory):
     result = {}
     for line in (directory / "outputs.jsonl").read_text().splitlines():
@@ -74,6 +82,7 @@ def windows(directory, filename="trace.jsonl.gz", *, paired=False):
                 dict(event, ids=sorted(event["ids"])) for event in r["miss_events"]
             ]
             if paired:
+                result[key].update(proposal_protocol(r))
                 result[key].update(
                     {
                         field: r[field]
@@ -122,6 +131,8 @@ def audit_within_server(directory):
             )
     config = json.loads((directory / "config.json").read_text())
     runtime = json.loads((directory / "runtime.json").read_text())
+    if proposal_protocol(config) != proposal_protocol(runtime):
+        raise ValueError("Runtime proposal/workspace policy differs from configuration")
     if config.get("shadows") is not True or not config.get("probes"):
         raise ValueError(
             "Within-server quality audit requires shadows and probe P values"
@@ -179,6 +190,8 @@ def audit_within_server(directory):
         ] != config.get("topk_order", "native"):
             raise ValueError(f"Trace configuration differs at {key}")
         for record in layers.values():
+            if proposal_protocol(record) != proposal_protocol(config):
+                raise ValueError(f"Trace proposal/workspace policy differs at {key}")
             for field in (
                 "input_ids",
                 "commit_len",
@@ -226,6 +239,10 @@ def audit_within_server(directory):
             record = json.loads(line)
             if record["kind"] != "probe":
                 continue
+            if proposal_protocol(record) != proposal_protocol(config):
+                raise ValueError(
+                    "Probe proposal/workspace policy differs from configuration"
+                )
             key = tuple(
                 record[x]
                 for x in (
@@ -265,6 +282,12 @@ def audit_within_server(directory):
         "request_windows": len(grouped),
         "layer_windows": len(right),
         "probe_records": len(probes),
+        "verify_width": config["verify_candidates"] + 1,
+        "probe_lengths": config["probes"],
+        "checkpoint_gamma": config.get("checkpoint_gamma"),
+        "proposal_gamma": config.get("proposal_gamma"),
+        "probe_workspace": config.get("probe_workspace", "none"),
+        "resident_units": runtime.get("device_buffer_size"),
         "trace_sha256": file_digest(directory / "trace.jsonl.gz"),
         "paired_baseline_sha256": file_digest(directory / "paired-baseline.jsonl.gz"),
         "replay_audit_sha256": file_digest(directory / "replay-audit.jsonl"),

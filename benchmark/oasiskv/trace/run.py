@@ -63,6 +63,28 @@ def checkpoint_topk(path):
     return value
 
 
+def real_candidates(args):
+    value = getattr(args, "verify_candidates", None)
+    return value if value is not None else getattr(args, "verify_width", 6) - 1
+
+
+def proposal_gamma(args, trained_gamma):
+    mode = getattr(args, "collection_mode", getattr(args, "mode", "paired"))
+    if mode in ("untraced", "full-control") or not hasattr(args, "probes"):
+        return trained_gamma
+    return max(trained_gamma, real_candidates(args) + max(args.probes))
+
+
+def resident_verify_width(args, trained_gamma):
+    mode = getattr(args, "mode", "paired")
+    if mode in ("untraced", "full-control"):
+        return trained_gamma + 1
+    width = real_candidates(args) + 1
+    if mode == "experiment" and not getattr(args, "skip_full_control", False):
+        width = max(width, trained_gamma + 1)
+    return width
+
+
 def server_command(args, gamma):
     return [
         sys.executable,
@@ -74,8 +96,10 @@ def server_command(args, gamma):
         args.draft,
         "--speculative-algorithm",
         "DSPARK",
+        "--speculative-dspark-block-size",
+        str(proposal_gamma(args, gamma)),
         "--speculative-num-draft-tokens",
-        str(gamma + 1),
+        str(proposal_gamma(args, gamma) + 1),
         "--host",
         "127.0.0.1",
         "--port",
@@ -126,31 +150,30 @@ def validate_args(args, gamma):
         raise ValueError(
             "Untraced mode has no ordering hook; use replay-check or control"
         )
-    v = (
-        args.verify_candidates
-        if args.verify_candidates is not None
-        else gamma - max(args.probes)
-    )
-    if not 1 <= v <= gamma or any(p < 1 or v + p > gamma for p in args.probes):
-        raise ValueError(
-            f"Need 1 <= V and V + max(P) <= checkpoint G={gamma}; got V={v}, P={args.probes}"
-        )
+    v = real_candidates(args)
+    if v < 1 or not args.probes or any(p < 1 for p in args.probes):
+        raise ValueError("Need W >= 2 and positive probe lengths")
+    runtime_gamma = proposal_gamma(args, gamma)
     if len(set(args.probes)) != len(args.probes):
         raise ValueError("Duplicate probe lengths")
     if min(args.input_lengths) < 1 or len(set(args.input_lengths)) != len(
         args.input_lengths
     ):
         raise ValueError("Input lengths must be positive and unique")
-    if args.context_length < max(args.input_lengths) + args.output_length + gamma + 1:
+    if (
+        args.context_length
+        < max(args.input_lengths) + args.output_length + runtime_gamma + 1
+    ):
         raise ValueError("Context length must cover prompt, output and proposal window")
     if (
         min(args.requests, args.output_length, args.snapshot_gib) <= 0
         or args.max_windows < 2
     ):
         raise ValueError("Need positive requests/output/snapshot size and >=2 windows")
-    if args.resident_units < (gamma + 1) * args.top_k:
+    baseline_width = resident_verify_width(args, gamma)
+    if args.resident_units < baseline_width * args.top_k:
         raise ValueError(
-            f"Ordinary DSPARK requires capacity >= (G+1)*index_topk = {(gamma + 1) * args.top_k} C4 units"
+            f"Real verify requires capacity >= W*index_topk = {baseline_width * args.top_k} C4 units"
         )
     if not 0 < args.mem_fraction < 1 or args.prefetch_units < 0:
         raise ValueError("Invalid memory fraction or prefetch cap")
@@ -423,7 +446,12 @@ def mode_plan(args):
     if not 1 <= args.port <= 65536 - len(modes):
         raise ValueError("Base --port and all mode ports must be within 1..65535")
     return [
-        (mode, argparse.Namespace(**(vars(args) | {"port": args.port + offset})))
+        (
+            mode,
+            argparse.Namespace(
+                **(vars(args) | {"port": args.port + offset, "collection_mode": mode})
+            ),
+        )
         for offset, mode in enumerate(modes)
     ]
 
@@ -573,12 +601,19 @@ def main():
         action="store_true",
         help="Otherwise print the resolved plan only (no GPU/model load)",
     )
-    parser.add_argument(
+    widths = parser.add_mutually_exclusive_group()
+    widths.add_argument(
+        "--verify-width",
+        type=int,
+        default=6,
+        help="Real target verify rows including anchor (W); probes are appended",
+    )
+    widths.add_argument(
         "--verify-candidates",
         type=int,
-        help="Default: G - max(P), preserving checkpoint G",
+        help="Equivalent to W-1; retained for old experiment recipes",
     )
-    parser.add_argument("--probes", type=int, nargs="+", default=[1, 2, 3])
+    parser.add_argument("--probes", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6])
     parser.add_argument("--input-lengths", type=int, nargs="+", default=[16384, 32768])
     parser.add_argument("--output-length", type=int, default=256)
     parser.add_argument("--requests", type=int, default=2)
@@ -633,7 +668,7 @@ def main():
     parser.add_argument(
         "--resident-units",
         type=int,
-        help="C4 capacity; default (G+1)*model index_topk, the ordinary DSPARK safety bound",
+        help="Persistent C4 capacity; default W*index_topk (also covers native full-control if requested)",
     )
     parser.add_argument(
         "--prefetch-units",
@@ -670,11 +705,11 @@ def main():
     gamma = checkpoint_gamma(args.draft)
     args.top_k = checkpoint_topk(args.target)
     if args.resident_units is None:
-        args.resident_units = (gamma + 1) * args.top_k
+        args.resident_units = resident_verify_width(args, gamma) * args.top_k
     v = validate_args(args, gamma)
     plan = mode_plan(args)
     print(
-        f"mode={args.mode}; G={gamma}, V={v}, P={args.probes}, index_topk={args.top_k}, resident_C4={args.resident_units}; B=1, TP=4; quality experiment, graphs disabled"
+        f"mode={args.mode}; checkpoint_G={gamma}, proposal_G={proposal_gamma(args, gamma)}, W={v+1}, P={args.probes}, index_topk={args.top_k}, resident_C4={args.resident_units}; B=1, TP=4; offline quality, graphs disabled"
     )
     for mode, mode_args in plan:
         print(f"{mode}: {shlex.join(server_command(mode_args, gamma))}")
@@ -701,6 +736,10 @@ def main():
                 p: digest(Path(p) / "config.json") for p in (args.target, args.draft)
             },
             "gamma": gamma,
+            "checkpoint_gamma": gamma,
+            "proposal_gamma": proposal_gamma(args, gamma),
+            "verify_width": v + 1,
+            "max_target_width": v + 1 + max(args.probes),
             "verify_candidates": v,
             "timing_valid": False,
         },
@@ -713,6 +752,9 @@ def main():
             "run_id": mode,
             "output": str(directory),
             "verify_candidates": gamma if mode == "full-control" else v,
+            "checkpoint_gamma": gamma,
+            "proposal_gamma": proposal_gamma(mode_args, gamma),
+            "probe_workspace": "row-copy",
             "probes": args.probes if mode == "probes" else [],
             "shadows": mode in ("probes", "replay-check"),
             "topk_order": args.topk_order,

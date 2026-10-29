@@ -12,7 +12,7 @@ import gzip
 import json
 import os
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from itertools import zip_longest
 from pathlib import Path
 
@@ -325,13 +325,16 @@ def replace_method(obj, name, method):
 
 
 class ForwardObservation:
-    def __init__(self, coordinator, real_width, mode, history_units, req_slot):
+    def __init__(
+        self, coordinator, real_width, mode, history_units, req_slot, workspace=None
+    ):
         self.coordinator = coordinator
         self.real_width = real_width
         self.mode = mode
         self.history_units = history_units
         self.req_slot = req_slot
         self.layers = {}
+        self.workspace = workspace
 
     @contextmanager
     def capture(self):
@@ -351,6 +354,7 @@ class ForwardObservation:
                 raise RuntimeError("Invalid trace verify geometry")
             rows = raw[:width].detach().cpu().tolist()
             misses = []
+            copied_tokens, copied_locations = [], []
             run_swap = coordinator._run_swap_in_kernel
             src = torch.empty(
                 (1, coordinator.top_k), dtype=torch.int64, device=raw.device
@@ -365,6 +369,21 @@ class ForwardObservation:
                 result = run_swap(*args, **kw)
                 size = int(count.item())
                 ids = [host_to_logical[x] for x in src[0, :size].cpu().tolist()]
+                if self.workspace is not None:
+                    row = len(misses)
+                    current_tokens, current_locs = self.residency(layer)
+                    check_live_locations(
+                        [rows[row]],
+                        result.cpu().tolist(),
+                        current_tokens,
+                        current_locs,
+                        self.history_units,
+                    )
+                    copied, locations = self.workspace.copy_row(
+                        layer, row, raw[row : row + 1], result, self.history_units
+                    )
+                    copied_tokens.extend(copied)
+                    copied_locations.extend(locations)
                 misses.append({"row": len(misses), "ids": ids})
                 return result
 
@@ -401,8 +420,8 @@ class ForwardObservation:
             check_live_locations(
                 rows,
                 result[:width].cpu().tolist(),
-                tokens,
-                locs,
+                tokens + copied_tokens,
+                locs + copied_locations,
                 self.history_units,
                 buffer_size=getattr(coordinator, "device_buffer_size", None),
             )
@@ -416,6 +435,11 @@ class ForwardObservation:
                     }
                 ),
                 "miss_events": misses,
+                "workspace_d2d_bytes": (
+                    len(copied_tokens) * coordinator.item_size_bytes
+                    if copied_tokens
+                    else 0
+                ),
             }
             return result
 
@@ -454,16 +478,21 @@ class OasisKVTrace:
         self.probes = config["probes"]
         self.max_windows = config["max_windows"]
         self.shadows = config.get("shadows", True)
+        workspace_mode = config.get("probe_workspace", "none")
+        if workspace_mode not in ("none", "row-copy"):
+            raise ValueError("Trace probe_workspace must be none or row-copy")
+        if config.get("proposal_gamma", worker.gamma) != worker.gamma:
+            raise ValueError("Trace proposal_gamma must match DSPARK runtime gamma")
         topk_order = config.get("topk_order", "native")
         if topk_order not in ("native", "logical", "logical-all"):
             raise ValueError("Trace topk_order must be native, logical or logical-all")
         if type(self.v) is not int or not 1 <= self.v <= worker.gamma:
-            raise ValueError("Trace V must be in [1, checkpoint gamma]")
+            raise ValueError("Trace V must be in [1, runtime proposal gamma]")
         if any(
             type(p) is not int or not 1 <= p <= worker.gamma - self.v
             for p in self.probes
         ):
-            raise ValueError("Trace requires 1 <= P <= checkpoint gamma - V")
+            raise ValueError("Trace requires 1 <= P <= runtime proposal gamma - V")
         if len(set(self.probes)) != len(self.probes) or self.max_windows < 2:
             raise ValueError("Use unique P values and at least two trace windows")
         if (
@@ -584,20 +613,37 @@ class OasisKVTrace:
             "head": 0,
             "target_forward_ms": None,
             "topk_order": self.config.get("topk_order", "native"),
+            "checkpoint_gamma": self.config.get("checkpoint_gamma"),
+            "proposal_gamma": self.config.get("proposal_gamma"),
+            "probe_workspace": self.config.get("probe_workspace", "none"),
         }
 
         def observe(mode, p):
-            observer = ForwardObservation(
-                self.coordinator, self.v + 1, mode, history_units, slot
+            from sglang.srt.speculative.oasiskv_trace_workspace import ShadowKVWorkspace
+
+            lease = (
+                ShadowKVWorkspace(self.coordinator, self.v + 1 + p)
+                if mode == "exact"
+                and p
+                and self.config.get("probe_workspace") == "row-copy"
+                else nullcontext(None)
             )
-            with observer.capture():
-                log_progress(
-                    "trace-forward-enter", batch.reqs, mode=mode, p=p, window=window
+            with lease as workspace:
+                observer = ForwardObservation(
+                    self.coordinator, self.v + 1, mode, history_units, slot, workspace
                 )
-                result = forward(self.v + 1 + p)
-                log_progress(
-                    "trace-forward-returned", batch.reqs, mode=mode, p=p, window=window
-                )
+                with observer.capture():
+                    log_progress(
+                        "trace-forward-enter", batch.reqs, mode=mode, p=p, window=window
+                    )
+                    result = forward(self.v + 1 + p)
+                    log_progress(
+                        "trace-forward-returned",
+                        batch.reqs,
+                        mode=mode,
+                        p=p,
+                        window=window,
+                    )
             return result, observer.layers
 
         # Wait for outstanding prefill/commit writes before taking a complete
@@ -676,6 +722,9 @@ class OasisKVTrace:
                                         for x in data["miss_events"][self.v + 1 :]
                                     )
                                     * self.coordinator.item_size_bytes,
+                                    probe_workspace_d2d_bytes=data[
+                                        "workspace_d2d_bytes"
+                                    ],
                                 )
                             )
             finally:

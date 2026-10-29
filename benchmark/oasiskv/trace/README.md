@@ -13,13 +13,40 @@
 | GPU | 4 × H100，TP=4，纯 TP，单机 |
 | 数据 | `/home/jovyan/td69032/ShareGPT_V3_unfiltered_cleaned_split.json` |
 | 输入 | 16384 / 32768 token，沿用性能 harness 的 ShareGPT 拼接规则 |
-| 首轮范围 | B=1，greedy，固定 V，无 grammar/logprob |
+| 首轮范围 | B=1，greedy，真实验证 W=6（anchor＋V=5 候选），无 grammar/logprob |
+| Probe | P=1～6；shadow 总宽度 W+P=7～12 |
+| DSPARK proposal | checkpoint G 单独记录；运行时生成 max(G, V+max(P)) 个候选，G=5 时扩至 11 |
 | 输出 / 采集窗口 | 每请求 256 输出 token；只记录前 32 个验证窗口 |
-| KV | 原生 V4 + HiSparse；Top-K 读取 target 的 `index_topk`；驻留容量默认 `(G+1)×index_topk` |
+| KV | 原生 V4 + HiSparse；Top-K 读取 target 的 `index_topk`；paired 默认常驻 `W×index_topk=3072` |
 | 路由专家 | 显式 `--moe-runner-backend flashinfer_mxfp4`；H100 使用 CUTLASS W4A16，保持 checkpoint MXFP4 存储 |
 | 全局 C4 池 | `host_to_device_ratio=1`，容纳完整 prefill；不改变每请求 decode 的 `resident_units` |
 
-**验证状态：GPU 测试方报告 `fd58f279f` 的两次独立 control 即使使用 `logical-all` 仍有内部路径差异，16 个输出 token 相同，30/42 个 layer-window 不同。** 因此不再把跨服务逐字段一致作为单轨迹预测实验的必要条件。本次新增同一 proposal/快照的 `paired` 实验与严格审计，相关 CPU 回归通过，尚待 GPU 复测。需要使用已能运行该仓库 V4/DSPARK 的 CUDA、FlashMLA、DeepGEMM 等环境；脚本不自动安装或下载模型依赖。
+**验证状态：GPU 测试方已报告旧 W=3、P=1/2/3 的 4K paired smoke 通过，但全驻留、没有 miss。此次 W=6、P=1～6 和 exact 临时 KV 副本已补 CPU 回归，尚待 GPU 验证。** 独立服务仍可能产生不同 proposal/Top-K，因此质量审计使用同服务、同 proposal、同快照的基线。需要使用已能运行该仓库 V4/DSPARK 的 CUDA、FlashMLA、DeepGEMM 等环境；脚本不自动安装或下载模型依赖。
+
+## W=6、P=1～6 的口径
+
+这里 W **包含 anchor**：真实接受流程只验证 5 个候选，最多提交 6 个 token。
+P 是额外 probe，不是 W 的一部分；P=6 时 target shadow 一次计算 12 行。
+默认同时传入 `--speculative-dspark-block-size 11 --speculative-num-draft-tokens 12`，
+为 DSPARK 生成 11 个候选并预留相应事务 scratch；两个参数必须匹配，单独设置后者会被 CLI 的 checkpoint 宽度校验拒绝。
+trace 的 compact verify 把真实窗口限制为 6 行，额外候选不会被接受。
+
+对于原生 G=5 的 checkpoint，这属于**扩大运行时 proposal 长度的离线实验**，没有修改或重训 checkpoint。
+draft 的 forward/Markov sampler 支持该宽度；离线固定窗口不调用按训练宽度校准的 confidence planner。
+更宽的 draft forward 也可能改变前 5 个候选，所以“真实验证宽度等于普通 DSPARK 的 6”不等于“proposal 或接受率等于原生 G=5”。
+每步只生成一次宽 proposal，不同 P 共用它的前缀；不要把不同最大 P（从而不同运行时 proposal 长度）的独立运行混为一条曲线。
+`manifest.json`、`runtime.json`、trace 和分析报告分别记录 `checkpoint_gamma`、`proposal_gamma`、`probe_workspace`。
+
+**常驻容量保持 3072，而非随 12 行升至 6144。** 真实 W=6 仍满足普通的 W×K 容量下界。
+exact shadow 的每行完成原生补载后，把该行选中的历史 KV 复制到临时 C4 位置，attention 读取这些副本，
+防止后面行换入时覆盖前面行仍要读取的历史 KV。当前窗口新生成的 KV 继续由事务 scratch 处理。
+临时位置来自全局 C4 池的空闲页，在 prefill 完成后、每次 exact shadow 开始时借用，forward 完成后归还并恢复 free-list 顺序。
+每个 TP rank 最大借用 12×512=6144 个位置，在全部 C4 层对应独立数据；不会加入常驻表，也不保留到下一真实窗口。
+全局池不够时会明确报错；应增大全局池/`--context-length`，不要扩大 `--resident-units` 来掩盖缺口。
+
+resident shadow 仍只给前 6 行补载，probe 历史 miss 不补载、不使用副本。
+新增 `probe_workspace_d2d_bytes` 单独统计 exact 全部行（含真实前缀）的临时复制量，不计入 H2D miss、候选命中或真实常驻容量。
+这仅用于离线质量采集，不代表线上采用双缓冲，也不能据其耗时推导性能。
 
 ## 执行
 
@@ -36,14 +63,16 @@ python benchmark/oasiskv/trace/run.py --output /srv/oasiskv/trace-plan
 # 首先验证模型入口、快照恢复和接受边界。4K可以没有miss，不作为覆盖率曲线。
 python benchmark/oasiskv/trace/run.py --mode paired \
   --topk-order logical-all \
-  --output /srv/oasiskv/trace-smoke \
+  --verify-width 6 --probes 1 2 3 4 5 6 --resident-units 3072 \
+  --output /srv/oasiskv/trace-w6-p6-smoke \
   --input-lengths 4096 --output-length 32 \
   --requests 1 --max-windows 3 \
-  --diagnostics --request-timeout 600 --execute
+  --diagnostics --request-timeout 1800 --execute
 
 # Smoke 成功后，再跑 16K / 32K。
 python benchmark/oasiskv/trace/run.py --mode paired \
   --topk-order logical-all \
+  --verify-width 6 --probes 1 2 3 4 5 6 --resident-units 3072 \
   --output /srv/oasiskv/trace-v4-16k-32k --execute
 ```
 
@@ -275,9 +304,13 @@ PYTHONPATH=python python -m pytest -q \
 4K真实历史应约为1024个C4单元，16K约4096、32K约8192。
 4K小于3072驻留容量，miss分母为0是合理的；只有16K/32K正式样本才用于研究预取覆盖率随P的变化。
 
-`G` 从 DSPARK checkpoint 的配置中读取，启动时明确传入 `speculative_num_draft_tokens=G+1`，**不扩大训练 proposal 窗口**。默认 `P=[1,2,3]`，`V=G−3`。例如 G=7 时 V=4。若 checkpoint 的 G 太短，脚本会报错；可选 `--verify-candidates 2 --probes 1 2`，但必须满足 `V+max(P)≤G`。控制组与 probe 组使用相同的 G 和 V。
+`G` 从 DSPARK checkpoint 的配置中读取；当前默认 W=6、P=[1,2,3,4,5,6]，运行时 proposal gamma 为 `max(G, W−1+max(P))`。
+旧的 `--verify-candidates V` 参数仍可用，等价于 `--verify-width V+1`。control 与 probes 使用相同运行时 proposal gamma 和 W。
+untraced/full-control 使用 checkpoint 原生 G；前者不做采集，后者用于提供原生接受长度参考。
 
-Top-K 使用模型的原生设置，不用通用 Qwen 实验的 2048 代替 V4 的 indexer 配置。若 G=7、`index_topk=512`，默认驻留容量为 4096 个 C4 单元。现有普通 DSPARK 路径要求容量至少为 `(G+1)×index_topk`，以同时保留所有验证行的 KV；脚本遵守这一限制，不为制造 misses 而绕过它。三组容量相同，实际值写入 `runtime.json`。
+Top-K 使用模型原生设置，不用通用 Qwen 实验的 2048 代替 V4 的 indexer 配置。
+paired 默认容量是 `W×index_topk`。若 experiment 还包含比 W 更宽的原生 full-control，则共同容量也必须满足原生宽度下界；
+所有组实际容量写入 `runtime.json`。只有 opt-in trace 的 exact shadow 使用上述临时副本；普通 DSPARK 的容量检查不变。
 
 ### 16K 首窗口误报 C4 4095 被淘汰
 
@@ -301,13 +334,13 @@ GPU 测试方在 `c1d98fda2` 报告的 `references evicted C4 4095` **不能直�
 ```bash
 PYTHONPATH=python python -m pytest -q \
   test/registered/kernels/ops/kvcache/test_hisparse.py \
-  -k six_verify_rows_keep_live_kv
+  -k verify_rows_keep_live_kv
 
 python benchmark/oasiskv/trace/run.py --mode paired --topk-order logical-all \
   --gpus 1,5,6,7 --port 31010 --input-lengths 16384 --output-length 32 \
-  --verify-candidates 2 --probes 1 2 3 --resident-units 3072 \
+  --verify-width 6 --probes 1 2 3 4 5 6 --resident-units 3072 \
   --requests 1 --max-windows 3 --diagnostics --request-timeout 1800 \
-  --output /srv/oasiskv/paired-16k-reserved-fixed --execute
+  --output /srv/oasiskv/paired-16k-w6-p6 --execute
 ```
 
 16K 同进程 audit 通过后，再按原方案采集 32K。CPU 回归不代替上述 GPU kernel 和完整模型验证；4K 已有结果仍只作为全驻留 smoke。
@@ -320,8 +353,8 @@ python benchmark/oasiskv/trace/run.py --mode paired --topk-order logical-all \
 `--mode experiment` 额外启动独立 control/full-control，它们提供复现性与接受长度参考，不作为下一真实窗口 ground truth 的来源。
 
 1. **control，P=0**：固定 V 的普通 DSPARK 接受流程，无 probe，无预测预取。
-2. **probes**：同一个固定 V 基线轨迹，每个采集窗口执行 P=1/2/3 的 exact、resident 影子 forward；这些 forward 不进入接受流程、不提交 KV，也不执行后台预取。最后恢复并重放原来的 V 窗口，走普通 DSPARK 接受流程。
-3. **full-control**：验证完整 G 个候选，无 probe。用于观察缩短 V 损失了多少接受长度；它与固定 V 的窗口划分不同，不强行逐窗口配对。Smoke 可以省略这一组。
+2. **probes**：同一个固定 V 基线轨迹，每个采集窗口执行 P=1～6 的 exact、resident 影子 forward；这些 forward 不进入接受流程、不提交 KV，也不执行后台预取。最后恢复并重放原来的 V 窗口，走普通 DSPARK 接受流程。
+3. **full-control**：用 checkpoint 原生 G 生成并验证完整候选，无 probe。用于观察扩大 proposal 长度/限制真实 V 后接受长度的变化，不强行逐窗口配对。Smoke 可以省略这一组。
 
 每个 shadow 仍在**一次 target forward** 中计算 `[anchor, V 个验证候选, P 个 probe]`，让 probe 的 hidden state 经过所有 target 层。离线实验为做对照而多次重放；这不代表未来线上实现必须额外启动这些 forward。
 
@@ -329,7 +362,7 @@ P=0 没有新的预测集合。验证行自己的 Top-K 已经为本轮 attentio
 
 ## exact / resident 的具体语义
 
-- **exact**：所有 V+1+P 行使用原生稀疏 Top-K 和按需补载。它是相同 draft 分支的精确稀疏 attention 参考，不是 dense attention，也不是下一轮命中率的数学上界。
+- **exact**：所有 V+1+P 行使用原生稀疏 Top-K 和按需补载，历史 KV 逐行复制到临时位置保护其读取生命周期。它是相同 draft 分支的精确稀疏 attention 参考，不是 dense attention，也不是下一轮命中率的数学上界。
 - **resident**：前 V+1 行照常补载。probe 先记录原始预测 Top-K，再仅映射其中已驻留的历史项，未驻留项的 attention 索引置为 −1；**不调用 probe 历史补载 kernel**。本窗口已计算的 C4 仍经过现有事务 scratch 映射和因果限制，SWA/C128 路径照常执行。
 
 resident 的策略是“probe Top-K 与本层真实验证后驻留集合的交集”，不是把任意驻留项补满 K。这个选择会影响深层 hidden state，因此报告必须保留 mode 标签。记录 probe Top-K 的动作发生在这一层 attention 之前；下一层的 Top-K 已受前一层近似 attention 影响。
@@ -398,6 +431,7 @@ trace 的 `layer` 是 C4 层序号；`runtime.json` 给出到原模型层号的�
 | `potential_first_fetch_bytes` | 潜在可提前获取的不同单元字节；同一单元多次补载只记一次 |
 | `candidate_precision` | 候选中真正出现在下一窗口 miss 集合的比例 |
 | `probe_demand_h2d_bytes` | exact probe 自己引入的补载；resident 必须为 0 |
+| `probe_workspace_d2d_bytes` | exact shadow 全部行的临时历史 KV 复制；不计入 H2D 或预取命中；resident 为 0 |
 | `next_unavailable_units` | 下一窗口使用、但源窗口尚未成为已提交历史的单元 |
 
 没有用 kernel 调用次数代替搬运量；实际 miss 来自 swap kernel 输出的 `miss_src/miss_count`，再映射回逻辑 C4 ID。
@@ -422,7 +456,7 @@ python benchmark/oasiskv/trace/analyze.py \
 
 目前也没有把候选真正异步搬入下一窗口、模拟其间的淘汰、或观测传输完成时刻。因此 `potential_*` 只是预测潜力，`timely_miss_coverage` 和 `saved_critical_path_ms` 一律为 null。
 
-下一步先看各层、各接受长度下 resident 对下一窗口**实际 misses**的覆盖，以及相对 exact 的变化；同时查看缩短 V 的接受长度损失。只有这些数据支持继续时，再实现线上融合 forward、KV 并集的安全生命周期和 graph 下的真实传输时序测试。
+下一步先看各层、各接受长度下 resident 对下一窗口**实际 misses**的覆盖，以及相对 exact 的变化；同时查看扩大 proposal/限制 V 后的接受长度变化。只有这些数据支持继续时，再实现线上融合 forward、KV 并集的安全生命周期和 graph 下的真实传输时序测试。
 
 CPU 验证命令：
 
@@ -430,6 +464,7 @@ CPU 验证命令：
 PYTHONPATH=python SGLANG_USE_CPU_ENGINE=0 python -m pytest -q \
   test/registered/unit/spec/test_oasiskv_trace.py \
   test/registered/unit/spec/test_oasiskv_trace_startup.py \
+  test/registered/unit/spec/test_oasiskv_trace_workspace.py \
   test/registered/unit/managers/test_prefill_adder.py \
   test/registered/unit/layers/quantization/test_fp4_moe_routing.py
 ```

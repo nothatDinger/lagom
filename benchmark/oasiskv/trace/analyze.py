@@ -47,6 +47,7 @@ COUNTS = (
     "potential_first_fetch_bytes",
     "unused_candidate_units",
     "probe_demand_h2d_bytes",
+    "probe_workspace_d2d_bytes",
 )
 
 
@@ -135,8 +136,17 @@ def validate(record):
                 "probe input_ids must include anchor, verify prefix and probes"
             )
         io = _integer(record, "probe_demand_h2d_bytes")
+        d2d = _integer(
+            dict(
+                record,
+                probe_workspace_d2d_bytes=record.get("probe_workspace_d2d_bytes", 0),
+            ),
+            "probe_workspace_d2d_bytes",
+        )
         if record["mode"] == "resident" and io:
             raise ValueError("resident probe must not cause synchronous history H2D")
+        if record["mode"] == "resident" and d2d:
+            raise ValueError("resident probe must not use the exact shadow workspace")
 
 
 def _key(record):
@@ -233,6 +243,7 @@ def compare(source, following, probe, cap):
             else None
         ),
         probe_demand_h2d_bytes=probe["probe_demand_h2d_bytes"],
+        probe_workspace_d2d_bytes=probe.get("probe_workspace_d2d_bytes", 0),
     )
     _ratios(row)
     return row
@@ -243,9 +254,19 @@ def analyze(records, cap):
         raise ValueError("prefetch cap must be a nonnegative integer")
     windows, probes = {}, {}
     orders = set()
+    protocols = set()
     for record in records:
         validate(record)
         orders.add(record.get("topk_order", "native"))
+        protocols.add(
+            (
+                record.get("checkpoint_gamma"),
+                record.get("proposal_gamma"),
+                record.get("probe_workspace", "none"),
+            )
+        )
+        if len(protocols) > 1:
+            raise ValueError("Cannot mix proposal widths or probe workspace policies")
         if not orders <= {"native", "logical", "logical-all"} or len(orders) > 1:
             raise ValueError("Cannot mix different topk_order experiments")
         key = _key(record)
@@ -295,6 +316,12 @@ def analyze(records, cap):
     return {
         "schema_version": VERSION,
         "topk_order": next(iter(orders), "native"),
+        "proposal_protocol": dict(
+            zip(
+                ("checkpoint_gamma", "proposal_gamma", "probe_workspace"),
+                next(iter(protocols), (None, None, "none")),
+            )
+        ),
         "prefetch_cap_units": cap,
         "candidate_policy": "probe-frequency; ties-by-logical-ID; dedup; committed-history; subtract-residency; cap",
         "measurement": "offline prediction potential; no eviction or asynchronous timing simulation",
