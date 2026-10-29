@@ -2335,6 +2335,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.TRITON
 
         if (
+            _is_cuda
+            and moe_runner_backend.is_triton()
+            and not self.dequant_fp4_to_fp8
+            and not get_moe_a2a_backend().is_megamoe()
+        ):
+            # Validate CUDA before checkpoint loading and graph warmup. MegaMoE
+            # bypasses this runner; validate its fallback at the point of use.
+            self._check_triton_expert_layout()
+
+        if (
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_aiter()
@@ -2347,7 +2357,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # TODO(cwan): refactor other backends
             pass
 
+    def _check_triton_expert_layout(self) -> None:
+        if self.is_fp4_expert:
+            raise ValueError(
+                "Packed MXFP4 routed experts cannot use the FP8 Triton MoE runner: "
+                "their stored K dimension is hidden_size / 2. Select an MXFP4 "
+                "backend with --moe-runner-backend (or "
+                "--speculative-moe-runner-backend for the draft). "
+                "On H100/H200 use marlin; flashinfer_mxfp4 is another option "
+                "with a compatible GPU and FlashInfer build. The checkpoint's "
+                "quant_method=fp8 does not imply that routed experts are FP8."
+            )
+
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
+        self._check_triton_expert_layout()
         use_rocm_mxfp8 = self.use_mxfp8 and _is_hip and _is_gfx95_supported
         return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,

@@ -79,6 +79,29 @@ def test_capacity_and_trace_length_follow_physical_window():
     assert value.input_len == 32000 and value.output_len == 1024
 
 
+@pytest.mark.parametrize("draft_backend", ["marlin", "auto"])
+def test_moe_backends_are_explicit_and_identical_across_modes(draft_backend, tmp_path):
+    settings = args(
+        "--moe-runner-backend",
+        "marlin",
+        "--speculative-moe-runner-backend",
+        draft_backend,
+    )
+    for mode in run.MODES:
+        command = run.server_command(settings, mode, 30000)
+        assert command[command.index("--moe-runner-backend") + 1] == "marlin"
+        assert (
+            command[command.index("--speculative-moe-runner-backend") + 1]
+            == draft_backend
+        )
+        assert "--disable-cuda-graph" not in command
+    extra = tmp_path / "extra.json"
+    extra.write_text(json.dumps(["--moe-runner-backend=triton"]))
+    settings.server_args_json = str(extra)
+    with pytest.raises(ValueError, match="cannot override"):
+        run.server_command(settings, "lagom", 30000)
+
+
 def test_sharegpt_packing_exact_lengths_stable_hashes_no_random_padding():
     dataset = [
         {"conversations": [{"from": "human", "value": str(i) * 20}]} for i in range(12)

@@ -40,15 +40,32 @@ concurrency=1、TP、采样参数、W、prompt 和 CUDA Graph；两个 HiSparse 
 
 ## 运行
 
-先进入仓库根目录，在已安装本仓库及 CUDA 依赖的环境执行：
+先确认 target 和 draft 的 **routed expert 权重格式**。DeepSeek V4 的
+`quantization_config.quant_method=fp8` 可以与 `expert_dtype=fp4` 同时存在；
+应结合权重头与启动日志中的 `is_fp4_experts` 判断，不能仅凭 quant_method。
+普通 TP 下 `auto` 可能选择 FP8 Triton runner，它不支持 packed MXFP4。
+
+H100/H200（SM90）上，若 target 和 draft 均使用原生 MXFP4 专家，两者显式设置
+`marlin`。两种后端参数会用于全部吞吐组和 trace 组；不指定时仍保留服务本身的
+默认选择，脚本不会自动转换权重格式。若 draft 实际为 FP8，给 draft 单独使用
+`--speculative-moe-runner-backend auto`。其他 GPU 需选择相应的 MXFP4 后端，
+例如 SM100 的 `flashinfer_mxfp4`，不能直接套用 Hopper 的 Marlin 配置。
+
+对于本次 H100、TP=4 的 FP4 target/draft，在已安装本仓库及 CUDA 依赖的环境执行：
 
 ```bash
 python benchmark/lagom/run.py \
-  --model /models/DeepSeek-V4 \
-  --draft /models/compatible-DSPARK \
+  --model /mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --draft /mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-DSpark \
   --sharegpt /data/ShareGPT_V3_unfiltered_cleaned_split.json \
-  --tp 8 --output /results/lagom-quick-01
+  --tp 4 --w 7 --p 7 --hot 8192 \
+  --moe-runner-backend marlin --speculative-moe-runner-backend marlin \
+  --output /results/lagom-quick-01
 ```
+
+该 checkpoint 的 `dspark_block_size=5`，这里按实验要求显式覆盖为 W=7；
+接受长度应随结果记录。之前启动命令中的 `num_draft_tokens=6`、block size=5、
+prediction_steps=5 对应 W=P=5，与此次 W=P=7 的配置不同。
 
 脚本顺序启动三个未插桩的服务做吞吐测试，再单独启动一个带插桩的 Lagom 服务
 采集 trace，退出后清理自己启动的进程。默认共 4 次模型加载，不同时占用两份模型。
@@ -59,7 +76,8 @@ python benchmark/lagom/run.py \
 ```bash
 python benchmark/lagom/run.py --model /models/DeepSeek-V4 \
   --draft /models/compatible-DSPARK --sharegpt /data/sharegpt.json \
-  --tp 8 --phase throughput --output /results/lagom-throughput-01
+  --tp 4 --moe-runner-backend marlin --speculative-moe-runner-backend marlin \
+  --phase throughput --output /results/lagom-throughput-01
 ```
 
 为三组都采集 trace，并启用 Nsight Systems 的关联 CPU/CUDA 时间线：
@@ -67,7 +85,8 @@ python benchmark/lagom/run.py --model /models/DeepSeek-V4 \
 ```bash
 python benchmark/lagom/run.py --model /models/DeepSeek-V4 \
   --draft /models/compatible-DSPARK --sharegpt /data/sharegpt.json \
-  --tp 8 --phase trace --trace-modes lagom hisparse dspark --nsys \
+  --tp 4 --moe-runner-backend marlin --speculative-moe-runner-backend marlin \
+  --phase trace --trace-modes lagom hisparse dspark --nsys \
   --output /results/lagom-trace-01
 ```
 
@@ -80,6 +99,13 @@ python benchmark/lagom/run.py --model /models/DeepSeek-V4 \
 不读取模型、不启动服务。额外相同的模型参数可通过 `--server-args-json file.json`
 提供字符串数组；不能覆盖脚本控制的实验开关。模型 K 会从配置读取并与 `--top-k`
 核对；容量不足直接报错，不静默修改缓存大小。
+
+如果旧版本在 graph capture 时出现 `fused_moe.py: Hidden size mismatch`，并且
+日志同时显示 `is_fp4_experts=True` 与 Triton runner，原因是 FP4 专家权重以
+`hidden_size/2` 打包存储，而 FP8 Triton 要求完整 K 维。这与 W/P 或 trace 无关。
+本分支会在初始化该 runner 时提前拒绝此组合；正确修复是选择兼容的专家后端。
+保持 CUDA Graph 开启，且不要通过 `SGLANG_DSV4_FP4_EXPERTS=0` 将原生 FP4
+权重误标为 FP8。日志中的 FlashInfer deferred finalize disabled 本身不是错误。
 
 ## 结果
 

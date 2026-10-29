@@ -104,6 +104,12 @@ def server_command(args, mode, port):
         command += ["--enable-hisparse", "--hisparse-config", json.dumps(config)]
     if args.trust_remote_code:
         command.append("--trust-remote-code")
+    for option, value in (
+        ("--moe-runner-backend", args.moe_runner_backend),
+        ("--speculative-moe-runner-backend", args.speculative_moe_runner_backend),
+    ):
+        if value is not None:
+            command += [option, value]
     if args.server_args_json:
         extra = json.loads(Path(args.server_args_json).read_text())
         if not isinstance(extra, list) or not all(isinstance(x, str) for x in extra):
@@ -480,6 +486,14 @@ def parser():
     )
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--tp", type=int, default=8)
+    p.add_argument(
+        "--moe-runner-backend",
+        help="Target MoE runner; use marlin for native MXFP4 experts on H100/H200",
+    )
+    p.add_argument(
+        "--speculative-moe-runner-backend",
+        help="Draft MoE runner; configure separately if its expert format differs",
+    )
     p.add_argument("--w", type=int, default=7)
     p.add_argument("--p", type=int, default=7)
     p.add_argument("--hot", type=int, default=8192)
