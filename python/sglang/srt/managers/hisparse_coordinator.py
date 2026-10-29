@@ -943,10 +943,11 @@ class HiSparseCoordinator:
         if (
             getattr(self, "_pr_verify_layout", None) is not None
             and compressed_len <= self.device_buffer_size
-            and not getattr(self, "_lagom_prediction_steps", 0)
+            and self.force_h2d_each_step
         ):
             raise ValueError(
-                "pr_fused experiment requires long-context requests (compressed prefix > hot slots)"
+                "pr_fused force_h2d_each_step=true requires long-context requests "
+                "(compressed prefix > hot slots)"
             )
 
         buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
@@ -969,7 +970,7 @@ class HiSparseCoordinator:
         self.req_device_buffer_tokens[
             :, req.req_pool_idx, : self.device_buffer_size
         ] = self._device_buffer_arange_i32
-        # Lagom retains this canonical identity even for not-yet-filled short
+        # Preserved residency retains canonical identities for not-yet-filled short
         # context slots. Sequence-length masking prevents reading them before
         # their C4 commit, and the transaction overlays current writer scratch.
         # Thus short-context history has no cache misses/rotations; promotion
@@ -2256,20 +2257,15 @@ class HiSparseCoordinator:
             lengths = lengths.expand(num_reqs, verify_width)
         tokens = top_k_result.reshape(num_reqs, verify_width, self.top_k)
         output = output_buffer.view(num_reqs, verify_width, self.top_k)
-        prediction_steps = getattr(self, "_lagom_prediction_steps", 0)
         planning_width = (
-            self._speculative_verify_width if prediction_steps else verify_width
+            verify_width if self.force_h2d_each_step else self._speculative_verify_width
         )
-        if verify_width > planning_width:
-            raise ValueError(
-                "Lagom real/prediction rows exceed the fixed planner width"
-            )
         if verify_width < planning_width:
             # The persistent miss workspace partitions table/index/compact
-            # arrays by NUM_STEPS * TOP_K. Alternating W+1 and P without this
+            # arrays by NUM_STEPS * TOP_K. Changing a preserved window without
             # padding would reinterpret old compact metadata as tagged hash
-            # entries. Keep one kernel geometry for union plans and decode
-            # fallback calls; padded rows cannot read or mutate residency.
+            # entries. Keep one geometry for full verify, ragged verify and
+            # single-token fallback; padded rows cannot mutate residency.
             padded_tokens = torch.full(
                 (num_reqs, planning_width, self.top_k),
                 -1,

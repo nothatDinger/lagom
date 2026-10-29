@@ -310,13 +310,14 @@ def item(cache, loc):
     return torch.cat((value, scale))
 
 
-@pytest.mark.parametrize("decode_width,prediction_steps", [(8, 1), (2, 9)])
-def test_lagom_preserved_workspace_alternates_graph_verify_and_prefetch(
+@pytest.mark.parametrize("decode_width,prediction_steps", [(8, 1), (2, 9), (6, 0)])
+def test_lagom_or_baseline_preserved_workspace_alternates_graph_verify_and_windows(
     decode_width, prediction_steps
 ):
     from types import SimpleNamespace
 
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.lagom_graph import LagomPrefetchGraphs
 
     hot, top_k, slots, host_rows = 256, 16, 2, 1024
     full_width = decode_width + prediction_steps
@@ -341,6 +342,10 @@ def test_lagom_preserved_workspace_alternates_graph_verify_and_prefetch(
     )
     c = HiSparseCoordinator.__new__(HiSparseCoordinator)
     c._lagom_prediction_steps = prediction_steps
+    if prediction_steps:
+        # This regression exercises fused fallback without a pending side copy;
+        # still use the production layer dependency captured by that path.
+        c._lagom_graphs = LagomPrefetchGraphs(torch.cuda.Stream())
     c._speculative_verify_width = full_width
     c._spec_states, c._pr_verify_layout = [state], {"active_slots": active}
     c.force_h2d_each_step, c.skip_io, c.top_k, c.item_size_bytes = (
@@ -380,7 +385,7 @@ def test_lagom_preserved_workspace_alternates_graph_verify_and_prefetch(
     with torch.cuda.graph(graph):
         run(decode_width, real_tokens, real_output)
     for trial in range(5):
-        for width in (decode_width, prediction_steps, 1):
+        for width in (decode_width, prediction_steps or 3, 1):
             selected = (
                 torch.arange(slots * width * top_k, dtype=torch.int32, device="cuda")
                 .remainder(96)
@@ -394,7 +399,14 @@ def test_lagom_preserved_workspace_alternates_graph_verify_and_prefetch(
             else:
                 output = torch.empty_like(selected)
                 run(width, selected, output)
+            # Repeating the exact working set must reuse its resident bytes:
+            # no per-step invalidation, host reload, or stale workspace epoch.
+            if width == decode_width:
+                graph.replay()
+            else:
+                run(width, selected, output)
             torch.cuda.synchronize()
+            assert (state.scratch_state[0, reqs] == 0).all()
             device_cpu, out_cpu, selected_cpu = (
                 device.cpu(),
                 output.cpu(),

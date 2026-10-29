@@ -15,9 +15,14 @@ finalization kernels are omitted because the parent branch already owns those
 transactions in `HiSparseCoordinator`. The source branch's benchmark imports,
 manifest checks, split planner, probes and comparison scripts are not needed.
 
-The original serving restrictions are retained: CUDA DSv4 speculative verify,
-`force_h2d_each_step=true`, real KV IO, no named prefetcher, compressed prefixes
-longer than the hot buffer, and `verify_width * effective_top_k <= min(hot, 8192)`.
+Serving requires CUDA DSv4 speculative verify, real KV IO, and
+`verify_width * effective_top_k <= min(hot, 8192)`. The ordinary path has no
+named prefetcher; Lagom adds protected union planning and split transfers.
+`force_h2d_each_step` defaults to `false`: short and long contexts retain their
+resident KV between steps. Persistent scratch keeps the maximum verify width
+when smaller ragged windows or single-token fallback execute. Explicit
+`force_h2d_each_step=true` retains the forced-cold experiment, which requires
+compressed prefixes longer than the hot buffer and is incompatible with Lagom.
 For DSPARK, the hot buffer defaults to `2 * verify_width * effective_top_k`,
 including force-H2D mode (width 6 and effective Top-K 512 default to 6144 C4
 entries). Explicit buffer sizes are preserved if they can hold one complete

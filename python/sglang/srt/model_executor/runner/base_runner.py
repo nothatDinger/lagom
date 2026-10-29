@@ -621,6 +621,11 @@ class BaseRunner(ABC):
             mr.lora_manager.prepare_lora_batch(forward_batch)
 
         forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
+        coordinator = getattr(mr, "hisparse_coordinator", None)
+        if getattr(coordinator, "_spec_states", None) is not None:
+            # Dummy rows can alias the same request slot. Do not let concurrent
+            # warmup blocks mutate a persistent hash/CLOCK workspace.
+            coordinator.num_real_reqs.zero_()
         if (
             getattr(mr.server_args, "is_lagom", False)
             and not mr.is_draft_worker
@@ -634,7 +639,6 @@ class BaseRunner(ABC):
                 mr.server_args.speculative_num_draft_tokens
             )
             forward_batch.is_lagom_graph_capture = True
-            mr.hisparse_coordinator.num_real_reqs.zero_()
         mr.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():

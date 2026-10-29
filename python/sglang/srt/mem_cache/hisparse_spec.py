@@ -86,20 +86,13 @@ def validate_pr_fused_config(
             raise ValueError(
                 "Lagom prediction_steps must leave a nonempty decode window"
             )
-    if not (
-        cuda
-        and dsv4
-        and speculative
-        and width > 0
-        and (force_h2d or lagom)
-        and not skip_io
-    ):
+    if not (cuda and dsv4 and speculative and width > 0 and not skip_io):
         if lagom:
             raise ValueError(
                 "Lagom requires CUDA DeepSeek-V4 speculative verify and real KV IO"
             )
         raise ValueError(
-            "pr_fused experiment requires CUDA DSv4 speculative verify, force_h2d_each_step=true and real IO"
+            "pr_fused requires CUDA DSv4 speculative verify and real KV IO"
         )
     if prefetcher and not lagom:
         raise ValueError("pr_fused experiment does not support a named prefetcher")

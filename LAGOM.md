@@ -74,6 +74,27 @@ across prediction rows are resolved by the fused cache planner.
 Keep `force_h2d_each_step` false: invalidating residency on every step would
 discard the prefetched working set and is rejected in Lagom mode.
 
+## Run DSPARK + HiSparse without Lagom
+
+Omit `prefetcher` and `prefetcher_config` to disable Lagom. Keep
+`--speculative-algorithm DSPARK --enable-hisparse --disable-radix-cache` and the
+same model, window and cache-capacity arguments, replacing the HiSparse config
+with:
+
+```bash
+--hisparse-config '{"host_to_device_ratio":2,"device_buffer_size":8192}'
+```
+
+`force_h2d_each_step` defaults to `false` in both modes. Ordinary DSPARK uses W
+draft candidates, preserves resident KV across steps, and has no prediction
+suffix or Lagom prefetch transfers. Set `SGLANG_RAGGED_VERIFY_MODE=static` for
+the ordinary DSPARK baseline to retain target CUDA Graph; Lagom selects static
+verify automatically. This gives a comparison with the same residency policy.
+
+Explicit `force_h2d_each_step=true` remains available for forced-cold baseline
+experiments. It requires a compressed prefix longer than the hot buffer and
+cannot be combined with Lagom.
+
 ## Execution and stream ordering
 
 1. DSPARK proposes `W+P` candidates. The target executes the anchor followed by

@@ -50,19 +50,24 @@ def _replay():
     )
 
 
-def test_target_autotune_registers_split_plans_with_inactive_dummy_requests():
+@pytest.mark.parametrize("is_lagom", [False, True])
+def test_target_autotune_keeps_persistent_cache_dummy_requests_inactive(is_lagom):
     """Exercise BaseRunner warmup through the real CSA routing helper."""
     batch, decode_width, prediction_width, topk = 2, 3, 2, 4
-    total = decode_width + prediction_width
+    total = decode_width + (prediction_width if is_lagom else 0)
     physical = torch.full((batch * total, topk), 33, dtype=torch.int32)
     coordinator = SimpleNamespace(
         swap_in_lagom_pages=Mock(return_value=physical),
         num_real_reqs=torch.ones(1, dtype=torch.int32),
+        _spec_states=[object()],
     )
     seen = {}
 
     def forward(_ids, _positions, forward_batch, **_kwargs):
         seen["batch"] = forward_batch
+        assert coordinator.num_real_reqs.item() == 0
+        if not is_lagom:
+            return
         resolve_lagom_topk(
             coordinator=coordinator,
             forward_batch=forward_batch,
@@ -73,7 +78,7 @@ def test_target_autotune_registers_split_plans_with_inactive_dummy_requests():
         )
 
     args = SimpleNamespace(
-        is_lagom=True,
+        is_lagom=is_lagom,
         speculative_num_draft_tokens=decode_width,
         disaggregation_mode="null",
         enable_lora=False,
@@ -147,6 +152,11 @@ def test_target_autotune_registers_split_plans_with_inactive_dummy_requests():
     dummy(SimpleNamespace(model_runner=mr), batch_size=batch, buffers=buffers)
     captured = seen["batch"]
     assert captured.input_ids.numel() == batch * total
+    assert coordinator.num_real_reqs.item() == 0
+    if not is_lagom:
+        coordinator.swap_in_lagom_pages.assert_not_called()
+        assert not getattr(captured, "lagom_decode_width", 0)
+        return
     assert (
         coordinator.swap_in_lagom_pages.call_args.kwargs["decode_width"] == decode_width
     )

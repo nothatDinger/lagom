@@ -1003,10 +1003,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # graph; backends read it from self.model_runner.hisparse_coordinator.
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
         if forward_batch.hisparse_coordinator is not None:
-            # Capture inputs alias dummy request slot zero. Keep Lagom's cache
-            # planner inactive during warmup/capture; replay supplies raw_bs.
+            # Capture inputs alias dummy request slot zero. Persistent fused
+            # cache planners must stay inactive during warmup/capture, whether
+            # or not Lagom is enabled; replay supplies the live raw_bs.
             forward_batch.hisparse_coordinator.num_real_reqs.fill_(
-                0 if getattr(self.model_runner.server_args, "is_lagom", False) else bs
+                0
+                if getattr(forward_batch.hisparse_coordinator, "_spec_states", None)
+                is not None
+                else bs
             )
             forward_batch.is_ema_graph_capture = (
                 forward_batch.hisparse_coordinator.prefetcher_name == "ema"
