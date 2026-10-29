@@ -633,11 +633,26 @@ def test_finish_rejects_probe_acceptance_and_writes_complete_gzip(tmp_path):
     trace.writer = tmp_path / "trace.jsonl.gz"
     with pytest.raises(RuntimeError, match="acceptance boundary"):
         trace.finish(NS(commit_lens=torch.tensor([3])))
-    trace.finish(NS(commit_lens=torch.tensor([2])))
+    trace.finish(NS(commit_lens=torch.tensor([2]), out_tokens=torch.tensor([[7, 8]])))
     with gzip.open(trace.writer, "rt") as stream:
         saved = json.loads(stream.read())
     assert saved["accepted_drafts"] == 1
     assert trace.pending is None
+
+
+def test_finish_rejects_acceptance_that_disagrees_with_pre_shadow_control(tmp_path):
+    trace = OasisKVTrace.__new__(OasisKVTrace)
+    trace.v = 1
+    trace.pending = [records()[0]]
+    trace.pending_baseline = [{"committed_output_ids": [22]}]
+    trace.writer = tmp_path / "trace.jsonl.gz"
+    with pytest.raises(RuntimeError, match="pre-shadow greedy baseline"):
+        trace.finish(
+            NS(commit_lens=torch.tensor([1]), out_tokens=torch.tensor([[99, -1]]))
+        )
+    assert (tmp_path / "rejection.json").exists()
+    assert not trace.writer.exists()
+    assert not (tmp_path / "paired-baseline.jsonl.gz").exists()
 
 
 @pytest.mark.parametrize("v", [1, 2, 3])
@@ -659,7 +674,15 @@ def test_native_acceptance_cannot_accept_the_reserved_suffix(v):
 
 @pytest.mark.parametrize(
     "variant",
-    ["normal", "permutation", "changed_ids", "changed_logits", "replay_check"],
+    [
+        "normal",
+        "permutation",
+        "changed_ids",
+        "changed_logits",
+        "same_argmax_logits",
+        "changed_hidden",
+        "replay_check",
+    ],
 )
 @pytest.mark.parametrize("fail_shadow", [False, True])
 def test_whole_shadow_loop_restores_target_state_and_never_commits(
@@ -722,7 +745,12 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
         logits[:, int(state[0])] = 1
         if variant == "changed_logits" and len(calls) == 6:
             logits[:, 2] = 2
-        return NS(logits_output=NS(next_token_logits=logits)), None
+        if variant == "same_argmax_logits" and len(calls) == 6:
+            logits[:, 1] = 2
+        hidden = torch.ones(width, 4)
+        if variant == "changed_hidden" and len(calls) == 6:
+            hidden.add_(1)
+        return NS(logits_output=NS(next_token_logits=logits)), hidden
 
     trace.worker = NS(device="cpu", _verify_executor=NS(run_compact=forward))
     batch = NS(
@@ -743,7 +771,12 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
             trace.run(**kwargs)
         assert state.item() == 0
         assert c.req_device_buffer_tokens.tolist() == [[[0, 1, -1, -1, -1, -1]]]
-    elif variant in ("changed_ids", "changed_logits"):
+    elif variant in (
+        "changed_ids",
+        "changed_logits",
+        "same_argmax_logits",
+        "changed_hidden",
+    ):
         with pytest.raises(RuntimeError, match="trace rejected"):
             trace.run(**kwargs)
         assert trace.pending is None
@@ -758,9 +791,19 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
             assert diagnostic["layer_differences"] == [
                 {"layer": 0, "fields": ["topk", "resident_after", "miss_events"]}
             ]
-        else:
+        elif variant == "changed_logits":
             assert diagnostic["differing_layers"] == []
             assert diagnostic["trial_predictions"] != diagnostic["replayed_predictions"]
+        else:
+            assert diagnostic["differing_layers"] == []
+            assert diagnostic["trial_predictions"] == diagnostic["replayed_predictions"]
+            assert not diagnostic[
+                (
+                    "hidden_states_exact_equal"
+                    if variant == "changed_hidden"
+                    else "logits_exact_equal"
+                )
+            ]
     else:
         trace.run(**kwargs)
         assert state.item() == 1  # Only the final baseline forward survives.
@@ -777,6 +820,29 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
         assert diagnostic["topk_order_only_layers"] == (
             [0] if variant == "permutation" else []
         )
+        if variant != "replay_check":
+            trace.finish(
+                NS(
+                    commit_lens=torch.tensor([1]),
+                    out_tokens=torch.tensor([[1, -1, -1]]),
+                )
+            )
+            (tmp_path / "config.json").write_text(
+                json.dumps(
+                    {
+                        "shadows": True,
+                        "probes": [1, 2],
+                        "verify_candidates": 1,
+                    }
+                )
+            )
+            (tmp_path / "runtime.json").write_text(
+                json.dumps({"c4_layer_to_model_layer": {"0": 0}})
+            )
+            (tmp_path / "outputs.jsonl").write_text(
+                json.dumps({"request_id": "r", "output_ids": [20, 1]}) + "\n"
+            )
+            assert auditor.audit_within_server(tmp_path)["passed"]
 
 
 def test_comparison_preserves_query_boundaries_duplicates_and_miss_counts():
@@ -1010,6 +1076,204 @@ def test_cross_process_audit_does_not_compare_shadow_topk(tmp_path):
     write_run(control, [source, following], [1, 2, 3])
     write_run(experiment, [source, following, probe], [1, 2, 3])
     assert auditor.audit(control, experiment)["passed"]
+
+
+def write_paired_run(directory):
+    source, following, probe = records()
+    source["committed_output_ids"], following["committed_output_ids"] = [22], [24]
+    trace = [source, following]
+    for window in (source, following):
+        for mode in ("exact", "resident"):
+            trace.append(
+                dict(
+                    probe,
+                    window_id=window["window_id"],
+                    snapshot_id=window["snapshot_id"],
+                    input_ids=window["input_ids"] + [25],
+                    mode=mode,
+                )
+            )
+    write_run(directory, trace, [20, 22, 24])
+    with gzip.open(directory / "paired-baseline.jsonl.gz", "wt") as stream:
+        for window in (source, following):
+            stream.write(json.dumps(window) + "\n")
+    (directory / "config.json").write_text(
+        json.dumps({"probes": [1], "shadows": True, "verify_candidates": 1})
+    )
+    (directory / "runtime.json").write_text(
+        json.dumps({"c4_layer_to_model_layer": {"2": 4}})
+    )
+    diagnostics = []
+    for window in (source, following):
+        predictions = window["committed_output_ids"] + [99]
+        diagnostics.append(
+            dict(
+                window,
+                paired_audit_version=1,
+                passed=True,
+                logits_exact_equal=True,
+                hidden_states_exact_equal=True,
+                differing_layers=[],
+                layer_ids=[2],
+                trial_predictions=predictions,
+                replayed_predictions=predictions,
+                topk_order="native",
+            )
+        )
+    (directory / "replay-audit.jsonl").write_text(
+        "".join(json.dumps(d) + "\n" for d in diagnostics)
+    )
+    return trace, diagnostics
+
+
+def test_within_server_audit_and_analysis_bind_exact_artifacts(tmp_path):
+    directory = tmp_path / "probes"
+    write_paired_run(directory)
+    report = auditor.audit_within_server(directory)
+    assert report["passed"] and report["layer_windows"] == 2
+    assert report["scope"] == "within-server-snapshot-paired"
+    path = tmp_path / "audit.json"
+    subprocess.run(
+        [
+            sys.executable,
+            auditor.__file__,
+            str(directory),
+            "--scope",
+            "within-server",
+            "--output",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    trace = directory / "trace.jsonl.gz"
+    assert analyzer.validated_audit(path, [trace]) == report
+    analysis = tmp_path / "analysis"
+    subprocess.run(
+        [
+            sys.executable,
+            analyzer.__file__,
+            str(trace),
+            "--audit",
+            str(path),
+            "--max-prefetch-units",
+            "256",
+            "--output",
+            str(analysis),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    result = json.loads((analysis / "report.json").read_text())
+    assert result["validation"] == report and result["matched_records"] == 2
+    with gzip.open(trace, "at") as stream:
+        stream.write("\n")
+    with pytest.raises(ValueError, match="different trace bytes"):
+        analyzer.validated_audit(path, [trace])
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "topk",
+        "input_ids",
+        "resident_after",
+        "miss_events",
+        "missing_pair",
+        "missing_diagnostic",
+        "hidden_drift",
+        "logits_drift",
+        "old_evidence",
+        "missing_probe",
+        "wrong_snapshot",
+        "wrong_output",
+        "fake_acceptance",
+        "failure_marker",
+    ],
+)
+def test_within_server_audit_rejects_incomplete_or_changed_evidence(tmp_path, defect):
+    directory = tmp_path / "probes"
+    trace, diagnostics = write_paired_run(directory)
+    if defect in ("topk", "input_ids", "resident_after", "miss_events"):
+        trace[0][defect] = []
+    elif defect == "missing_pair":
+        (directory / "paired-baseline.jsonl.gz").unlink()
+    elif defect == "missing_diagnostic":
+        diagnostics.pop()
+    elif defect in ("hidden_drift", "logits_drift"):
+        diagnostics[0][
+            (
+                "hidden_states_exact_equal"
+                if defect == "hidden_drift"
+                else "logits_exact_equal"
+            )
+        ] = False
+    elif defect == "old_evidence":
+        diagnostics[0].pop("paired_audit_version")
+    elif defect == "missing_probe":
+        trace.pop()
+    elif defect == "wrong_snapshot":
+        trace[-1]["snapshot_id"] = "another snapshot"
+    elif defect == "wrong_output":
+        (directory / "outputs.jsonl").write_text(
+            json.dumps({"request_id": "r", "output_ids": [20, 999, 24]})
+        )
+    elif defect == "fake_acceptance":
+        trace[0]["committed_output_ids"] = [99]
+        with gzip.open(directory / "paired-baseline.jsonl.gz", "wt") as stream:
+            for window in trace[:2]:
+                stream.write(json.dumps(window) + "\n")
+    elif defect == "failure_marker":
+        (directory / "failure.json").write_text("{}")
+    with gzip.open(directory / "trace.jsonl.gz", "wt") as stream:
+        for record in trace:
+            stream.write(json.dumps(record) + "\n")
+    (directory / "replay-audit.jsonl").write_text(
+        "".join(json.dumps(d) + "\n" for d in diagnostics)
+    )
+    with pytest.raises(ValueError):
+        auditor.audit_within_server(directory)
+
+
+def test_independent_control_drift_is_diagnostic_without_weakening_paired_audit(
+    tmp_path,
+):
+    probes = tmp_path / "probes"
+    trace, _ = write_paired_run(probes)
+    control = tmp_path / "control"
+    changed = copy.deepcopy(trace[:2])
+    changed[0]["input_ids"][1] = 999
+    changed[0]["topk"][1] = [3, 4]
+    write_run(control, changed, [20, 22, 24])
+    with pytest.raises(auditor.AuditMismatch):
+        auditor.audit(control, probes)
+    assert auditor.audit_within_server(probes)["passed"]
+    output = tmp_path / "cross-server-audit.json"
+    process = subprocess.run(
+        [
+            sys.executable,
+            auditor.__file__,
+            str(control),
+            str(probes),
+            "--output",
+            str(output),
+            "--diagnostic-only",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert process.returncode == 0, process.stderr
+    assert not output.exists()
+    diagnostic = json.loads((tmp_path / "cross-server-audit-failure.json").read_text())
+    assert not diagnostic["passed"] and diagnostic["output_ids_equal"]
+
+
+def test_paired_plan_uses_one_server():
+    plan = runner.mode_plan(NS(mode="paired", skip_full_control=False, port=32100))
+    assert [(mode, args.port) for mode, args in plan] == [("probes", 32100)]
 
 
 @pytest.mark.parametrize("skip_full", [False, True])

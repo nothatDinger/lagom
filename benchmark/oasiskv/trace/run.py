@@ -418,7 +418,7 @@ def mode_plan(args):
     modes = (
         ["control", "probes"] + ([] if args.skip_full_control else ["full-control"])
         if args.mode == "experiment"
-        else [args.mode]
+        else ["probes"] if args.mode == "paired" else [args.mode]
     )
     if not 1 <= args.port <= 65536 - len(modes):
         raise ValueError("Base --port and all mode ports must be within 1..65535")
@@ -586,6 +586,7 @@ def main():
         "--mode",
         choices=[
             "experiment",
+            "paired",
             "untraced",
             "control",
             "probes",
@@ -593,7 +594,12 @@ def main():
             "replay-check",
         ],
         default="experiment",
-        help="Single modes collect diagnostics only; experiment runs paired groups and analysis",
+        help="paired uses one probes server and its snapshot baseline; experiment adds independent control servers",
+    )
+    parser.add_argument(
+        "--require-cross-server-match",
+        action="store_true",
+        help="For experiment only: also require independent control/probes to match exactly",
     )
     parser.add_argument(
         "--topk-order",
@@ -659,6 +665,8 @@ def main():
         help="Smoke runs only: omit the full-G acceptance reference",
     )
     args = parser.parse_args()
+    if args.require_cross_server_match and args.mode != "experiment":
+        parser.error("--require-cross-server-match requires --mode experiment")
     gamma = checkpoint_gamma(args.draft)
     args.top_k = checkpoint_topk(args.target)
     if args.resident_units is None:
@@ -723,7 +731,7 @@ def main():
             server_command(mode_args, gamma),
             prompts,
         )
-    if args.mode != "experiment":
+    if args.mode not in ("experiment", "paired"):
         print(
             f"Collected {args.mode}; no cross-process audit or coverage report: {output}"
         )
@@ -738,13 +746,27 @@ def main():
         [
             sys.executable,
             str(HERE / "audit.py"),
-            str(output / "control"),
             str(output / "probes"),
+            "--scope",
+            "within-server",
             "--output",
             str(output / "audit.json"),
         ],
         check=True,
     )
+    if args.mode == "experiment":
+        subprocess.run(
+            [
+                sys.executable,
+                str(HERE / "audit.py"),
+                str(output / "control"),
+                str(output / "probes"),
+                "--output",
+                str(output / "cross-server-audit.json"),
+            ]
+            + ([] if args.require_cross_server_match else ["--diagnostic-only"]),
+            check=True,
+        )
     subprocess.run(
         [
             sys.executable,
@@ -752,6 +774,8 @@ def main():
             str(output / "probes" / "trace.jsonl.gz"),
             "--max-prefetch-units",
             str(args.prefetch_units),
+            "--audit",
+            str(output / "audit.json"),
             "--output",
             str(output / "analysis"),
         ],

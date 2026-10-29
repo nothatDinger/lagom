@@ -268,6 +268,18 @@ def replay_diagnostics(trial_layers, layers, trial_logits, logits):
     }
 
 
+def greedy_commit_tokens(input_ids, predictions):
+    """Independent CPU reference for the fixed-V, greedy acceptance boundary."""
+    if len(input_ids) != len(predictions) or not input_ids:
+        raise ValueError("Paired baseline needs V+1 inputs and predictions")
+    accepted = 0
+    for candidate, predicted in zip(input_ids[1:], predictions):
+        if candidate != predicted:
+            break
+        accepted += 1
+    return predictions[: accepted + 1]
+
+
 @contextmanager
 def replace_method(obj, name, method):
     # Removing the override restores descriptor binding, including on failure.
@@ -480,6 +492,7 @@ class OasisKVTrace:
 
     def run(self, *, batch, draft_block_ids, draft_tokens, sampling_info):
         self.pending = None
+        self.pending_baseline = None
         log_progress(
             "trace-enter", batch.reqs, shadows=self.shadows, probes=self.probes
         )
@@ -603,6 +616,7 @@ class OasisKVTrace:
                     .detach()
                     .to("cpu", copy=True)
                 )
+                trial_hidden = trial[1][: self.v + 1].detach().to("cpu", copy=True)
                 del trial
                 for p in self.probes:
                     for mode in ("exact", "resident"):
@@ -643,9 +657,18 @@ class OasisKVTrace:
                 .to("cpu", copy=True)
             )
             diagnostic = replay_diagnostics(trial_layers, layers, trial_logits, logits)
+            hidden = result[1][: self.v + 1].detach().to("cpu", copy=True)
+            diagnostic.update(
+                paired_audit_version=1,
+                input_ids=inputs[: self.v + 1],
+                layer_ids=sorted(layers),
+                hidden_states_exact_equal=torch.equal(trial_hidden, hidden),
+            )
             diagnostic["passed"] = (
                 diagnostic["trial_predictions"] == diagnostic["replayed_predictions"]
                 and not diagnostic["differing_layers"]
+                and diagnostic["logits_exact_equal"]
+                and diagnostic["hidden_states_exact_equal"]
             )
             if self.writer is not None:
                 with (self.writer.parent / "replay-audit.jsonl").open("a") as stream:
@@ -667,6 +690,27 @@ class OasisKVTrace:
                     "Baseline replay changed after shadow restoration; trace rejected: "
                     + json.dumps(diagnostic, sort_keys=True)
                 )
+            # Preserve the pre-shadow control, rather than trying to recreate
+            # this proposal and prefix in an independent server process.
+            expected_tokens = greedy_commit_tokens(
+                inputs[: self.v + 1], diagnostic["trial_predictions"]
+            )
+            self.pending_baseline = [
+                dict(
+                    common,
+                    kind="window",
+                    layer=layer,
+                    prefix_len=prefix,
+                    prompt_len=len(batch.reqs[0].origin_input_ids),
+                    history_units=history_units,
+                    input_ids=inputs[: self.v + 1],
+                    accepted_drafts=len(expected_tokens) - 1,
+                    commit_len=len(expected_tokens),
+                    committed_output_ids=expected_tokens,
+                    **data,
+                )
+                for layer, data in trial_layers.items()
+            ]
         for layer, data in layers.items():
             records.append(
                 dict(
@@ -713,13 +757,33 @@ class OasisKVTrace:
             raise RuntimeError(
                 "Probe escaped the fixed verification acceptance boundary"
             )
+        tokens = accept.out_tokens.reshape(1, -1)[0, :committed].cpu().tolist()
+        baseline = getattr(self, "pending_baseline", None)
+        if baseline is not None and tokens != baseline[0]["committed_output_ids"]:
+            error = "Actual acceptance differs from the pre-shadow greedy baseline"
+            if self.writer is not None:
+                (self.writer.parent / "rejection.json").write_text(
+                    json.dumps({"passed": False, "error": error})
+                )
+            raise RuntimeError(error)
         for record in self.pending:
             if record["kind"] == "window":
-                record.update(accepted_drafts=committed - 1, commit_len=committed)
+                record.update(
+                    accepted_drafts=committed - 1,
+                    commit_len=committed,
+                    committed_output_ids=tokens,
+                )
         if self.writer is not None:
+            if baseline is not None:
+                with gzip.open(
+                    self.writer.parent / "paired-baseline.jsonl.gz", "at"
+                ) as stream:
+                    for record in baseline:
+                        stream.write(json.dumps(record, separators=(",", ":")) + "\n")
             # Close every gzip member so a normally terminated server leaves a
             # readable trace even though worker shutdown does not run __del__.
             with gzip.open(self.writer, "at", encoding="utf-8") as stream:
                 for record in self.pending:
                     stream.write(json.dumps(record, separators=(",", ":")) + "\n")
         self.pending = None
+        self.pending_baseline = None

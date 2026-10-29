@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import hashlib
 import json
 import math
 from collections import Counter, defaultdict
@@ -297,6 +298,7 @@ def analyze(records, cap):
         "prefetch_cap_units": cap,
         "candidate_policy": "probe-frequency; ties-by-logical-ID; dedup; committed-history; subtract-residency; cap",
         "measurement": "offline prediction potential; no eviction or asynchronous timing simulation",
+        "validation": {"scope": "not_audited", "passed": None},
         "baseline_records": len(windows),
         "probe_records": len(probes),
         "matched_records": len(rows),
@@ -330,10 +332,17 @@ def main():
     parser.add_argument("traces", type=Path, nargs="+")
     parser.add_argument("--max-prefetch-units", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--audit",
+        type=Path,
+        help="Bind a passed within-server audit to this exact trace file",
+    )
     args = parser.parse_args()
     report = analyze(read_records(args.traces), args.max_prefetch_units)
     if not report["matched_records"]:
         parser.error("no consecutive baseline windows with matching probe records")
+    if args.audit is not None:
+        report["validation"] = validated_audit(args.audit, args.traces)
     args.output.mkdir(parents=True, exist_ok=False)
     (args.output / "report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
@@ -346,6 +355,23 @@ def main():
     print(
         f"Matched {report['matched_records']} layer/head samples; wrote {args.output}"
     )
+
+
+def validated_audit(path, traces):
+    audit = json.loads(path.read_text())
+    if (
+        len(traces) != 1
+        or audit.get("passed") is not True
+        or audit.get("scope") != "within-server-snapshot-paired"
+    ):
+        raise ValueError("Analysis requires a passed within-server audit for one trace")
+    digest = hashlib.sha256()
+    with traces[0].open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != audit.get("trace_sha256"):
+        raise ValueError("Audit belongs to different trace bytes")
+    return audit
 
 
 if __name__ == "__main__":
