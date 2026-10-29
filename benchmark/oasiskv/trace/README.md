@@ -19,7 +19,7 @@
 | 路由专家 | 显式 `--moe-runner-backend flashinfer_mxfp4`；H100 使用 CUTLASS W4A16，保持 checkpoint MXFP4 存储 |
 | 全局 C4 池 | `host_to_device_ratio=1`，容纳完整 prefill；不改变每请求 decode 的 `resident_units` |
 
-**验证状态：本分支在无 GPU 环境进行了 CPU 单元测试；尚未在上述 checkpoint / 4 × H100 上实测。先跑下面的 smoke。** 需要使用已能运行该仓库 V4/DSPARK 的 CUDA、FlashMLA、DeepGEMM 等环境。脚本检查本地 checkpoint、GPU 和配置，不自动安装或下载模型依赖。
+**验证状态：GPU 测试方报告 `ae1545f24` 的 untraced/control 已通过，probes 在恢复校验处失败；本次顺序比较修复只完成了 CPU 回归，尚待 GPU 复测。** 需要使用已能运行该仓库 V4/DSPARK 的 CUDA、FlashMLA、DeepGEMM 等环境。脚本检查本地 checkpoint、GPU 和配置，不自动安装或下载模型依赖。
 
 ## 执行
 
@@ -45,7 +45,9 @@ python benchmark/oasiskv/trace/run.py \
   --output /srv/oasiskv/trace-v4-16k-32k --execute
 ```
 
-已有本地实验分支时使用 `git switch exp/oasiskv-trace`。输出目录必须不存在，以防混合旧 trace。默认使用 GPU `0,1,2,3`；可通过 `--gpus` 修改。脚本顺序启动并关闭自己的服务进程，不连接或终止已有服务。每个模式共用同一份 `prompts.npy`，请求串行执行。
+已有本地实验分支时使用 `git switch exp/oasiskv-trace`。输出目录必须不存在，以防混合旧 trace。默认使用 GPU `0,1,2,3`；可通过 `--gpus` 修改。`--mode experiment` 顺序启动独立的 control/probes/full-control 服务进程，各自重新加载模型，共用 `prompts.npy`；不是在同一个服务里切换组别。请求串行执行。
+Linux runner 在启动服务前启用 child subreaper，接管服务遗留的孤儿进程，退出时清理本次服务的所有后代，包括调用 `setsid()` 脱离原进程组的 worker；已有无关服务不会被清理。
+清理不依赖 wrapper 的 `poll()`，TERM 超时后升级为 KILL，仍存活则写 `teardown-failure.json` 并中止后续组别。
 GPU工作区若已有针对 `eb91f01a4` 的未提交修补，请先保存diff，并在新的worktree检出更新后的分支验证，
 避免把旧的初始化补丁重复覆盖到新代码上。运行manifest同时记录HEAD和`source.diff`的SHA256。
 
@@ -128,6 +130,36 @@ CUDA上 packed MXFP4 不再静默落到普通FP8 MoE；不支持的runner（包�
 共享专家的FP8路径保留。手工使用 `SGLANG_DSV4_FP4_DEQUANT=1`＋auto仍可走已有解包路径，
 但会扩大专家权重显存，不属于本实验默认配置。
 
+GPU 测试方在 h100-8（10.72.1.175）使用 CUDA 13 wheel 工具链时，还需要以下环境设置；这些是该机器的配置，不是所有 CUDA 环境的通用要求：
+
+```bash
+# CUDA_HOME 使用现场已验证的 .venv/.../nvidia/cu13 绝对路径。
+# 先确认该目录内 lib64 -> lib 及链接器需要的未带版本 soname 已准备好。
+export NVCC_PREPEND_FLAGS=-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK
+export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
+```
+
+runner 继承这些设置，并在 `launch.json` 记录上述变量及 `CUDA_HOME`。
+关闭 DeepGEMM 启动时的大网格预编译不等于关闭运行时 JIT；缓存目录继续使用现场已验证的持久化配置。
+
+## Stage 3 恢复校验失败：Top-K 顺序与集合
+
+`ae1545f24` 用 Python 列表精确比较 trial/replay 的整个逐层观测。
+V4 HiSparse 的原生 `topk_v1.cuh::radix_topk()` 用 `atomicAdd` 分配输出位置，**不保证同一组选中 ID 的排列顺序**。
+因此仅排列变化就能导致所有层报不同，不能据此认定快照恢复或 observation override 泄漏。
+每次 `observe()` 都创建独立对象，Top-K 已转成 CPU list；变宽重放、张量覆盖及异常退出有 CPU 回归覆盖。
+
+现在窗口内和独立进程 audit 都逐 query 比较 ID **多重集合**，逐 miss event 比较实际搬运 ID 多重集合：保留行边界、重复次数、padding 与驻留集合校验。
+原始 Top-K / miss 顺序继续保存在 trace；不修改传入 attention 的 GPU 张量。
+若阈值并列导致选中 ID 本身改变，或 miss/驻留/argmax token 改变，仍拒绝；本修复不把这些情况视为噪声。
+
+`replay-audit.jsonl` 记录每个窗口是否通过、`topk_order_only_layers`、差异字段、argmax 和有限 logits 的最大绝对差。
+**相同 argmax 不代表 logits 完全相同，也不能单独证明状态恢复完整。** 如果仍拒绝，查看 `rejection.json` 与 `rejected-trace.jsonl.gz`，区分 `topk`、`miss_events`、`resident_after` 的真正变化。
+拒绝记录使用 `rejected_window` / `rejected_probe`，不进入正常 trace；audit/analyze 拒绝带 `rejection.json` 的目录，即使其中已有前几个窗口的有效记录。
+
+P 行是 P 个 query 的 Top-K，和搬运次数没有直接等价关系。4K 输入约有 1024 C4 单元，容量 3072 时完全可能全部驻留；此时 exact 和 resident 的 `probe_demand_h2d_bytes=0` 正常。
+先用上方 4K experiment smoke 验证采集与隔离，再跑 16K/32K 研究容量压力；不能用全驻留的 smoke 推导预取命中率收益。
+
 新实验配置列出允许采集的request IDs：server warmup只执行正常验证，不保存window、不做shadow，
 不进入覆盖率和接受长度统计。原日志中的 `history_units=1–2` 不能代表4K请求；
 4K真实历史应约为1024个C4单元，16K约4096、32K约8192。
@@ -166,7 +198,7 @@ resident 的策略是“probe Top-K 与本层真实验证后驻留集合的交�
 
 会执行两层校验：
 
-- 窗口内：shadow 前后的基线重放必须得到相同的 argmax token、Top-K、实际 miss 列表和驻留状态。
+- 窗口内：shadow 前后的基线重放必须得到相同的 argmax token、逐 query Top-K 多重集合、逐行实际 miss 多重集合和驻留状态。
 - 独立进程：`control` 与 `probes` 的完整输出 token ID、实际接受长度、验证输入、逐层 Top-K、miss 和驻留状态必须一致，否则停止分析。
 
 另外检查所有仍被真实验证行引用的历史物理槽是否有效，避免逐行换入后，前面行的 KV 已被后面行淘汰。启动时已有容量下界检查，运行时若仍报 `references evicted C4`，**这次数据不能用于质量结论**，需要先检查状态映射或容量处理；不能忽略该检查继续分析。
@@ -187,7 +219,11 @@ trace-v4-16k-32k/
     outputs.jsonl              # 请求输出 token IDs
     server_info.json / request-progress.json
     failure.json               # 仅运行异常时存在
+    teardown-failure.json      # 仅服务后代清理失败时存在
   probes/snapshot-inventory.json
+  probes/replay-audit.jsonl     # 每窗口重放检查、Top-K 仅排列变化、logits 差异
+  probes/rejection.json         # 仅恢复校验拒绝时存在；阻止该目录进入分析
+  probes/rejected-trace.jsonl.gz # 被拒绝窗口/探针原始观测，独立于有效 trace
   audit.json                    # 独立进程隔离检查，必须 passed=true
   acceptance.json               # 每种 V 的 A 分布、平均提交 token 数
   analysis/samples.csv           # 每窗口、每层、P、mode 的明细

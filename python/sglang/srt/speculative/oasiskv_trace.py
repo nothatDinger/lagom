@@ -15,7 +15,6 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import torch
-
 from sglang.srt.speculative.oasiskv_trace_diagnostics import log_progress
 
 
@@ -166,6 +165,63 @@ def check_live_locations(raw, selected, tokens, locations, history_units):
                     "the active Top-K union exceeds safe residency. Increase "
                     "device_buffer_size and label it as a different experiment."
                 )
+
+
+def compare_observations(trial, replay):
+    """Compare KV membership, not the atomic scatter order of native Top-K.
+
+    V4 topk_v1.cuh radix_topk() emits IDs with atomicAdd, without sorting.
+    Sort within each query/miss event only. Preserve query order, multiplicity,
+    padding and per-row fetch counts. In particular, different winners at a tied
+    Top-K threshold are NOT equivalent. Never reorder tensors used by attention.
+    The original arrays remain in the trace for diagnosis.
+    """
+    differences = []
+    for layer in sorted(trial.keys() | replay.keys()):
+        left, right = trial.get(layer), replay.get(layer)
+        if left is None or right is None:
+            differences.append({"layer": layer, "fields": ["layer_presence"]})
+            continue
+        fields = []
+        if [sorted(row) for row in left["topk"]] != [
+            sorted(row) for row in right["topk"]
+        ]:
+            fields.append("topk")
+        if left["resident_after"] != right["resident_after"]:
+            fields.append("resident_after")
+        if [(x["row"], sorted(x["ids"])) for x in left["miss_events"]] != [
+            (x["row"], sorted(x["ids"])) for x in right["miss_events"]
+        ]:
+            fields.append("miss_events")
+        if fields:
+            differences.append({"layer": layer, "fields": fields})
+    return differences
+
+
+def replay_diagnostics(trial_layers, layers, trial_logits, logits):
+    differences = compare_observations(trial_layers, layers)
+    finite = torch.isfinite(trial_logits) & torch.isfinite(logits)
+    delta = (trial_logits.float() - logits.float()).abs()
+    return {
+        "trial_predictions": trial_logits.argmax(-1).tolist(),
+        "replayed_predictions": logits.argmax(-1).tolist(),
+        "differing_layers": [item["layer"] for item in differences],
+        "layer_differences": differences,
+        "topk_order_only_layers": [
+            layer
+            for layer in sorted(trial_layers.keys() & layers.keys())
+            if trial_layers[layer]["topk"] != layers[layer]["topk"]
+            and [sorted(row) for row in trial_layers[layer]["topk"]]
+            == [sorted(row) for row in layers[layer]["topk"]]
+        ],
+        # Equal argmax tokens do not prove equal logits or complete restoration.
+        "logits_exact_equal": torch.equal(trial_logits, logits),
+        "logits_max_abs_diff_finite": (
+            float(delta[finite].max()) if finite.any() else None
+        ),
+        "trial_nonfinite_logits": int((~torch.isfinite(trial_logits)).sum()),
+        "replayed_nonfinite_logits": int((~torch.isfinite(logits)).sum()),
+    }
 
 
 @contextmanager
@@ -375,6 +431,7 @@ class OasisKVTrace:
         )
 
     def run(self, *, batch, draft_block_ids, draft_tokens, sampling_info):
+        self.pending = None
         log_progress(
             "trace-enter", batch.reqs, shadows=self.shadows, probes=self.probes
         )
@@ -491,11 +548,11 @@ class OasisKVTrace:
 
             try:
                 trial, trial_layers = observe("exact", 0)
-                trial_predictions = (
+                trial_logits = (
                     trial[0]
                     .logits_output.next_token_logits[: self.v + 1]
-                    .argmax(-1)
-                    .cpu()
+                    .detach()
+                    .to("cpu", copy=True)
                 )
                 del trial
                 for p in self.probes:
@@ -530,15 +587,36 @@ class OasisKVTrace:
 
         result, layers = observe("exact", 0)
         if self.shadows and self.probes:
-            predictions = (
-                result[0].logits_output.next_token_logits[: self.v + 1].argmax(-1).cpu()
+            logits = (
+                result[0]
+                .logits_output.next_token_logits[: self.v + 1]
+                .detach()
+                .to("cpu", copy=True)
             )
-            if (
-                not torch.equal(predictions, trial_predictions)
-                or layers != trial_layers
-            ):
+            diagnostic = replay_diagnostics(trial_layers, layers, trial_logits, logits)
+            diagnostic["passed"] = (
+                diagnostic["trial_predictions"] == diagnostic["replayed_predictions"]
+                and not diagnostic["differing_layers"]
+            )
+            if self.writer is not None:
+                with (self.writer.parent / "replay-audit.jsonl").open("a") as stream:
+                    stream.write(json.dumps(dict(common, **diagnostic)) + "\n")
+            if not diagnostic["passed"]:
+                self.write_rejection(
+                    dict(
+                        common,
+                        prefix_len=prefix,
+                        history_units=history_units,
+                        input_ids=inputs[: self.v + 1],
+                    ),
+                    records,
+                    trial_layers,
+                    layers,
+                    diagnostic,
+                )
                 raise RuntimeError(
-                    "Baseline replay changed after shadow restoration; trace rejected"
+                    "Baseline replay changed after shadow restoration; trace rejected: "
+                    + json.dumps(diagnostic, sort_keys=True)
                 )
         for layer, data in layers.items():
             records.append(
@@ -555,6 +633,28 @@ class OasisKVTrace:
             )
         self.pending = records
         return result
+
+    def write_rejection(self, common, probes, trial, replay, diagnostic):
+        """Close diagnostic files before raising; never admit rejected samples."""
+        if self.writer is None:
+            return
+        directory = self.writer.parent
+        (directory / "rejection.json").write_text(
+            json.dumps(dict(common, **diagnostic), indent=2) + "\n"
+        )
+        with gzip.open(directory / "rejected-trace.jsonl.gz", "at") as stream:
+            for record in probes:
+                stream.write(json.dumps(dict(record, kind="rejected_probe")) + "\n")
+            for phase, observations in (("trial", trial), ("replay", replay)):
+                for layer, data in observations.items():
+                    record = dict(
+                        common,
+                        kind="rejected_window",
+                        phase=phase,
+                        layer=layer,
+                        **data,
+                    )
+                    stream.write(json.dumps(record) + "\n")
 
     def finish(self, accept):
         if self.pending is None:

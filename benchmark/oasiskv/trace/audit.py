@@ -21,6 +21,10 @@ def outputs(directory):
 
 
 def windows(directory):
+    if (directory / "rejection.json").exists():
+        raise ValueError(
+            f"Rejected shadow replay in {directory}; inspect rejection.json"
+        )
     result = {}
     with gzip.open(directory / "trace.jsonl.gz", "rt") as stream:
         for line in stream:
@@ -45,6 +49,12 @@ def windows(directory):
                     "miss_events",
                 )
             }
+            # Native Top-K uses atomic scatter, not score/rank order. Keep row
+            # boundaries, duplicate IDs and miss multiplicity (also for old files).
+            result[key]["topk"] = [sorted(row) for row in r["topk"]]
+            result[key]["miss_events"] = [
+                dict(event, ids=sorted(event["ids"])) for event in r["miss_events"]
+            ]
     if not result:
         raise ValueError("No baseline windows to audit")
     return result

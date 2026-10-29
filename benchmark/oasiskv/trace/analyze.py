@@ -303,6 +303,10 @@ def analyze(records, cap):
 
 def read_records(paths):
     for path in paths:
+        if (path.parent / "rejection.json").exists():
+            raise ValueError(
+                f"Rejected shadow replay in {path.parent}; inspect rejection.json"
+            )
         opener = gzip.open if path.suffix == ".gz" else open
         with opener(path, "rt", encoding="utf-8") as stream:
             for number, line in enumerate(stream, 1):

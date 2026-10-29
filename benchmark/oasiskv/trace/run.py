@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -263,15 +264,124 @@ def wait_ready(process, url, timeout):
     raise TimeoutError("Server startup timeout; see server.log")
 
 
-def stop(process):
-    # Only the process group created for this experiment is signalled.
-    if process.poll() is None:
-        os.killpg(process.pid, signal.SIGTERM)
+def process_table():
+    """Linux process identity plus ancestry; start time guards against PID reuse."""
+    result = {}
+    for path in Path("/proc").glob("[0-9]*/stat"):
         try:
-            process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=30)
+            # comm may contain spaces and parentheses.
+            fields = path.read_text().rsplit(")", 1)[1].split()
+            result[int(path.parent.name)] = (
+                int(fields[19]),  # starttime, field 22
+                int(fields[1]),  # ppid
+                fields[0],  # state
+            )
+        except (OSError, ValueError, IndexError):
+            continue  # Process exited during the scan.
+    return result
+
+
+class ServerProcessTree:
+    """Own one server in this sequential CLI, including setsid()/orphan workers.
+
+    Enable subreaping BEFORE spawn: scanning at teardown alone loses children
+    already reparented to PID 1. Existing children (and their descendants) are
+    excluded. The CLI must not launch unrelated subprocesses during this scope.
+    """
+
+    def __enter__(self):
+        if sys.platform != "linux":
+            raise RuntimeError("The V4 trace runner requires Linux process supervision")
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        if self.libc.prctl(37, ctypes.byref(previous), 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), "PR_GET_CHILD_SUBREAPER failed")
+        self.previous_subreaper = previous.value
+        if self.libc.prctl(36, 1, 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER failed")
+        self.excluded = {
+            pid: row[0] for pid, row in process_table().items() if row[1] == os.getpid()
+        }
+        self.owned = {}
+        self.process = None
+        self.stop_attempted = False
+        return self
+
+    def attach(self, process):
+        self.process = process
+        self.scan()
+
+    def scan(self):
+        table = process_table()
+        # Remember descendants of pre-existing children before they can orphan.
+        for identities in (self.excluded, self.owned):
+            parents = {
+                pid
+                for pid, start in identities.items()
+                if pid in table and table[pid][0] == start
+            }
+            if identities is self.owned:
+                parents.update(
+                    pid
+                    for pid, row in table.items()
+                    if row[1] == os.getpid() and self.excluded.get(pid) != row[0]
+                )
+            while parents:
+                children = {
+                    pid
+                    for pid, row in table.items()
+                    if row[1] in parents and identities.get(pid) != row[0]
+                }
+                for pid in parents | children:
+                    identities[pid] = table[pid][0]
+                parents = children
+        return {pid: row for pid, row in table.items() if self.owned.get(pid) == row[0]}
+
+    def stop(self, term_timeout=30, kill_timeout=30):
+        self.stop_attempted = True
+        if self.process is None:
+            return
+        for sig, timeout in (
+            (signal.SIGTERM, term_timeout),
+            (signal.SIGKILL, kill_timeout),
+        ):
+            deadline = time.monotonic() + timeout
+            signalled = set()
+            while True:
+                self.process.poll()  # Reap the wrapper separately from adopted workers.
+                live = {}
+                for pid, (start, parent, state) in self.scan().items():
+                    if (
+                        state == "Z"
+                        and parent == os.getpid()
+                        and pid != self.process.pid
+                    ):
+                        try:
+                            os.waitpid(pid, os.WNOHANG)
+                        except ChildProcessError:
+                            pass
+                    elif state != "Z":
+                        live[pid] = start
+                        if (pid, start) not in signalled:
+                            try:
+                                os.kill(pid, sig)
+                            except ProcessLookupError:
+                                pass
+                            signalled.add((pid, start))
+                if not live:
+                    return
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+        raise RuntimeError(f"Server workers survived teardown: {sorted(live)}")
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if not self.stop_attempted:
+                self.stop()
+        finally:
+            if self.libc.prctl(36, self.previous_subreaper, 0, 0, 0) != 0:
+                raise OSError(ctypes.get_errno(), "Restoring child subreaper failed")
 
 
 def run_environment(args, config_path):
@@ -316,6 +426,9 @@ def run_one(args, directory, config, command, prompts):
                     "SGLANG_OASISKV_TRACE_CONFIG",
                     "SGLANG_OASISKV_TRACE_DIAGNOSTICS",
                     "SGLANG_DSV4_FP4_DEQUANT",
+                    "CUDA_HOME",
+                    "NVCC_PREPEND_FLAGS",
+                    "SGLANG_JIT_DEEPGEMM_PRECOMPILE",
                 )
             },
         },
@@ -324,7 +437,7 @@ def run_one(args, directory, config, command, prompts):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", args.port))  # Fail before spawning if in use.
     print(f"Starting {directory.name}", flush=True)
-    with (directory / "server.log").open("w") as log:
+    with (directory / "server.log").open("w") as log, ServerProcessTree() as tree:
         process = subprocess.Popen(
             command,
             cwd=ROOT,
@@ -333,6 +446,7 @@ def run_one(args, directory, config, command, prompts):
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        tree.attach(process)
         try:
             wait_ready(process, url, args.startup_timeout)
             write_json(directory / "server_info.json", request(url + "/server_info"))
@@ -404,7 +518,17 @@ def run_one(args, directory, config, command, prompts):
             )
             raise
         finally:
-            stop(process)
+            try:
+                tree.stop()
+            except Exception as error:
+                write_json(
+                    directory / "teardown-failure.json",
+                    {
+                        "error": f"{type(error).__name__}: {error}",
+                        "unix_s": time.time(),
+                    },
+                )
+                raise
 
 
 def main():

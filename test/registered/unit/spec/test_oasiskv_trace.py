@@ -5,6 +5,11 @@ import copy
 import gzip
 import importlib.util
 import json
+import os
+import socket
+import subprocess
+import sys
+import time
 from pathlib import Path
 from types import MethodType
 from types import SimpleNamespace as NS
@@ -21,7 +26,9 @@ from sglang.srt.speculative.oasiskv_trace import (
     OasisKVTrace,
     TensorSnapshot,
     check_live_locations,
+    compare_observations,
     replace_method,
+    replay_diagnostics,
     resident_lookup,
     validate_trace_hisparse,
 )
@@ -209,6 +216,13 @@ def test_replace_method_restores_binding_after_exception():
         raise RuntimeError("shadow failed")
     assert obj.read() == 3
     assert "read" not in vars(obj)
+    with replace_method(obj, "read", lambda: 5):
+        with pytest.raises(RuntimeError), replace_method(obj, "read", lambda: 6):
+            assert obj.read() == 6
+            raise RuntimeError("nested observation failed")
+        assert obj.read() == 5
+    assert obj.read() == 3
+    assert "read" not in vars(obj)
 
 
 def fake_coordinator():
@@ -253,6 +267,37 @@ def fake_coordinator():
         HiSparseCoordinator.swap_in_selected_pages_spec, c
     )
     return c
+
+
+def test_observations_do_not_leak_rows_or_overrides_across_widths():
+    c = fake_coordinator()
+    original_swap, original_kernel = (
+        c.swap_in_selected_pages_spec,
+        c._run_swap_in_kernel,
+    )
+    saved = []
+    for width, mode in [(3, "exact"), (5, "resident"), (4, "exact"), (3, "exact")]:
+        c.req_device_buffer_tokens[0, 0] = torch.tensor([0, 1, -1, -1])
+        raw = torch.tensor([[0, 2], [2, 3]] + [[1, 3]] * (width - 2), dtype=torch.int32)
+        expected = raw.tolist()
+        observer = ForwardObservation(c, 3, mode, 10, 0)
+        with observer.capture():
+            c.swap_in_selected_pages_spec(
+                req_pool_indices=torch.tensor([0]),
+                compressed_seq_lens=torch.full((width,), 10),
+                top_k_result=raw,
+                layer_id=0,
+                verify_lens_cpu=[width],
+                output_buffer=None,
+            )
+        raw.fill_(-99)  # Later forwards may overwrite their temporary GPU buffers.
+        assert observer.layers[0]["topk"] == expected
+        assert len(observer.layers[0]["miss_events"]) == width
+        assert c.swap_in_selected_pages_spec is original_swap
+        assert c._run_swap_in_kernel is original_kernel
+        saved.append((observer, copy.deepcopy(observer.layers)))
+    for observer, expected in saved:
+        assert observer.layers == expected
 
 
 @pytest.mark.parametrize("padding", [0, 2])
@@ -601,9 +646,12 @@ def test_native_acceptance_cannot_accept_the_reserved_suffix(v):
     assert bonus.tolist() == [v + 2]
 
 
+@pytest.mark.parametrize(
+    "variant", ["normal", "permutation", "changed_ids", "changed_logits"]
+)
 @pytest.mark.parametrize("fail_shadow", [False, True])
 def test_whole_shadow_loop_restores_target_state_and_never_commits(
-    monkeypatch, fail_shadow
+    monkeypatch, tmp_path, fail_shadow, variant
 ):
     c = fake_coordinator()
     c.req_device_buffer_tokens = torch.tensor(
@@ -630,7 +678,7 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
     )
     trace.v, trace.probes, trace.shadows, trace.max_windows = 1, [1, 2], True, 3
     trace.config = {"snapshot_gib": 0.01, "run_id": "test"}
-    trace.coordinator, trace.writer, trace.windows = c, None, {}
+    trace.coordinator, trace.writer, trace.windows = c, tmp_path / "trace.jsonl.gz", {}
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(torch.cuda, "get_rng_state", lambda: torch.zeros(1))
     monkeypatch.setattr(torch.cuda, "set_rng_state", lambda _: None)
@@ -643,18 +691,23 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
         state.add_(1)
         if fail_shadow and width > 2:
             raise RuntimeError("shadow failed inside target")
+        raw = torch.tensor([[0, 2], [2, 3], [1, 4], [4, 5]][:width], dtype=torch.int32)
+        if variant == "permutation" and len(calls) % 2 == 0:
+            raw = raw.flip(-1)
+        if variant == "changed_ids" and len(calls) == 6:
+            raw[0, 1] = 4
         c.swap_in_selected_pages_spec(
             req_pool_indices=torch.tensor([0]),
             compressed_seq_lens=torch.full((width,), 10),
-            top_k_result=torch.tensor(
-                [[0, 2], [2, 3], [1, 4], [4, 5]][:width], dtype=torch.int32
-            ),
+            top_k_result=raw,
             layer_id=0,
             verify_lens_cpu=[width],
             output_buffer=None,
         )
         logits = torch.zeros(4, 4)
         logits[:, int(state[0])] = 1
+        if variant == "changed_logits" and len(calls) == 6:
+            logits[:, 2] = 2
         return NS(logits_output=NS(next_token_logits=logits)), None
 
     trace.worker = NS(device="cpu", _verify_executor=NS(run_compact=forward))
@@ -676,6 +729,24 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
             trace.run(**kwargs)
         assert state.item() == 0
         assert c.req_device_buffer_tokens.tolist() == [[[0, 1, -1, -1, -1, -1]]]
+    elif variant in ("changed_ids", "changed_logits"):
+        with pytest.raises(RuntimeError, match="trace rejected"):
+            trace.run(**kwargs)
+        assert trace.pending is None
+        assert not trace.writer.exists()
+        diagnostic = json.loads((tmp_path / "rejection.json").read_text())
+        with gzip.open(tmp_path / "rejected-trace.jsonl.gz", "rt") as stream:
+            rejected = [json.loads(line) for line in stream]
+        assert len(rejected) == 6  # Four shadows plus trial/replay baseline.
+        assert {r["kind"] for r in rejected} == {"rejected_window", "rejected_probe"}
+        if variant == "changed_ids":
+            assert diagnostic["trial_predictions"] == diagnostic["replayed_predictions"]
+            assert diagnostic["layer_differences"] == [
+                {"layer": 0, "fields": ["topk", "resident_after", "miss_events"]}
+            ]
+        else:
+            assert diagnostic["differing_layers"] == []
+            assert diagnostic["trial_predictions"] != diagnostic["replayed_predictions"]
     else:
         trace.run(**kwargs)
         assert state.item() == 1  # Only the final baseline forward survives.
@@ -687,6 +758,48 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
             for r in trace.pending
             if r.get("mode") == "resident"
         )
+        diagnostic = json.loads((tmp_path / "replay-audit.jsonl").read_text())
+        assert diagnostic["passed"]
+        assert diagnostic["topk_order_only_layers"] == (
+            [0] if variant == "permutation" else []
+        )
+
+
+def test_comparison_preserves_query_boundaries_duplicates_and_miss_counts():
+    left = {
+        0: {
+            "topk": [[1, 2, -1], [3, 4, -1]],
+            "resident_after": [1, 2, 3, 4],
+            "miss_events": [{"row": 0, "ids": [2, 1]}, {"row": 1, "ids": [4, 3]}],
+        }
+    }
+    right = copy.deepcopy(left)
+    right[0]["topk"][0].reverse()
+    right[0]["miss_events"][0]["ids"].reverse()
+    assert compare_observations(left, right) == []
+    # Same argmax need not mean identical logits; record both facts.
+    diagnostic = replay_diagnostics(
+        left, right, torch.tensor([[1.0, 0]]), torch.tensor([[2.0, 0]])
+    )
+    assert diagnostic["trial_predictions"] == diagnostic["replayed_predictions"]
+    assert diagnostic["topk_order_only_layers"] == [0]
+    assert not diagnostic["logits_exact_equal"]
+    assert diagnostic["logits_max_abs_diff_finite"] == 1
+    for field, value in (
+        ("topk", [[1, 1, 2], [3, 4, -1]]),
+        ("topk", [[3, 4, -1], [1, 2, -1]]),
+        ("topk", [[1, 2, -1]]),
+        ("resident_after", [1, 2, 3]),
+        ("miss_events", [{"row": 0, "ids": [1]}, {"row": 1, "ids": [3, 4]}]),
+        ("miss_events", [{"row": 0, "ids": [1, 2, 2]}, {"row": 1, "ids": [3, 4]}]),
+        ("miss_events", [{"row": 1, "ids": [1, 2]}, {"row": 0, "ids": [3, 4]}]),
+    ):
+        changed = copy.deepcopy(left)
+        changed[0][field] = value
+        assert compare_observations(left, changed) == [{"layer": 0, "fields": [field]}]
+    assert compare_observations(left, {}) == [
+        {"layer": 0, "fields": ["layer_presence"]}
+    ]
 
 
 @pytest.mark.parametrize(
@@ -743,3 +856,66 @@ def test_cross_process_audit_rejects_changed_tokens_or_baseline_topk(tmp_path):
     )
     with pytest.raises(ValueError, match="token IDs differ"):
         auditor.audit(control, experiment)
+
+
+def test_cross_process_audit_accepts_scatter_order_but_rejects_failed_runs(tmp_path):
+    source, following, probe = records()
+    control, experiment = tmp_path / "control", tmp_path / "probes"
+    write_run(control, [source, following], [1, 2, 3])
+    changed = copy.deepcopy(following)
+    for row in changed["topk"]:
+        row.reverse()
+    for event in changed["miss_events"]:
+        event["ids"].reverse()
+    write_run(experiment, [source, changed, probe], [1, 2, 3])
+    assert auditor.audit(control, experiment)["passed"]
+    # A previous successfully committed window is not evidence the run passed.
+    (experiment / "rejection.json").write_text("{}")
+    with pytest.raises(ValueError, match="Rejected shadow replay"):
+        auditor.audit(control, experiment)
+    with pytest.raises(ValueError, match="Rejected shadow replay"):
+        list(analyzer.read_records([experiment / "trace.jsonl.gz"]))
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper and /proc")
+def test_server_teardown_reaps_orphan_that_escaped_the_session(tmp_path):
+    # This child is deliberately outside the experiment; cleanup must not kill it.
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    marker = tmp_path / "orphan.json"
+    script = """
+import json, os, signal, socket, sys, time
+from pathlib import Path
+if os.fork():
+    os._exit(0)
+os.setsid()
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+sock = socket.socket()
+sock.bind(('127.0.0.1', 0))
+sock.listen()
+Path(sys.argv[1]).write_text(json.dumps({'pid': os.getpid(), 'port': sock.getsockname()[1]}))
+while True:
+    time.sleep(1)
+"""
+    try:
+        with runner.ServerProcessTree() as tree:
+            process = subprocess.Popen(
+                [sys.executable, "-c", script, str(marker)], start_new_session=True
+            )
+            tree.attach(process)
+            try:
+                process.wait(timeout=5)
+                deadline = time.monotonic() + 5
+                while not marker.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                data = json.loads(marker.read_text())
+                assert runner.process_table()[data["pid"]][1] == os.getpid()
+                assert process.poll() == 0  # Old stop() would skip all cleanup.
+            finally:
+                tree.stop(term_timeout=0.1, kill_timeout=5)
+        assert data["pid"] not in runner.process_table()
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", data["port"]))
+        assert unrelated.poll() is None
+    finally:
+        unrelated.terminate()
+        unrelated.wait(timeout=5)
