@@ -409,8 +409,8 @@ class OasisKVTrace:
         self.max_windows = config["max_windows"]
         self.shadows = config.get("shadows", True)
         topk_order = config.get("topk_order", "native")
-        if topk_order not in ("native", "logical"):
-            raise ValueError("Trace topk_order must be native or logical")
+        if topk_order not in ("native", "logical", "logical-all"):
+            raise ValueError("Trace topk_order must be native, logical or logical-all")
         if type(self.v) is not int or not 1 <= self.v <= worker.gamma:
             raise ValueError("Trace V must be in [1, checkpoint gamma]")
         if any(

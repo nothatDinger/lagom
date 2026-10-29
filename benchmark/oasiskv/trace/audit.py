@@ -1,4 +1,8 @@
-"""Reject a probe experiment if the isolated fixed-V control trajectory changed."""
+"""Check committed output and matched KV baselines across independent servers.
+
+A mismatch is not by itself proof that a shadow replay changed model state.
+The per-window replay audit tests restoration within the probes server.
+"""
 
 import argparse
 import gzip
@@ -61,26 +65,110 @@ def windows(directory):
     return result
 
 
+class AuditMismatch(ValueError):
+    def __init__(self, message, report):
+        super().__init__(message)
+        self.report = report
+
+
+def trace_inventory(directory):
+    kinds = Counter()
+    windows = defaultdict(set)
+    with gzip.open(directory / "trace.jsonl.gz", "rt") as stream:
+        for line in stream:
+            record = json.loads(line)
+            kind = record["kind"]
+            kinds[kind] += 1
+            windows[kind].add((record["request_id"], record["window_id"]))
+    return {
+        "records_by_kind": dict(kinds),
+        "request_windows_by_kind": {kind: len(keys) for kind, keys in windows.items()},
+    }
+
+
+def difference_sample(left, right):
+    """Bound diagnostics even for thousands of differing KV IDs per window."""
+    if isinstance(left, list) and isinstance(right, list):
+        positions = [
+            i
+            for i in range(max(len(left), len(right)))
+            if i >= len(left) or i >= len(right) or left[i] != right[i]
+        ]
+        return {
+            "control_length": len(left),
+            "probes_length": len(right),
+            "different_positions": len(positions),
+            "samples": [
+                {
+                    "index": i,
+                    "difference": difference_sample(
+                        left[i] if i < len(left) else None,
+                        right[i] if i < len(right) else None,
+                    ),
+                }
+                for i in positions[:4]
+            ],
+        }
+    if isinstance(left, dict) and isinstance(right, dict):
+        return {
+            key: difference_sample(left.get(key), right.get(key))
+            for key in left.keys() | right.keys()
+            if left.get(key) != right.get(key)
+        }
+    return {"control": left, "probes": right}
+
+
 def audit(control, probes):
     a, b = outputs(control), outputs(probes)
-    if a != b:
-        raise ValueError(
-            "Control and probe-run output token IDs differ; reject the quality report"
-        )
     left, right = windows(control), windows(probes)
-    if left.keys() != right.keys():
-        raise ValueError("Control and probe-run window sets differ")
-    for key, value in left.items():
-        if value != right[key]:
-            raise ValueError(
-                f"Baseline trajectory/residency changed at {key}; reject the quality report"
+    counts, examples = Counter(), []
+    differing_windows = 0
+    for key in sorted(left.keys() & right.keys()):
+        fields = [field for field in left[key] if left[key][field] != right[key][field]]
+        if not fields:
+            continue
+        differing_windows += 1
+        counts.update(fields)
+        if len(examples) < 8:
+            examples.append(
+                {
+                    "key": list(key),
+                    "fields": {
+                        field: difference_sample(left[key][field], right[key][field])
+                        for field in fields
+                    },
+                }
             )
-    return {
-        "passed": True,
+    report = {
+        "passed": a == b and left.keys() == right.keys() and not differing_windows,
         "requests": len(a),
         "layer_windows": len(left),
+        "output_ids_equal": a == b,
+        "window_keys_equal": left.keys() == right.keys(),
+        "control_only_keys": sorted(left.keys() - right.keys())[:8],
+        "probes_only_keys": sorted(right.keys() - left.keys())[:8],
+        "differing_layer_windows": differing_windows,
+        "differing_fields": dict(counts),
+        "examples": examples,
+        "inventory": {
+            "control": trace_inventory(control),
+            "probes": trace_inventory(probes),
+        },
+        "scope": "Independent-server matched baseline; window Top-K, not shadow probe Top-K",
+        "note": "A mismatch does not identify shadow contamination; check the within-server replay audit separately.",
         "timing_valid": False,
     }
+    if not report["passed"]:
+        if a != b:
+            reason = "Control and probe-run output token IDs differ"
+        elif left.keys() != right.keys():
+            reason = "Control and probe-run window sets differ"
+        else:
+            reason = f"Baseline trajectory/residency changed; differing fields: {dict(counts)}"
+        raise AuditMismatch(
+            reason + "; matched-baseline quality report rejected", report
+        )
+    return report
 
 
 def acceptance_summary(directory):
@@ -119,7 +207,14 @@ def main():
     parser.add_argument("probes", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    report = audit(args.control, args.probes)
+    try:
+        report = audit(args.control, args.probes)
+    except ValueError as error:
+        failure_path = args.output.with_name(args.output.stem + "-failure.json")
+        failure = getattr(error, "report", {"passed": False, "error": str(error)})
+        with failure_path.open("x") as stream:
+            json.dump(failure, stream, indent=2)
+        raise SystemExit(f"{error}; diagnostics: {failure_path}") from error
     with args.output.open("x") as stream:
         json.dump(report, stream, indent=2)
     print(

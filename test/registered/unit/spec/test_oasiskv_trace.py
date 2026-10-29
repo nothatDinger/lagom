@@ -418,7 +418,7 @@ def test_startup_guard_accepts_real_io_zero_environment(monkeypatch):
 
 
 @pytest.mark.parametrize("active_phase", [None, "decode", "prefill"])
-@pytest.mark.parametrize("topk_order", ["native", "logical"])
+@pytest.mark.parametrize("topk_order", ["native", "logical", "logical-all"])
 def test_trace_startup_uses_resolved_graph_backends(
     monkeypatch, active_phase, topk_order
 ):
@@ -852,15 +852,16 @@ def test_canonical_order_keeps_raw_page_scratch_alignment_and_storage(noncontigu
         canonicalize_topk_(raw, pages[:, :2])
 
 
-def test_analysis_rejects_mixing_attention_visitation_order():
+@pytest.mark.parametrize("order", ["logical", "logical-all"])
+def test_analysis_rejects_mixing_attention_visitation_order(order):
     source, following, probe = records()
-    changed = dict(probe, topk_order="logical")
+    changed = dict(probe, topk_order=order)
     with pytest.raises(ValueError, match="different topk_order"):
         analyzer.analyze([source, following, changed], 256)
     report = analyzer.analyze(
-        [dict(r, topk_order="logical") for r in (source, following, probe)], 256
+        [dict(r, topk_order=order) for r in (source, following, probe)], 256
     )
-    assert report["topk_order"] == "logical"
+    assert report["topk_order"] == order
 
 
 @pytest.mark.parametrize(
@@ -951,9 +952,96 @@ def test_cross_process_audit_rejects_different_visitation_order(tmp_path):
         auditor.audit(control, experiment)
 
 
-def test_untraced_cannot_claim_fixed_attention_order():
+@pytest.mark.parametrize("order", ["logical", "logical-all"])
+def test_untraced_cannot_claim_fixed_attention_order(order):
     with pytest.raises(ValueError, match="no ordering hook"):
-        runner.validate_args(NS(mode="untraced", topk_order="logical"), 5)
+        runner.validate_args(NS(mode="untraced", topk_order=order), 5)
+
+
+def test_audit_separates_committed_output_from_kv_baseline_and_persists_failure(
+    tmp_path,
+):
+    source, following, probe = records()
+    control, experiment = tmp_path / "control", tmp_path / "probes"
+    write_run(control, [source, following], [1, 2, 3])
+    changed = copy.deepcopy(source)
+    changed["input_ids"][1] = 999  # Rejected proposal; committed output stays equal.
+    changed["topk"][1] = [3, 4]
+    changed["resident_after"] = [3, 4]
+    write_run(experiment, [changed, following, probe], [1, 2, 3])
+    with pytest.raises(auditor.AuditMismatch) as caught:
+        auditor.audit(control, experiment)
+    report = caught.value.report
+    assert report["output_ids_equal"] and report["window_keys_equal"]
+    assert report["differing_layer_windows"] == 1
+    assert report["differing_fields"] == {
+        "input_ids": 1,
+        "topk": 1,
+        "resident_after": 1,
+    }
+    assert report["inventory"]["probes"]["records_by_kind"] == {"window": 2, "probe": 1}
+    assert report["inventory"]["probes"]["request_windows_by_kind"] == {
+        "window": 2,
+        "probe": 1,
+    }
+    output = tmp_path / "audit.json"
+    process = subprocess.run(
+        [
+            sys.executable,
+            auditor.__file__,
+            str(control),
+            str(experiment),
+            "--output",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert process.returncode != 0
+    assert not output.exists()
+    assert json.loads((tmp_path / "audit-failure.json").read_text()) == report
+
+
+def test_cross_process_audit_does_not_compare_shadow_topk(tmp_path):
+    source, following, probe = records()
+    control, experiment = tmp_path / "control", tmp_path / "probes"
+    probe["topk"] = [[999, 1000]]
+    write_run(control, [source, following], [1, 2, 3])
+    write_run(experiment, [source, following, probe], [1, 2, 3])
+    assert auditor.audit(control, experiment)["passed"]
+
+
+@pytest.mark.parametrize("skip_full", [False, True])
+def test_mode_plan_assigns_ports_without_mutating_args(skip_full):
+    args = NS(mode="experiment", skip_full_control=skip_full, port=32100)
+    plan = runner.mode_plan(args)
+    assert [(mode, a.port) for mode, a in plan] == [
+        ("control", 32100),
+        ("probes", 32101),
+    ] + ([] if skip_full else [("full-control", 32102)])
+    assert args.port == 32100
+    args.mode, args.port = "control", 65535
+    assert runner.mode_plan(args)[0][1].port == 65535
+    args.mode = "experiment"
+    with pytest.raises(ValueError, match="mode ports"):
+        runner.mode_plan(args)
+
+
+def test_port_check_rejects_listener_and_accepts_reusable_closed_connection():
+    with socket.socket() as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        listener.listen(1)
+        with pytest.raises(OSError):
+            runner.check_listen_port(port)
+        with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+            connection, _ = listener.accept()
+            # Server active-close leaves a TIME_WAIT socket, not a live server.
+            connection.close()
+            assert client.recv(1) == b""
+    runner.check_listen_port(port)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper and /proc")

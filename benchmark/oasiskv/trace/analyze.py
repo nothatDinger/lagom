@@ -245,7 +245,7 @@ def analyze(records, cap):
     for record in records:
         validate(record)
         orders.add(record.get("topk_order", "native"))
-        if not orders <= {"native", "logical"} or len(orders) > 1:
+        if not orders <= {"native", "logical", "logical-all"} or len(orders) > 1:
             raise ValueError("Cannot mix different topk_order experiments")
         key = _key(record)
         table = windows if record["kind"] == "window" else probes

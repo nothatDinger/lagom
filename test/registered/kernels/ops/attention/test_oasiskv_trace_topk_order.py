@@ -1,4 +1,4 @@
-"""Real CUDA V4 v1 Top-K launches; full-model replay is the replay-check recipe.
+"""Real CUDA V4 v1/v2 Top-K launches; full-model replay is the replay-check recipe.
 
 These tests do not assert that the native scatter happens to reorder on a given
 GPU. They check repeated fixed-score membership and raw/page alignment, including
@@ -7,7 +7,11 @@ padding and equal-score selection, with the optional diagnostic ordering enabled
 
 import pytest
 import torch
-from sglang.kernels.ops.attention.dsv4.topk import topk_transform_512
+from sglang.kernels.ops.attention.dsv4.topk import (
+    plan_topk_v2,
+    topk_transform_512,
+    topk_transform_512_v2,
+)
 from sglang.srt.speculative.oasiskv_trace_topk import canonicalize_topk_
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -18,7 +22,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 @pytest.mark.parametrize("width", [3, 6])
 @pytest.mark.parametrize("ties", [False, True])
-def test_native_topk_repeated_fixed_scores_with_logical_order(width, ties):
+@pytest.mark.parametrize("backend", ["v1", "v2"])
+def test_native_topk_repeated_fixed_scores_with_logical_order(width, ties, backend):
     n, k, page_size = 1024, 512, 64
     torch.manual_seed(42)
     scores = torch.stack(
@@ -29,6 +34,7 @@ def test_native_topk_repeated_fixed_scores_with_logical_order(width, ties):
         scores = scores.div(65, rounding_mode="floor")
     lengths = torch.full((width,), n, dtype=torch.int32, device="cuda")
     lengths[1], lengths[2] = 117, 0
+    plan = plan_topk_v2(lengths) if backend == "v2" else None
     page_table = torch.stack(
         [torch.randperm(n // page_size, device="cuda") for _ in range(width)]
     ).to(torch.int32)
@@ -36,7 +42,12 @@ def test_native_topk_repeated_fixed_scores_with_logical_order(width, ties):
     pages = torch.empty_like(raw)
     reference = None
     for _ in range(8):
-        topk_transform_512(scores, lengths, page_table, pages, page_size, raw)
+        if backend == "v2":
+            topk_transform_512_v2(
+                scores, lengths, page_table, pages, page_size, plan, raw
+            )
+        else:
+            topk_transform_512(scores, lengths, page_table, pages, page_size, raw)
         before = raw.clone()
         canonicalize_topk_(raw, pages)
         assert torch.equal(raw.sort(-1).values, before.sort(-1).values)

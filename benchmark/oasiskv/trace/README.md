@@ -19,9 +19,7 @@
 | 路由专家 | 显式 `--moe-runner-backend flashinfer_mxfp4`；H100 使用 CUTLASS W4A16，保持 checkpoint MXFP4 存储 |
 | 全局 C4 池 | `host_to_device_ratio=1`，容纳完整 prefill；不改变每请求 decode 的 `resident_units` |
 
-**验证状态：GPU 测试方报告 `ae1545f24` 的 untraced/control 已通过，probes 在恢复校验处失败；本次顺序比较修复只完成了 CPU 回归，尚待 GPU 复测。** 需要使用已能运行该仓库 V4/DSPARK 的 CUDA、FlashMLA、DeepGEMM 等环境。脚本检查本地 checkpoint、GPU 和配置，不自动安装或下载模型依赖。
-
-后续 GPU 证据已确认：第 0 个 C4 层仅换序，第 1–20 层存在逐渐扩大的集合差异。`e2c921d6b` 的集合比较不能消除这种真实差异；下面新增固定访问顺序的诊断，尚未据此宣称模型恢复已经正确或实验已跑通。
+**验证状态：GPU 测试方报告 `05f7c04b3` 的 `logical` 窗口内双重放通过、logits 位相同，probes 已产出记录；跨服务 audit 仍因 proposal、基线 Top-K 和部分驻留集合不同而拒绝。** 本次新增 `logical-all`，将固定访问顺序扩展到 target prefill，并修正模式端口分配、补齐 audit 差异产物；尚待真实 GPU 模型复测。需要使用已能运行该仓库 V4/DSPARK 的 CUDA、FlashMLA、DeepGEMM 等环境。脚本检查本地 checkpoint、GPU 和配置，不自动安装或下载模型依赖。
 
 ## 执行
 
@@ -37,6 +35,7 @@ python benchmark/oasiskv/trace/run.py --output /srv/oasiskv/trace-plan
 
 # 首先验证模型入口、快照恢复和接受边界。4K可以没有miss，不作为覆盖率曲线。
 python benchmark/oasiskv/trace/run.py \
+  --topk-order logical-all \
   --output /srv/oasiskv/trace-smoke \
   --input-lengths 4096 --output-length 32 \
   --requests 1 --max-windows 3 --skip-full-control \
@@ -44,10 +43,14 @@ python benchmark/oasiskv/trace/run.py \
 
 # Smoke 成功后，再跑 16K / 32K。
 python benchmark/oasiskv/trace/run.py \
+  --topk-order logical-all \
   --output /srv/oasiskv/trace-v4-16k-32k --execute
 ```
 
 已有本地实验分支时使用 `git switch exp/oasiskv-trace`。输出目录必须不存在，以防混合旧 trace。默认使用 GPU `0,1,2,3`；可通过 `--gpus` 修改。`--mode experiment` 顺序启动独立的 control/probes/full-control 服务进程，各自重新加载模型，共用 `prompts.npy`；不是在同一个服务里切换组别。请求串行执行。
+`--port` 为基准端口：experiment 的三组分别使用 base、base+1、base+2；单独运行一个模式使用 base。
+启动前用 `SO_REUSEADDR` 的 bind/listen 检查端口，与服务端语义一致，避免把旧连接的 TIME_WAIT 误报为活跃 listener。
+已有活跃 listener 仍报错；预检查不持有服务 socket，不能防止其他作业恰在启动之间抢占端口，也不会清理其他作业。
 Linux runner 在启动服务前启用 child subreaper，接管服务遗留的孤儿进程，退出时清理本次服务的所有后代，包括调用 `setsid()` 脱离原进程组的 worker；已有无关服务不会被清理。
 清理不依赖 wrapper 的 `poll()`，TERM 超时后升级为 KILL，仍存活则写 `teardown-failure.json` 并中止后续组别。
 GPU工作区若已有针对 `eb91f01a4` 的未提交修补，请先保存diff，并在新的worktree检出更新后的分支验证，
@@ -174,10 +177,11 @@ P 行是 P 个 query 的 Top-K，和搬运次数没有直接等价关系。4K �
 
 - `--mode replay-check`：相同快照 → 基线 forward → 恢复 → 基线 forward，不运行 P 个 probe 或任何变宽 shadow；仍执行真实模型与全部严格校验。只产出诊断，不生成覆盖率报告。
 - `--topk-order logical`：仅在 trace 的 target verify 路径，原生 Top-K 选择后、HiSparse 换入及 scratch 映射前，按逻辑 C4 ID 排序，同时对原始 ID 和 page 索引施加同一排列，padding 放末尾。随后 attention 使用固定的逻辑顺序。此选项不更改当前集合，不规定同分候选的取舍，也不保证其余 kernel 确定性。
+- `--topk-order logical-all`：覆盖 target 的 prefill、verify 和 decode C4 路径，保持各路径原有的 v1/v2 Top-K 选择算法，仅对选出结果排序。prefill 额外取得 v2 已支持的 raw ID 输出，不因为申请 raw ID 就切换到 v1。
 
-默认仍为 `--topk-order native`。`logical` 是单独标记的实验变体，会影响浮点计算顺序，不能保证与 native 逐 token 相同。
+默认仍为 `--topk-order native`。`logical` 和 `logical-all` 是分别标记的实验变体，会影响浮点计算顺序，不能保证与 native 逐 token 相同。
 控制/探针组必须使用同一种设置；`runtime.json`、每条 trace、`analysis/report.json` 都标记 `topk_order`，audit/analyze 拒绝混用。
-untraced 不安装该 hook，因此只允许 native。prefill 不在此诊断排序范围；跨进程 audit 若仍失败，也不能跳过。
+untraced 不安装该 hook，因此只允许 native。`logical` 不覆盖 prefill；`logical-all` 覆盖，但不承诺消除全部 CUDA/TP/MoE 数值不确定性。
 
 在已有 CUDA/JIT 环境设置下，可先各跑一个不含 probe 的双重放诊断（每条命令重新加载一次模型）：
 
@@ -203,9 +207,59 @@ python benchmark/oasiskv/trace/run.py --mode experiment --topk-order logical \
   --request-timeout 1800 --output /srv/oasiskv/probes-logical-new --execute
 ```
 
-仅在该模式窗口校验和跨进程 audit 都通过后，才用同一 `--topk-order logical` 跑 16K/32K，并把结果标为 logical-order 变体。
+这条 `logical` 命令保留用于复现 fix3/fix4 的 verify-only 诊断。跨服务基线不一致时，继续下面的 `logical-all` 检查。
 若固定顺序后仍有集合差异，应继续采集首次分歧层的 indexer 输入、分数和 K/K+1 边界，区分同分选择、分数漂移与状态恢复问题，不能为了生成曲线忽略集合变化。
 `rejection_layer_diffs` 保留逐层 `resident_after_equal` / `miss_events_equal`，`compare_topk()` 进一步区分逐行换序、换 ID、重复次数及缺行。
+
+### fix4：跨服务基线不同，不等于 shadow 恢复失败
+
+`audit.py` 只比较 `kind=window` 的 **真实基线 verify** Top-K，不比较 `kind=probe` 的反事实 Top-K。
+被拒绝的候选虽不进入输出，仍参与本轮 verify、选择 KV 并可能改变驻留状态；因此相同的 committed output 不能证明 KV 基线相同。
+报告中的 `resident_after` 也仅 42/63 相同，删掉 `input_ids` 和 `topk` 后仍有 21 条差异。
+跨服务不一致不证明 shadow 污染；窗口内恢复检查与跨服务基线检查分别回答不同问题。
+独立服务也不必然产生不同 proposal，不能把这个现象视为按构造无法通过的校验。
+
+V4 DSPARK 的 `DSparkAttention` 使用 `compress_ratio=0` 的 **SWA** 路径，没有 C4 indexer。
+但 target prefill 的 hidden state 通过 `inject_target_hidden()` 写入 draft KV，旧 `logical` 未固定这段 target C4 访问顺序。
+`logical-all` 补齐这一处已确认的诊断范围缺口；是否足以消除现场的首次 proposal 差异，需要 GPU 验证，不能仅凭静态代码确定根因。
+
+先在相同环境做两个不含 shadow 的独立 control，以较低成本检查基线本身能否复现。每次输出目录必须是新的：
+
+```bash
+python benchmark/oasiskv/trace/run.py --mode control --topk-order logical-all \
+  --gpus 1,5,6,7 --port 31000 --input-lengths 4096 --output-length 16 \
+  --requests 1 --max-windows 2 --diagnostics --request-timeout 1800 \
+  --output /srv/oasiskv/control-all-a-new --execute
+
+python benchmark/oasiskv/trace/run.py --mode control --topk-order logical-all \
+  --gpus 1,5,6,7 --port 31001 --input-lengths 4096 --output-length 16 \
+  --requests 1 --max-windows 2 --diagnostics --request-timeout 1800 \
+  --output /srv/oasiskv/control-all-b-new --execute
+
+python benchmark/oasiskv/trace/audit.py \
+  /srv/oasiskv/control-all-a-new/control /srv/oasiskv/control-all-b-new/control \
+  --output /srv/oasiskv/control-all-b-new/repeat-audit.json
+```
+
+若 control/control 仍不同，先查 `repeat-audit-failure.json` 的首个分歧窗口；两组都没有 shadow，不能归罪于 shadow restore。
+此时优先对齐 target prefill hidden / draft 注入 KV / draft logits，继续定位首个数值分歧，不提交长时 probe 作业。
+通过后再运行完整 experiment：
+
+```bash
+python benchmark/oasiskv/trace/run.py --mode experiment --topk-order logical-all \
+  --gpus 1,5,6,7 --port 31010 --input-lengths 4096 --output-length 32 \
+  --requests 1 --max-windows 3 --diagnostics --request-timeout 1800 \
+  --output /srv/oasiskv/experiment-all-new --execute
+```
+
+跨服务失败现在写 `audit-failure.json`，包括输出是否相同、各字段差异次数、首批差异样本、按 kind 和请求窗口的记录数；不会留下 `passed=true` 的 audit。
+21 个 C4 层、3 个采集窗口、P=1/2/3、exact/resident 两种模式，预期 **63 条 window + 378 条 probe**；不足时检查实际生成窗口数，而非把不同组的 trace 混合。
+只有窗口内 replay 和跨服务 audit 都通过后，才按同一顺序模式跑 16K/32K，并标注实验变体。
+
+`history_coverage` 比较 probe 预测集合与 **同一 probes 服务下一真实窗口** 的需求，属于离线预测潜力；它并非把 shadow 分支自身当作 ground truth。
+因此 fix3 的 0.796→0.878→0.945 可以描述该次采集的预测潜力，不能称为已通过跨服务校验的 H2D 命中率。
+独立运行 analyze 得到的探索性结果也不会使失败的 audit 变为通过。
+4K 全驻留时无候选/无 miss 的比例应为 null。16K/32K 增加容量压力，但历史超过容量仍不保证每个窗口都有 miss；要检查实际 miss 字节分母。
 
 真实 CUDA kernel 回归不需要加载 checkpoint：
 
@@ -214,7 +268,7 @@ PYTHONPATH=python python -m pytest -q \
   test/registered/kernels/ops/attention/test_oasiskv_trace_topk_order.py
 ```
 
-该测试重复调用 V4 原生 v1 Top-K，验证固定分数下的集合、短行/padding，以及排序后的 raw/page 对齐；它不代替上述完整模型双重放和 probes 验证。本地 CPU 测试中的 executor 仍为模拟实现，不应称作真实 GPU replay 已通过。
+该测试重复调用 V4 原生 v1/v2 Top-K，验证固定分数下的集合、短行/padding，以及排序后的 raw/page 对齐；它不代替上述完整模型双重放和 probes 验证。本地 CPU 测试中的 executor 仍为模拟实现，不应称作真实 GPU replay 已通过。
 
 新实验配置列出允许采集的request IDs：server warmup只执行正常验证，不保存window、不做shadow，
 不进入覆盖率和接受长度统计。原日志中的 `history_units=1–2` 不能代表4K请求；
@@ -281,6 +335,7 @@ trace-v4-16k-32k/
   probes/rejection.json         # 仅恢复校验拒绝时存在；阻止该目录进入分析
   probes/rejected-trace.jsonl.gz # 被拒绝窗口/探针原始观测，独立于有效 trace
   audit.json                    # 独立进程隔离检查，必须 passed=true
+  audit-failure.json            # 仅跨进程校验拒绝时存在，逐字段差异与记录数
   acceptance.json               # 每种 V 的 A 分布、平均提交 token 数
   analysis/samples.csv           # 每窗口、每层、P、mode 的明细
   analysis/groups.csv            # 按输入长度、层、V、实际 A、P、mode 聚合

@@ -844,6 +844,12 @@ class C4IndexerBackendMixin:
         hisparse_paired = hisparse_coordinator is not None and getattr(
             forward_batch, "is_oasiskv_paired", False
         )
+        trace_order = getattr(
+            hisparse_coordinator, "oasiskv_trace_topk_order", "native"
+        )
+        trace_sort = trace_order == "logical-all" or (
+            trace_order == "logical" and hisparse_verify
+        )
 
         raw_indices = None
         if capture_enabled:
@@ -863,6 +869,12 @@ class C4IndexerBackendMixin:
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
+        # Prefill may not otherwise need logical IDs. Request the optional raw
+        # output without changing its native v1/v2 selection algorithm.
+        trace_raw_only = trace_sort and raw_indices is None
+        if trace_raw_only:
+            raw_indices = torch.empty_like(c4_sparse_page_indices)
+
         if self.dsa_topk_backend.is_torch():
             topk_transform_512_pytorch_vectorized(
                 logits,
@@ -881,7 +893,9 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and (
+            raw_indices is None or trace_raw_only
+        ):
             topk_transform_512_v2(
                 logits,
                 c4_seq_lens,
@@ -889,6 +903,7 @@ class C4IndexerBackendMixin:
                 c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
+                out_raw_indices=raw_indices,
             )
         else:
             topk_transform_512(
@@ -899,11 +914,7 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        if (
-            hisparse_verify
-            and getattr(hisparse_coordinator, "oasiskv_trace_topk_order", "native")
-            == "logical"
-        ):
+        if trace_sort:
             from sglang.srt.speculative.oasiskv_trace_topk import canonicalize_topk_
 
             # Offline diagnostic only. Keep raw, page and later scratch indices

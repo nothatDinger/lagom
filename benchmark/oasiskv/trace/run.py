@@ -413,6 +413,31 @@ def run_environment(args, config_path):
     return env
 
 
+def mode_plan(args):
+    """One controller, separate servers; use a distinct declared port per mode."""
+    modes = (
+        ["control", "probes"] + ([] if args.skip_full_control else ["full-control"])
+        if args.mode == "experiment"
+        else [args.mode]
+    )
+    if not 1 <= args.port <= 65536 - len(modes):
+        raise ValueError("Base --port and all mode ports must be within 1..65535")
+    return [
+        (mode, argparse.Namespace(**(vars(args) | {"port": args.port + offset})))
+        for offset, mode in enumerate(modes)
+    ]
+
+
+def check_listen_port(port):
+    # Match the server's reuse semantics: TIME_WAIT after an old HTTP connection
+    # must not be mistaken for a live listener. No SO_REUSEPORT: fail for a real
+    # competing server. Closing before spawn cannot prevent an external race.
+    with socket.socket() as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", port))
+        sock.listen(1)
+
+
 def run_one(args, directory, config, command, prompts):
     directory.mkdir()
     config_path = directory / "config.json"
@@ -441,9 +466,8 @@ def run_one(args, directory, config, command, prompts):
         },
     )
     url = f"http://127.0.0.1:{args.port}"
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", args.port))  # Fail before spawning if in use.
-    print(f"Starting {directory.name}", flush=True)
+    check_listen_port(args.port)
+    print(f"Starting {directory.name} on port {args.port}", flush=True)
     with (directory / "server.log").open("w") as log, ServerProcessTree() as tree:
         process = subprocess.Popen(
             command,
@@ -573,9 +597,9 @@ def main():
     )
     parser.add_argument(
         "--topk-order",
-        choices=["native", "logical"],
+        choices=["native", "logical", "logical-all"],
         default="native",
-        help="Offline diagnostic only: sort selected IDs before attention; native remains default",
+        help="Offline diagnostic: logical sorts verify only; logical-all also sorts target prefill/decode",
     )
     parser.add_argument(
         "--diagnostics",
@@ -614,7 +638,12 @@ def main():
     parser.add_argument("--context-length", type=int, default=40960)
     parser.add_argument("--mem-fraction", type=float, default=0.9)
     parser.add_argument("--gpus", default="0,1,2,3")
-    parser.add_argument("--port", type=int, default=30000)
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=30000,
+        help="Base port; experiment uses base/base+1/base+2",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--startup-timeout", type=int, default=1800)
     parser.add_argument("--request-timeout", type=int, default=21600)
@@ -635,11 +664,12 @@ def main():
     if args.resident_units is None:
         args.resident_units = (gamma + 1) * args.top_k
     v = validate_args(args, gamma)
-    command = server_command(args, gamma)
+    plan = mode_plan(args)
     print(
         f"mode={args.mode}; G={gamma}, V={v}, P={args.probes}, index_topk={args.top_k}, resident_C4={args.resident_units}; B=1, TP=4; quality experiment, graphs disabled"
     )
-    print(shlex.join(command))
+    for mode, mode_args in plan:
+        print(f"{mode}: {shlex.join(server_command(mode_args, gamma))}")
     if not args.execute:
         return
     hardware = preflight(args)
@@ -668,12 +698,8 @@ def main():
         },
     )
     prompts = prepare_prompts(args, output)
-    modes = (
-        ["control", "probes"] + ([] if args.skip_full_control else ["full-control"])
-        if args.mode == "experiment"
-        else [args.mode]
-    )
-    for mode in modes:
+    modes = [mode for mode, _ in plan]
+    for mode, mode_args in plan:
         directory = output / mode
         config = {
             "run_id": mode,
@@ -691,7 +717,11 @@ def main():
             ],
         }
         run_one(
-            args, directory, None if mode == "untraced" else config, command, prompts
+            mode_args,
+            directory,
+            None if mode == "untraced" else config,
+            server_command(mode_args, gamma),
+            prompts,
         )
     if args.mode != "experiment":
         print(
