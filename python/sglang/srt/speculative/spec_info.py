@@ -427,7 +427,11 @@ def create_dummy_verify_input(
         spec_info = DFlashVerifyInput(
             draft_token=None,
             positions=None,
-            draft_token_num=spec.speculative_num_draft_tokens,
+            draft_token_num=(
+                num_tokens_per_req
+                if getattr(spec, "is_lagom", False)
+                else spec.speculative_num_draft_tokens
+            ),
             custom_mask=None,
             capture_hidden_mode=(
                 CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL

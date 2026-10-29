@@ -129,7 +129,11 @@ class DSparkVerifyPlanner:
                     sts_path,
                 )
 
-        self._ragged_verify_mode = read_ragged_verify_mode()
+        self._ragged_verify_mode = (
+            RaggedVerifyMode.STATIC
+            if getattr(server_args, "is_lagom", False)
+            else read_ragged_verify_mode()
+        )
         self._schedule_cfg = DSparkScheduleConfig(gamma=self.gamma)
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
         self._dynamic_graph_tier = False

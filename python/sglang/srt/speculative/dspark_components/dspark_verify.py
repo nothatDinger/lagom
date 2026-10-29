@@ -40,6 +40,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
     apply_logits_adjustments_strided,
 )
+from sglang.srt.speculative.lagom import select_decode_rows
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
@@ -236,8 +237,15 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        lagom_decode_width: int = 0,
     ) -> TargetVerifyResult:
-        verify_w = self.verify_num_draft_tokens
+        verify_w = (
+            verify_ids_2d.shape[1]
+            if lagom_decode_width
+            else self.verify_num_draft_tokens
+        )
+        if lagom_decode_width and lagom_decode_width != self.verify_num_draft_tokens:
+            raise ValueError("Lagom decode width differs from the acceptance window")
         positions_2d = verify_window.positions_2d
         verify_cache_loc = verify_window.verify_cache_loc
 
@@ -265,13 +273,33 @@ class TargetVerifyExecutor:
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            lagom_decode_width=lagom_decode_width,
         )
+
+        if lagom_decode_width:
+            # The target evaluated probes to provide per-layer indexer queries;
+            # no probe logit or auxiliary hidden state enters acceptance or the
+            # authoritative draft context. Preserve each request's own prefix.
+            output = result.logits_output
+            for name in ("next_token_logits", "hidden_states"):
+                value = getattr(output, name, None)
+                if value is not None:
+                    setattr(
+                        output,
+                        name,
+                        select_decode_rows(
+                            value,
+                            batch_size=verify_ids_2d.shape[0],
+                            execution_width=verify_w,
+                            decode_width=lagom_decode_width,
+                        ),
+                    )
 
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
-                draft_token_num=verify_w,
+                draft_token_num=self.verify_num_draft_tokens,
             )
 
         return result
@@ -283,12 +311,16 @@ class TargetVerifyExecutor:
         verify_input: DFlashVerifyInput,
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
+        lagom_decode_width: int = 0,
     ) -> TargetVerifyResult:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
+        if lagom_decode_width:
+            verify_forward_batch.lagom_decode_width = lagom_decode_width
+            verify_forward_batch.lagom_prefix_lens_cpu = seq_lens_cpu_backup
 
         target_out = self.target_worker.forward_batch_generation(
             batch=None,

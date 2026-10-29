@@ -165,7 +165,7 @@ def test_unknown_algorithm_and_fields_are_rejected():
             "random", {}, effective_top_k=4, device_buffer_size=8
         )
     with pytest.raises(
-        ValueError, match="supported prefetchers: ema, oasiskv, previous"
+        ValueError, match="supported prefetchers: ema, lagom, oasiskv, previous"
     ):
         create_hisparse_prefetcher(
             "previous_layer_topk", {}, effective_top_k=4, device_buffer_size=8
@@ -177,7 +177,7 @@ def test_unknown_algorithm_and_fields_are_rejected():
             effective_top_k=4,
             device_buffer_size=8,
         )
-    assert supported_hisparse_prefetchers() == ("ema", "oasiskv", "previous")
+    assert supported_hisparse_prefetchers() == ("ema", "lagom", "oasiskv", "previous")
 
 
 def test_oasiskv_logical_entry_size_and_selection():

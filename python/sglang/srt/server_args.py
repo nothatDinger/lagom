@@ -2080,6 +2080,9 @@ class ServerArgs:
     # OasisKV runs fixed-width EAGLE-3 verification and additionally makes each
     # verify row's Indexer Top-K resident in the HiSparse device buffer.
     is_oasiskv_lookahead: bool = False
+    # Resolved from HiSparse's Lagom configuration; no independent CLI switches.
+    is_lagom: A[bool, Arg(no_cli=True), NS("spec")] = False
+    lagom_prefetch_tokens: A[int, Arg(no_cli=True), NS("spec")] = 0
     speculative_draft_model_path: A[
         Optional[str],
         Arg(
@@ -9078,7 +9081,9 @@ class ServerArgs:
         if self.speculative_num_draft_tokens is None:
             return None
         if not self.speculative_adaptive:
-            return self.speculative_num_draft_tokens
+            return self.speculative_num_draft_tokens + (
+                self.lagom_prefetch_tokens if self.is_lagom else 0
+            )
 
         from sglang.srt.speculative.adaptive_spec_params import (
             resolve_candidate_steps_from_config,

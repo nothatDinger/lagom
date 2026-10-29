@@ -62,6 +62,7 @@ def _resolve_speculative_algorithm_alias(
 
 
 def handle_speculative_decoding(server_args: ServerArgs) -> None:
+    _handle_lagom_mode(server_args)
     _handle_oasiskv_lookahead(server_args)
     if (
         server_args.speculative_draft_model_path is not None
@@ -143,6 +144,81 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
     if algo is not None:
         algo.handle_server_args(server_args)
+    _resolve_lagom_window(server_args)
+
+
+def _handle_lagom_mode(server_args: ServerArgs) -> None:
+    """Select real DSPARK decoding with disposable CSA forecast rows."""
+    try:
+        config = json.loads(server_args.hisparse_config or "{}")
+    except json.JSONDecodeError:
+        return
+    if (
+        not isinstance(config, dict)
+        or str(config.get("prefetcher", "")).lower() != "lagom"
+    ):
+        return
+    if not server_args.enable_hisparse:
+        raise ValueError('HiSparse prefetcher "lagom" requires --enable-hisparse.')
+    if (server_args.speculative_algorithm or "DSPARK").upper() != "DSPARK":
+        raise ValueError(
+            'HiSparse prefetcher "lagom" requires DSPARK speculative decoding.'
+        )
+    if not server_args.device.startswith("cuda"):
+        raise ValueError("Lagom currently requires CUDA DeepSeek-V4.")
+    from sglang.srt.configs.model_config import is_deepseek_v4
+    from sglang.srt.utils import is_hip
+
+    if is_hip() or not is_deepseek_v4(server_args.get_model_config().hf_config):
+        raise ValueError("Lagom currently requires CUDA DeepSeek-V4.")
+    if (
+        server_args.pp_size != 1
+        or server_args.dp_size != 1
+        or server_args.attn_cp_size != 1
+        or server_args.dcp_size != 1
+    ):
+        raise ValueError(
+            "Lagom currently supports tensor parallelism only (PP/DP/CP/DCP sizes must be 1)."
+        )
+    if server_args.disaggregation_mode != "null":
+        raise ValueError("Lagom currently requires colocated prefill and decode.")
+    if server_args.speculative_adaptive:
+        raise ValueError(
+            "Lagom uses a fixed decode window and does not support adaptive speculation."
+        )
+    if config.get("force_h2d_each_step", False):
+        raise ValueError(
+            "Lagom requires force_h2d_each_step=false to preserve prefetched KV."
+        )
+    if os.getenv("SGLANG_OASISKV_TRACE_CONFIG"):
+        raise ValueError("Lagom cannot run with the offline OasisKV trace harness.")
+    server_args.speculative_algorithm = "DSPARK"
+    server_args.is_lagom = True
+
+
+def _resolve_lagom_window(server_args: ServerArgs) -> None:
+    if not getattr(server_args, "is_lagom", False):
+        return
+    config = json.loads(server_args.hisparse_config)
+    prefetch_config = config.setdefault("prefetcher_config", {})
+    if not isinstance(prefetch_config, dict):
+        raise ValueError("Lagom prefetcher_config must be an object.")
+    width = int(server_args.speculative_num_draft_tokens) - 1
+    prediction_steps = prefetch_config.get("prediction_steps", width)
+    if type(prediction_steps) is not int or prediction_steps <= 0:
+        raise ValueError(
+            "Lagom prefetcher_config.prediction_steps must be a positive integer."
+        )
+    server_args.lagom_prefetch_tokens = prediction_steps
+    prefetch_config["prediction_steps"] = prediction_steps
+    server_args.hisparse_config = json.dumps(config)
+    logger.info(
+        "Lagom enabled: DSPARK W=%d, CSA forecast P=%d, target rows=%d; "
+        "static verify with asynchronous KV prefetch",
+        width,
+        prediction_steps,
+        width + prediction_steps + 1,
+    )
 
 
 def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:

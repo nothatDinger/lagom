@@ -114,7 +114,13 @@ def validate_hisparse_prefetcher(
         raise ValueError(
             f"Unknown HiSparse prefetcher {name!r}; supported prefetchers: {supported}"
         )
-    algorithm_fields = {"alpha", "beta", "gamma"} if normalized == "ema" else set()
+    algorithm_fields = (
+        {"alpha", "beta", "gamma"}
+        if normalized == "ema"
+        else {"prediction_steps"}
+        if normalized == "lagom"
+        else set()
+    )
     unknown = set(config) - ({"size"} | algorithm_fields)
     if unknown:
         raise ValueError(
@@ -131,6 +137,15 @@ def validate_hisparse_prefetcher(
             f"buffer capacity ({device_buffer_size} logical entries)"
         )
     algorithm_config = {}
+    if normalized == "lagom":
+        prediction_steps = _require_int(config, "prediction_steps", 1)
+        if prediction_steps <= 0:
+            raise ValueError("prefetcher_config.prediction_steps must be positive")
+        if size > effective_top_k:
+            raise ValueError(
+                "Lagom prefetcher_config.size must not exceed the model Top-K"
+            )
+        algorithm_config["prediction_steps"] = prediction_steps
     for key, default in (("alpha", 0.6), ("beta", 0.2), ("gamma", 0.25)):
         if key not in algorithm_fields:
             continue
@@ -178,6 +193,15 @@ class OasisKVPrefetcher(HiSparsePrefetcher):
         result = predicted[:, : self.logical_entries]
         self.stats.selected_entries += result.numel()
         return result
+
+
+@register_hisparse_prefetcher("lagom")
+class LagomPrefetcher(OasisKVPrefetcher):
+    """Per-probe CSA candidates; the coordinator owns union and async transfer."""
+
+    def __init__(self, logical_entries, size=None, prediction_steps=1):
+        super().__init__(logical_entries, size)
+        self.prediction_steps = prediction_steps
 
 
 @register_hisparse_prefetcher("ema")

@@ -16,6 +16,7 @@ from sglang.kernels.ops.kvcache.hisparse_spec import (
     allocate_hisparse_spec_states,
     initialize_hisparse_spec_state,
     load_cache_to_device_buffer_spec_mla,
+    lookup_hisparse_spec_resident,
 )
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
@@ -156,6 +157,20 @@ class HiSparseTokenStats(NamedTuple):
 
 
 @dataclass
+class LagomPrefetch:
+    """One layer's advisory forecast, with scheduler-owned CPU identity."""
+
+    req_slots: torch.Tensor
+    generations: torch.Tensor
+    source_lens: torch.Tensor
+    req_indices: torch.Tensor
+    predicted_entries: torch.Tensor
+    ready: object
+    completion: object = None
+    consumed: bool = False
+
+
+@dataclass
 class HiSparseDSparkWindow:
     """Metadata for one target-verify transaction over fixed C4 scratch."""
 
@@ -239,7 +254,9 @@ def is_hisparse_prefetcher_mode_unsupported(
     OasisKV is the one named prefetcher implemented directly on EAGLE-3 verify
     batches, so it is allowed with ``is_speculative``.
     """
-    return pp_size != 1 or (is_speculative and (name or "").lower() != "oasiskv")
+    return pp_size != 1 or (
+        is_speculative and (name or "").lower() not in ("oasiskv", "lagom")
+    )
 
 
 class HiSparseCoordinator:
@@ -316,6 +333,10 @@ class HiSparseCoordinator:
             )
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
+        lagom = (prefetcher_name or "").lower() == "lagom"
+        self._lagom_prediction_steps = (
+            (prefetcher_config or {}).get("prediction_steps", 0) if lagom else 0
+        )
         self._pr_verify_layout = None
         if self.is_dsv4_hisparse and is_speculative and speculative_verify_width > 0:
             self._pr_verify_layout = validate_pr_fused_config(
@@ -329,6 +350,7 @@ class HiSparseCoordinator:
                 force_h2d=force_h2d_each_step,
                 skip_io=self.skip_io,
                 prefetcher=prefetcher_name,
+                prediction_steps=self._lagom_prediction_steps,
             )
             logger.info(
                 "HiSparse speculative swap-in uses pr_fused: %s", self._pr_verify_layout
@@ -458,7 +480,16 @@ class HiSparseCoordinator:
         self._spec_states = None
         if self._pr_verify_layout is not None:
             self._spec_states = allocate_hisparse_spec_states(
-                HiSparseSpecLayout(device_buffer_size, speculative_verify_width, top_k),
+                HiSparseSpecLayout(
+                    device_buffer_size,
+                    max(
+                        speculative_verify_width - self._lagom_prediction_steps,
+                        self._lagom_prediction_steps,
+                    )
+                    if lagom
+                    else speculative_verify_width,
+                    top_k,
+                ),
                 device_buffer_locs=self.req_device_buffer_token_locs,
                 scratch_offset=self._pr_verify_layout["scratch_offset"],
             )
@@ -474,7 +505,10 @@ class HiSparseCoordinator:
         )
         self.prefetcher = None
         self.prefetcher_name = prefetcher_name.lower() if prefetcher_name else None
-        if self.prefetcher_name in ("oasiskv", "ema") and not self.is_dsv4_hisparse:
+        if (
+            self.prefetcher_name in ("oasiskv", "ema", "lagom")
+            and not self.is_dsv4_hisparse
+        ):
             raise ValueError(
                 f'HiSparse prefetcher "{self.prefetcher_name}" requires the '
                 "DeepSeek-V4 C4 Indexer"
@@ -488,15 +522,15 @@ class HiSparseCoordinator:
             device_buffer_size=self.device_buffer_size,
         )
         if envs.SGLANG_DISABLE_HISPARSE_PREFETCH.get():
-            if self.prefetcher_name == "oasiskv":
+            if self.prefetcher_name in ("oasiskv", "lagom"):
                 raise ValueError(
-                    "OasisKV was requested but SGLANG_DISABLE_HISPARSE_PREFETCH is set"
+                    f"{self.prefetcher_name} was requested but SGLANG_DISABLE_HISPARSE_PREFETCH is set"
                 )
             logger.info("HiSparse prefetch mode: disabled")
         elif self.enable_prefetch:
-            if self.prefetcher_name == "oasiskv":
+            if self.prefetcher_name in ("oasiskv", "lagom"):
                 raise ValueError(
-                    "OasisKV conflicts with legacy shared-index prefetch for this model"
+                    f"{self.prefetcher_name} conflicts with legacy shared-index prefetch for this model"
                 )
             logger.info("HiSparse prefetch mode: legacy shared-index")
             if prefetcher_name is not None:
@@ -508,8 +542,10 @@ class HiSparseCoordinator:
         elif prefetcher_name is not None and is_hisparse_prefetcher_mode_unsupported(
             self.prefetcher_name, pp_size=pp_size, is_speculative=is_speculative
         ):
-            if self.prefetcher_name == "oasiskv":
-                raise ValueError("OasisKV EAGLE-3 verification requires pp_size=1")
+            if self.prefetcher_name in ("oasiskv", "lagom"):
+                raise ValueError(
+                    f"{self.prefetcher_name} verification requires pp_size=1"
+                )
             logger.warning(
                 'HiSparse prefetcher "%s" is disabled under pipeline parallelism '
                 "or speculative decoding; HiSparse prefetch mode: disabled",
@@ -527,6 +563,10 @@ class HiSparseCoordinator:
                 prefetcher_name.lower() if prefetcher_name is not None else "disabled",
             )
         if self.prefetcher is not None:
+            if lagom and self.prefetcher.logical_entries > self.top_k:
+                raise ValueError(
+                    "Lagom prefetch size cannot exceed the CSA indexer Top-K"
+                )
             if (
                 self.prefetcher_name == "ema"
                 and self.prefetcher.logical_entries + self.top_k
@@ -589,6 +629,16 @@ class HiSparseCoordinator:
                 max_num_req_slots, dtype=torch.int32, device=device
             )
             self._previous_prefetch_stream = device_module.Stream()
+            self._lagom_pending: Dict[int, LagomPrefetch] = {}
+            self._lagom_inflight: Dict[int, LagomPrefetch] = {}
+            self._lagom_layer_events = None
+            if lagom:
+                self._lagom_layer_events = [
+                    device_module.Event(external=True)
+                    for _ in range(self.mem_pool_device.layer_num)
+                ]
+                for event in self._lagom_layer_events:
+                    event.record(device_module.current_stream())
             self._previous_prefetch_event = device_module.Event()
             self._previous_prefetch_target_layer = None
             self._previous_prefetch_num_reqs = 0
@@ -884,6 +934,7 @@ class HiSparseCoordinator:
         if (
             getattr(self, "_pr_verify_layout", None) is not None
             and compressed_len <= self.device_buffer_size
+            and not getattr(self, "_lagom_prediction_steps", 0)
         ):
             raise ValueError(
                 "pr_fused experiment requires long-context requests (compressed prefix > hot slots)"
@@ -909,6 +960,11 @@ class HiSparseCoordinator:
         self.req_device_buffer_tokens[
             :, req.req_pool_idx, : self.device_buffer_size
         ] = self._device_buffer_arange_i32
+        # Lagom retains this canonical identity even for not-yet-filled short
+        # context slots. Sequence-length masking prevents reading them before
+        # their C4 commit, and the transaction overlays current writer scratch.
+        # Thus short-context history has no cache misses/rotations; promotion
+        # below may safely use the canonical req_to_device_buffer destination.
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
@@ -1225,9 +1281,9 @@ class HiSparseCoordinator:
         Returns:
             Device KV cache indices for the selected tokens.  Shape: (num_reqs, top_k)
         """
-        assert (
-            not self.is_dsv4_hisparse
-        ), "naive_load_topk is not implemented for dsv4 hisparse"
+        assert not self.is_dsv4_hisparse, (
+            "naive_load_topk is not implemented for dsv4 hisparse"
+        )
         num_reqs = req_pool_indices.size(0)
         top_k_indices = torch.full(
             (num_reqs, self.top_k), -1, dtype=torch.int32, device=self.device
@@ -1242,9 +1298,9 @@ class HiSparseCoordinator:
             req_idx = int(req_pool_indices[i].item())
             selected_tokens = top_k_tokens[i, :top_n].to(dtype=torch.int64)
 
-            assert torch.all(
-                selected_tokens >= 0
-            ), f"Req {req_idx}: selected tokens contain negative positions"
+            assert torch.all(selected_tokens >= 0), (
+                f"Req {req_idx}: selected tokens contain negative positions"
+            )
             assert torch.all(selected_tokens < seq_len), (
                 f"Req {req_idx}: selected tokens {selected_tokens.tolist()} "
                 f"out of range for seq_len={seq_len}"
@@ -1339,6 +1395,7 @@ class HiSparseCoordinator:
         Request finish is a slow path, so synchronizing the few matching task
         events is preferable to a global device/stream synchronization.
         """
+        self._drain_lagom_before_request_release(req_pool_idx)
         if getattr(self, "_oasiskv_ring", None) is None:
             return
         for layer_slots in self._oasiskv_ring:
@@ -1535,6 +1592,9 @@ class HiSparseCoordinator:
         req_pool_indices_cpu: Optional[torch.Tensor] = None,
         committed_lens_cpu: Optional[torch.Tensor] = None,
     ) -> None:
+        if self.prefetcher_name == "lagom":
+            self.consume_lagom_prefetch(layer_id)
+            return
         if self.prefetcher_name == "ema":
             # This call is intentionally unconditional: during CUDA Graph
             # capture it records one external wait at the point each layer is
@@ -1784,6 +1844,201 @@ class HiSparseCoordinator:
         ring_slot = self._oasiskv_next_slot[layer_id]
         self._oasiskv_next_slot[layer_id] = 1 - ring_slot
         return self._oasiskv_ring[layer_id][ring_slot]
+
+    def queue_lagom_prefetch(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+        source_committed_lens_cpu: torch.Tensor,
+        predicted_c4_entries: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        """Retain a layer forecast until accepted C4 promotion has completed.
+
+        Snapshot request-major [B, P, K] outputs before a subsequent CUDA Graph
+        replay may overwrite them. No cache planning or IO is launched here.
+        """
+        if self.prefetcher_name != "lagom" or self.prefetcher is None:
+            raise RuntimeError("Lagom forecasts require the lagom prefetcher")
+        if (
+            req_pool_indices_cpu.device.type != "cpu"
+            or source_committed_lens_cpu.device.type != "cpu"
+        ):
+            raise ValueError("Lagom requires scheduler-owned CPU metadata")
+        batch = req_pool_indices.numel()
+        if predicted_c4_entries.shape != (
+            batch,
+            self._lagom_prediction_steps,
+            self.top_k,
+        ):
+            raise ValueError(
+                "Lagom prediction shape must be [batch, prediction_steps, top_k]"
+            )
+        if (
+            req_pool_indices_cpu.numel() != batch
+            or source_committed_lens_cpu.numel() != batch
+        ):
+            raise ValueError("Lagom forecast identities must match the request count")
+        slots = req_pool_indices_cpu.to(torch.int64).clone()
+        ready = device_module.Event()
+        # A scheduler may reuse its device identity vector while the side
+        # stream runs. Own this small vector; layer predictions are fresh.
+        req_indices = req_pool_indices.to(torch.int64).clone()
+        predicted_c4_entries = predicted_c4_entries.clone()
+        ready.record(device_module.current_stream())
+        self._lagom_pending[layer_id] = LagomPrefetch(
+            req_slots=slots,
+            generations=self._prefetch_generation[slots].clone(),
+            source_lens=source_committed_lens_cpu.to(torch.int64).clone(),
+            req_indices=req_indices,
+            predicted_entries=predicted_c4_entries,
+            ready=ready,
+        )
+
+    def submit_lagom_prefetches(self) -> None:
+        """Warm future verify working sets on the side stream after C4 commit.
+
+        Selection, history filtering, hash/CLOCK maintenance, and H2D all run
+        off the target stream. The ordinary fused engine owns both real and
+        predicted residency, so its persistent hash never diverges from KV.
+        """
+        pending = getattr(self, "_lagom_pending", None)
+        if not pending:
+            return
+        if self._active_dspark_window is not None:
+            raise RuntimeError("Lagom prefetch must follow C4 commit or rollback")
+        self._lagom_pending = {}
+        stream = self._previous_prefetch_stream
+        stream.wait_stream(device_module.current_stream())
+        for layer_id, task in pending.items():
+            if not torch.equal(
+                task.generations, self._prefetch_generation[task.req_slots]
+            ):
+                self.prefetcher.stats.stale_tasks += 1
+                continue
+            task.ready.wait(stream)
+            for tensor in (task.req_indices, task.predicted_entries):
+                tensor.record_stream(stream)
+            task.completion = self._lagom_layer_events[layer_id]
+            # Retain completion even after a consumer enqueues its wait: host
+            # page reclamation must wait for actual DMA completion.
+            self._lagom_inflight[layer_id] = task
+            with device_module.stream(stream):
+                try:
+                    batch, steps, _ = task.predicted_entries.shape
+                    # Only history committed before this verify is predicted.
+                    # Rejected probes and unaccepted C4 writers never become
+                    # host-cache sources, irrespective of acceptance length.
+                    lengths = (task.source_lens // self.compress_ratio).to(
+                        device=self.device, dtype=torch.int32, non_blocking=True
+                    )
+                    candidates = task.predicted_entries.to(torch.int32).contiguous()
+                    candidates.masked_fill_(
+                        (candidates < 0) | (candidates >= lengths[:, None, None]), -1
+                    )
+                    if self.prefetcher.logical_entries < self.top_k:
+                        candidates[:, :, self.prefetcher.logical_entries :].fill_(-1)
+                    real_reqs = torch.full(
+                        (1,), batch, dtype=torch.int32, device=self.device
+                    )
+                    output = torch.empty_like(candidates)
+                    self._run_swap_in_verify_window(
+                        req_pool_indices=task.req_indices,
+                        compressed_seq_lens=lengths,
+                        top_k_result=candidates.reshape(-1, self.top_k),
+                        layer_id=layer_id,
+                        verify_width=steps,
+                        output_buffer=output,
+                        num_real_reqs=real_reqs,
+                    )
+                    entries = batch * steps * self.prefetcher.logical_entries
+                    self.prefetcher.stats.selected_entries += entries
+                    self.prefetcher.stats.submitted_entries += entries
+                finally:
+                    task.completion.record(stream)
+
+    def consume_lagom_prefetch(self, layer_id: int) -> None:
+        """Join a layer's writer only when real attention needs its residency."""
+        # Always record this dependency, including CUDA Graph capture. An
+        # external event is re-recorded by every post-replay side-stream task.
+        self._lagom_layer_events[layer_id].wait(device_module.current_stream())
+        task = getattr(self, "_lagom_inflight", {}).get(layer_id)
+        if task is not None and not task.consumed:
+            task.consumed = True
+            self.prefetcher.stats.prefetch_wait_submissions += 1
+
+    def discard_lagom_prefetches(self) -> None:
+        """Abort unsubmitted forecasts; submitted tasks retain their drain events."""
+        if hasattr(self, "_lagom_pending"):
+            self._lagom_pending = {}
+
+    def _drain_lagom_before_request_release(self, req_pool_idx: int) -> None:
+        pending = getattr(self, "_lagom_pending", {})
+        for layer_id, task in list(pending.items()):
+            if bool((task.req_slots == req_pool_idx).any()):
+                del pending[layer_id]
+        # The shared side stream serializes all generations. Draining every
+        # retained latest layer event also covers older tasks replaced by a
+        # new batch, including requests absent from that replacement batch.
+        inflight = getattr(self, "_lagom_inflight", {})
+        for task in inflight.values():
+            task.completion.synchronize()
+        inflight.clear()
+
+    def swap_in_lagom_pages(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        layer_id: int,
+        decode_width: int,
+        output_buffer: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Resolve real verify rows and read resident history for forecast rows."""
+        batch = req_pool_indices.numel()
+        width = decode_width + self._lagom_prediction_steps
+        if top_k_result.shape != (batch * width, self.top_k):
+            raise ValueError(
+                "Lagom indexer rows must contain decode then prediction windows"
+            )
+        self.consume_lagom_prefetch(layer_id)
+        raw = top_k_result.reshape(batch, width, self.top_k)
+        lengths = compressed_seq_lens.reshape(batch, -1)
+        if lengths.shape[1] == 1:
+            lengths = lengths.expand(batch, width)
+        if lengths.shape[1] != width:
+            raise ValueError("Lagom needs one compressed length per request or query")
+        real = raw[:, :decode_width].contiguous()
+        real_output = torch.empty_like(real, dtype=torch.int32)
+        self._run_swap_in_verify_window(
+            req_pool_indices=req_pool_indices,
+            compressed_seq_lens=lengths[:, :decode_width].contiguous(),
+            top_k_result=real.reshape(-1, self.top_k),
+            layer_id=layer_id,
+            verify_width=decode_width,
+            output_buffer=real_output,
+        )
+        probes = raw[:, decode_width:].contiguous()
+        probe_output = torch.empty_like(probes, dtype=torch.int32)
+        active = self._pr_verify_layout["active_slots"]
+        lookup_hisparse_spec_resident(
+            top_k_tokens=probes,
+            device_buffer_tokens=self.req_device_buffer_tokens[layer_id, :, :active],
+            device_buffer_locs=self.req_device_buffer_token_locs[layer_id, :, :active],
+            req_pool_indices=req_pool_indices,
+            seq_lens=lengths[:, decode_width:].contiguous(),
+            state=self._spec_states[layer_id],
+            num_real_reqs=self.num_real_reqs,
+            output=probe_output,
+        )
+        if output_buffer is None:
+            output_buffer = torch.empty_like(top_k_result, dtype=torch.int32)
+        output = output_buffer.reshape(batch, width, self.top_k)
+        output[:, :decode_width].copy_(real_output)
+        output[:, decode_width:].copy_(probe_output)
+        return output_buffer
 
     def consume_ema_prefetch(self) -> None:
         """Publish prior work stats; per-layer graph nodes provide ordering."""
@@ -2063,14 +2318,48 @@ class HiSparseCoordinator:
         lengths = compressed_seq_lens.reshape(num_reqs, -1)
         if lengths.shape[1] == 1:
             lengths = lengths.expand(num_reqs, verify_width)
+        tokens = top_k_result.reshape(num_reqs, verify_width, self.top_k)
+        output = output_buffer.view(num_reqs, verify_width, self.top_k)
+        prediction_steps = getattr(self, "_lagom_prediction_steps", 0)
+        planning_width = (
+            max(self._speculative_verify_width - prediction_steps, prediction_steps)
+            if prediction_steps
+            else verify_width
+        )
+        if verify_width > planning_width:
+            raise ValueError(
+                "Lagom real/prediction rows exceed the fixed planner width"
+            )
+        if verify_width < planning_width:
+            # The persistent miss workspace partitions table/index/compact
+            # arrays by NUM_STEPS * TOP_K. Alternating W+1 and P without this
+            # padding would reinterpret old compact metadata as tagged hash
+            # entries. Keep one kernel geometry for real, forecast, and decode
+            # fallback calls; padded rows cannot read or mutate residency.
+            padded_tokens = torch.full(
+                (num_reqs, planning_width, self.top_k),
+                -1,
+                dtype=tokens.dtype,
+                device=tokens.device,
+            )
+            padded_tokens[:, :verify_width].copy_(tokens)
+            tokens = padded_tokens
+            padded_lengths = torch.zeros(
+                (num_reqs, planning_width), dtype=lengths.dtype, device=lengths.device
+            )
+            padded_lengths[:, :verify_width].copy_(lengths)
+            lengths = padded_lengths
+            kernel_output = torch.empty_like(tokens, dtype=torch.int32)
+        else:
+            kernel_output = output
         load_cache_to_device_buffer_spec_mla(
-            top_k_tokens=top_k_result.reshape(num_reqs, verify_width, self.top_k),
+            top_k_tokens=tokens,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id, :, :active],
             device_buffer_locs=self.req_device_buffer_token_locs[layer_id, :, :active],
             host_cache_locs=self.req_to_host_pool,
             host_cache=self.mem_pool_host.kv_buffer[layer_id],
             device_buffer=self.mem_pool_device.kv_buffer[layer_id],
-            top_k_device_locs=output_buffer.view(num_reqs, verify_width, self.top_k),
+            top_k_device_locs=kernel_output,
             req_pool_indices=req_pool_indices.to(torch.int64),
             seq_lens=lengths.to(torch.int32).contiguous().view(-1),
             state=self._spec_states[layer_id],
@@ -2080,6 +2369,8 @@ class HiSparseCoordinator:
             transfer_kind="dsv4_paged",
             item_size_bytes=self.item_size_bytes,
         )
+        if verify_width < planning_width:
+            output.copy_(kernel_output[:, :verify_width])
         return output_buffer
 
     def swap_in_selected_pages_spec(

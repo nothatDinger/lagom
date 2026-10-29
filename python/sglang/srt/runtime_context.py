@@ -1493,16 +1493,20 @@ def mamba_checkpoint_grid(tree_page: int) -> int:
 def max_speculative_num_draft_tokens() -> int | None:
     """The largest draft-token count speculative decoding may use.
 
-    All three inputs are ``spec`` leaves, so this derives from the bags and
+    All inputs are ``spec`` leaves, so this derives from the bags and
     follows a post-publish override; ``ServerArgs.max_speculative_num_draft_tokens``
     is the pre-publish equivalent. Adaptive spec resolves the count from its
-    candidate-step table instead of the flat field.
+    candidate-step table instead of the flat field. Lagom includes its
+    prediction-only suffix in this allocation bound, without extending the
+    public acceptance window.
     """
     spec = get_spec()
     if spec.speculative_num_draft_tokens is None:
         return None
     if not spec.speculative_adaptive:
-        return spec.speculative_num_draft_tokens
+        return spec.speculative_num_draft_tokens + (
+            spec.lagom_prefetch_tokens if spec.is_lagom else 0
+        )
     # The adaptive branch parses a JSON config, and this is called per decode
     # batch (`spec_prepare_for_decode`), so memoize on the inputs -- keyed, not
     # cached once, so a post-publish override still recomputes.

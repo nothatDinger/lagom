@@ -32,7 +32,9 @@ ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
 def get_compress_state_ring_size(
-    compress_ratio: int, is_speculative: bool = False
+    compress_ratio: int,
+    is_speculative: bool = False,
+    speculative_num_draft_tokens: int = 0,
 ) -> int:
     assert compress_ratio in [4, 128], f"Unsupported {compress_ratio = }"
     # Online c128 keeps a single (max, sum, kv) state per index instead of a
@@ -43,7 +45,22 @@ def get_compress_state_ring_size(
             raise AssertionError("online c128 does not support MTP")
         return 1
     if is_speculative:
-        return 16 if compress_ratio == 4 else 256
+        ring_size = 16 if compress_ratio == 4 else 256
+        if compress_ratio == 4:
+            # Lagom executes W+P+1 rows although only W candidates can be
+            # accepted. Preserve the preceding compressor window while all
+            # provisional rows are written. C4 rings must divide SWA page 128.
+            while (
+                get_compress_state_write_pad(compress_ratio, ring_size)
+                < speculative_num_draft_tokens
+            ):
+                ring_size *= 2
+            if ring_size > 128:
+                raise ValueError(
+                    "DeepSeek-V4 C4 execution window exceeds the 128-slot "
+                    "compressor ring capacity (at most 122 target rows)."
+                )
+        return ring_size
     else:
         return 8 if compress_ratio == 4 else 128
 
@@ -666,7 +683,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def get_ring_size(self, compress_ratio: int) -> int:
         is_speculative = get_spec().speculative_algorithm is not None
-        return get_compress_state_ring_size(compress_ratio, is_speculative)
+        from sglang.srt.runtime_context import max_speculative_num_draft_tokens
+
+        return get_compress_state_ring_size(
+            compress_ratio,
+            is_speculative,
+            (max_speculative_num_draft_tokens() or 0) if get_spec().is_lagom else 0,
+        )
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self.full_to_swa_index_mapping is not None

@@ -1064,14 +1064,30 @@ class C4IndexerBackendMixin:
                             logical_c4_sparse_page_indices
                         ).to(torch.int32)
                     )
-                    swapped_locs = hisparse_coordinator.swap_in_selected_pages_spec(
-                        req_pool_indices=forward_batch.req_pool_indices,
-                        compressed_seq_lens=indexer_metadata.c4_seq_lens,
-                        top_k_result=raw_indices,
-                        layer_id=compress_layer_id,
-                        verify_lens_cpu=verify_lens_cpu,
-                        output_buffer=c4_sparse_page_indices,
-                    )
+                    if getattr(forward_batch, "lagom_decode_width", 0):
+                        from sglang.srt.layers.attention.dsv4.lagom import (
+                            resolve_lagom_topk,
+                        )
+
+                        if layout is not None:
+                            raise RuntimeError("Lagom requires a static verify window")
+                        swapped_locs = resolve_lagom_topk(
+                            coordinator=hisparse_coordinator,
+                            forward_batch=forward_batch,
+                            layer_id=compress_layer_id,
+                            raw_indices=raw_indices,
+                            compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                            output_buffer=c4_sparse_page_indices,
+                        )
+                    else:
+                        swapped_locs = hisparse_coordinator.swap_in_selected_pages_spec(
+                            req_pool_indices=forward_batch.req_pool_indices,
+                            compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                            top_k_result=raw_indices,
+                            layer_id=compress_layer_id,
+                            verify_lens_cpu=verify_lens_cpu,
+                            output_buffer=c4_sparse_page_indices,
+                        )
                     # Host misses for current verify C4 rows resolve through the
                     # transaction's scratch mapping rather than becoming -1.
                     core_metadata.c4_sparse_page_indices = (

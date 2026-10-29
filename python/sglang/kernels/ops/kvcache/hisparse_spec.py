@@ -255,3 +255,58 @@ def initialize_hisparse_spec_state(
         state.cache_policy,
         state.scratch_state,
     )
+
+
+@cache_once
+def _jit_spec_lookup_module(hot_buffer_size: int) -> Module:
+    return load_jit(
+        "hisparse_spec_lookup",
+        hot_buffer_size,
+        cuda_files=["hisparse_spec.cuh"],
+        cuda_wrappers=[
+            (
+                "lookup_hisparse_spec_resident",
+                f"lookup_hisparse_spec_resident<{hot_buffer_size}>",
+            )
+        ],
+    )
+
+
+def lookup_hisparse_spec_resident(
+    *,
+    top_k_tokens: torch.Tensor,
+    device_buffer_tokens: torch.Tensor,
+    device_buffer_locs: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    state: HiSparseSpecState,
+    num_real_reqs: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Resolve probe queries against residency without IO or CLOCK updates.
+
+    Missing historical entries stay -1. The caller separately overlays current
+    transaction C4 writer locations, which are absent from the committed hash.
+    """
+    if top_k_tokens.ndim != 3 or output.shape != top_k_tokens.shape:
+        raise ValueError(
+            "resident lookup expects matching [batch, steps, top_k] tensors"
+        )
+    if not top_k_tokens.is_contiguous() or not output.is_contiguous():
+        raise ValueError("resident lookup inputs and output must be contiguous")
+    batch, steps, _ = top_k_tokens.shape
+    if seq_lens.numel() != batch * steps:
+        raise ValueError("resident lookup requires one sequence length per query")
+    module = _jit_spec_lookup_module(state.cache_policy.size(1))
+    module.lookup_hisparse_spec_resident(
+        top_k_tokens,
+        device_buffer_tokens,
+        device_buffer_locs,
+        req_pool_indices.to(torch.int64),
+        seq_lens.to(torch.int32).contiguous().reshape(-1),
+        state.cache_index,
+        state.scratch_state,
+        num_real_reqs,
+        output,
+    )
+    return output

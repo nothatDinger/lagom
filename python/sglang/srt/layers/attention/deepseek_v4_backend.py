@@ -556,7 +556,13 @@ class DeepseekV4AttnBackend(
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
         self.speculative_num_steps = speculative_num_steps
-        self.speculative_num_draft_tokens: int = get_spec().speculative_num_draft_tokens
+        # The backend covers all execution rows; the worker separately bounds
+        # acceptance to W candidates when Lagom adds its P forecast rows.
+        self.speculative_num_draft_tokens: int = (
+            model_runner.server_args.max_speculative_num_draft_tokens
+            if model_runner.server_args.is_lagom
+            else get_spec().speculative_num_draft_tokens
+        )
         if self.speculative_num_draft_tokens is not None:
             # Persistent target-verify metadata buffers. Allocated here (not
             # lazily) so they are ordinary tensors: the first touch of a lazy

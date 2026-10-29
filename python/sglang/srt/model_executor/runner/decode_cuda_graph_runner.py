@@ -306,6 +306,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if speculative_num_draft_tokens is None
             else speculative_num_draft_tokens
         )
+        if getattr(get_spec(), "is_lagom", False):
+            # The public width remains W+1 for acceptance/transport. Both
+            # target and draft capture need the full execution window; the
+            # algorithm's draft hook removes its anchor row below.
+            self.speculative_num_draft_tokens += get_spec().lagom_prefetch_tokens
 
         # --- capture mode + tokens-per-bs ------------------------------
         self.capture_forward_mode = ForwardMode.DECODE
@@ -334,6 +339,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ragged_verify_compact_graphs_enabled(self.model_runner.spec_algorithm)
             and (self.capture_forward_mode == ForwardMode.TARGET_VERIFY)
             and not self.model_runner.is_draft_worker
+            and not getattr(get_spec(), "is_lagom", False)
         )
         self.capture_num_tokens: Optional[list[int]] = (
             self._build_ragged_verify_token_buckets()
@@ -348,6 +354,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # target graph.  They have graph-pool-stable addresses and are turned
         # into live prefetch submissions only after replay and root commit.
         self._oasiskv_graph_prefetch: dict[object, dict] = {}
+        self._lagom_graph_prefetch: dict[object, dict] = {}
         # Graph-keyed references to replayed EMA Indexer scores. EMA state and
         # H2D task descriptors remain ordinary Python and are updated post-replay.
         self._ema_graph_prefetch: dict[object, dict] = {}
@@ -1022,6 +1029,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 bs, dtype=torch.bool, device=input_ids.device
             )
 
+        if (
+            getattr(self.model_runner.server_args, "is_lagom", False)
+            and not self.model_runner.is_draft_worker
+            and self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+        ):
+            forward_batch.lagom_decode_width = (
+                self.model_runner.server_args.speculative_num_draft_tokens
+            )
+            forward_batch.is_lagom_graph_capture = True
+
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
 
@@ -1268,6 +1285,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     # warmup-created descriptors have been overwritten by the
                     # capture invocation of run_once.
                     self._oasiskv_graph_prefetch[shape_key] = dict(pending)
+                lagom_pending = getattr(forward_batch, "_lagom_pending_prefetch", None)
+                if lagom_pending:
+                    self._lagom_graph_prefetch[shape_key] = dict(lagom_pending)
                 ema_pending = getattr(forward_batch, "_ema_pending_prefetch", None)
                 if ema_pending:
                     self._ema_graph_prefetch[shape_key] = dict(ema_pending)
@@ -1320,6 +1340,32 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         coordinator = self.model_runner.hisparse_coordinator
         if coordinator is not None and coordinator.prefetcher_name == "ema":
             coordinator.consume_ema_prefetch()
+
+    def _publish_lagom_graph_prefetch(self, forward_batch: ForwardBatch) -> None:
+        """Bind replayed predictions to live rows without scheduling IO yet.
+
+        The per-layer external event waits are captured immediately before
+        each fused cache resolve. There is deliberately no global wait at the
+        start of the target graph: later layers' H2D can overlap earlier target
+        layers, and all layers can overlap the preceding draft computation.
+        """
+        if (
+            not getattr(forward_batch, "lagom_decode_width", 0)
+            or forward_batch.batch_size == 0
+        ):
+            return
+        templates = self._lagom_graph_prefetch.get(self._replay_graph_key)
+        if not templates:
+            raise RuntimeError("Lagom target graph did not capture CSA predictions")
+        raw_bs = forward_batch.batch_size
+        for layer_id, (coordinator, predictions) in templates.items():
+            coordinator.queue_lagom_prefetch(
+                req_pool_indices=forward_batch.req_pool_indices[:raw_bs],
+                req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
+                source_committed_lens_cpu=forward_batch.lagom_prefix_lens_cpu,
+                predicted_c4_entries=predictions[:raw_bs],
+                layer_id=layer_id,
+            )
 
     def _submit_previous_graph_prefetch(self, forward_batch: ForwardBatch) -> None:
         """Submit graph-produced Previous candidates without capturing Python state."""
@@ -1620,6 +1666,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             output = self.backend.replay(self._replay_graph_key, forward_batch)
             self._publish_oasiskv_graph_prefetch(forward_batch)
+            self._publish_lagom_graph_prefetch(forward_batch)
             self._submit_ema_graph_prefetch(forward_batch)
             self._submit_previous_graph_prefetch(forward_batch)
 

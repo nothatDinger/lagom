@@ -61,14 +61,41 @@ def validate_pr_fused_config(
     force_h2d,
     skip_io,
     prefetcher=None,
+    prediction_steps=0,
 ):
-    if not (cuda and dsv4 and speculative and width > 0 and force_h2d and not skip_io):
+    lagom = (prefetcher or "").lower() == "lagom"
+    if lagom:
+        if force_h2d:
+            raise ValueError(
+                "Lagom requires preserved residency; force_h2d_each_step must be false"
+            )
+        if (
+            not isinstance(prediction_steps, int)
+            or isinstance(prediction_steps, bool)
+            or not 0 < prediction_steps < width
+        ):
+            raise ValueError(
+                "Lagom prediction_steps must leave a nonempty decode window"
+            )
+    if not (
+        cuda
+        and dsv4
+        and speculative
+        and width > 0
+        and (force_h2d or lagom)
+        and not skip_io
+    ):
+        if lagom:
+            raise ValueError(
+                "Lagom requires CUDA DeepSeek-V4 speculative verify and real KV IO"
+            )
         raise ValueError(
             "pr_fused experiment requires CUDA DSv4 speculative verify, force_h2d_each_step=true and real IO"
         )
-    if prefetcher:
+    if prefetcher and not lagom:
         raise ValueError("pr_fused experiment does not support a named prefetcher")
-    if width * top_k > min(hot, 8192):
+    work_width = max(width - prediction_steps, prediction_steps) if lagom else width
+    if work_width * top_k > min(hot, 8192):
         raise ValueError(
             "pr_fused verify occurrences must fit hot slots and PR capacity"
         )

@@ -60,6 +60,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.lagom import decode_proposal, decode_window
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
@@ -85,6 +86,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         super().__init__()
 
         self.server_args = server_args
+        self._lagom = bool(getattr(server_args, "is_lagom", False))
         self.gpu_id = gpu_id
         self.ps = ps
         self.nccl_port = nccl_port
@@ -151,6 +153,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         self.gamma = runtime_config.gamma
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
+        self._draft_gamma = self.gamma + (
+            int(server_args.lagom_prefetch_tokens) if self._lagom else 0
+        )
+        self._execution_width = self._draft_gamma + 1
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
 
@@ -170,8 +176,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._block_pos_offsets = build_block_pos_offsets(
             length=self.verify_num_draft_tokens, device=self.device
         )
+        self._execution_pos_offsets = (
+            build_block_pos_offsets(length=self._execution_width, device=self.device)
+            if self._lagom
+            else self._block_pos_offsets
+        )
         self._draft_block_spec_info = make_draft_block_spec_info(
-            draft_token_num=int(self.gamma), device=self.device
+            draft_token_num=self._draft_gamma, device=self.device
         )
 
         if getattr(self.draft_model, "uses_own_vocab_modules", False):
@@ -200,6 +211,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             server_args=self.server_args,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
         )
+        if self._lagom and self._verify_planner.mode_value != "static":
+            raise ValueError(
+                "Lagom requires SGLANG_RAGGED_VERIFY_MODE=static; its prediction "
+                "suffix is independent of the W-candidate acceptance window."
+            )
         if (
             get_parallel().enable_dp_attention
             and not self._draft_is_moe
@@ -224,7 +240,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
             draft_model_runner=self.draft_model_runner,
-            gamma=self.gamma,
+            gamma=self._draft_gamma,
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
             dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
@@ -234,6 +250,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
             and is_cuda()
+            and not self._lagom
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
@@ -383,13 +400,13 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _maybe_build_draft_sampler(self):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
-            gamma=self.gamma,
+            gamma=self._draft_gamma,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             device=self.device,
             tp_rank=self.ps.tp_rank,
             confidence_fn=(
                 self._verify_planner.compute_confidence_tensor
-                if self._verify_planner.carries_confidence
+                if self._verify_planner.carries_confidence and not self._lagom
                 else None
             ),
             out=(
@@ -583,13 +600,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._observers.begin_step()
 
         target_model = self.target_worker.model_runner.model
-        verify_window = alloc_verify_window(
+        execution_window = alloc_verify_window(
             batch=batch,
             bs=bs,
             device=device,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            block_pos_offsets=self._block_pos_offsets,
+            verify_num_draft_tokens=self._execution_width,
+            block_pos_offsets=self._execution_pos_offsets,
             model_runner=self.model_runner,
+        )
+        verify_window = (
+            decode_window(execution_window, self.verify_num_draft_tokens)
+            if self._lagom
+            else execution_window
         )
 
         sampling_info = batch.sampling_info
@@ -597,23 +619,44 @@ class DSparkWorkerV2(BaseSpecWorker):
             proposal = self._proposer.propose(
                 batch=batch,
                 draft_input=draft_input,
-                verify_window=verify_window,
+                verify_window=execution_window,
                 bs=bs,
                 device=device,
                 target_model=target_model,
                 sampling_info=sampling_info,
             )
+        execution_ids_2d = None
+        if self._lagom:
+            execution_ids_2d = torch.cat(
+                [proposal.draft_block_ids[:, :1], proposal.draft_block.draft_tokens],
+                dim=1,
+            ).contiguous()
+            proposal = decode_proposal(proposal, self.gamma)
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
 
         confidence = proposal.confidence
         if confidence is None:
+            confidence_tap = proposal.confidence_tap
+            if (
+                self._lagom
+                and confidence_tap is None
+                and self._verify_planner.carries_confidence
+            ):
+                # The total-width folded sampler deliberately does not run
+                # W-wide confidence/STS calibration. Recover its small head
+                # input from just the decoding prefix after graph replay.
+                confidence_tap = self.draft_model.collapse_hc_head(
+                    proposal.draft_hidden.reshape(
+                        bs * self.gamma, self.draft_model.hc_mult, -1
+                    )
+                )
             confidence = self._verify_planner.compute_confidence_tensor(
                 draft_hidden=proposal.draft_hidden,
                 anchor_tokens=draft_block_ids[:, 0],
                 draft_tokens=draft_tokens,
-                confidence_tap=proposal.confidence_tap,
+                confidence_tap=confidence_tap,
             )
 
         verify_token_budget = self._verify_planner.resolve_verify_token_budget(
@@ -656,7 +699,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             hisparse_window = hisparse_coordinator.prepare_dspark_verify_window(
                 req_pool_indices=batch.req_pool_indices,
                 prefix_lens=prefix_lens,
-                verify_width=verify_ids_2d.shape[1],
+                verify_width=self._execution_width,
                 req_pool_indices_cpu=batch.req_pool_indices_cpu,
                 prefix_lens_cpu=batch.seq_lens_cpu,
             )
@@ -673,7 +716,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             # A live grammar forces the eager path: the folded epilogue accepts inside
             # the cuda graph off its own buffers, where the mask below never lands.
             fold_eligible = (
-                self._verify_executor.verify_epilogue is not None
+                not self._lagom
+                and self._verify_executor.verify_epilogue is not None
                 and proposal.folded
                 # The epilogue's in-graph accept is greedy (accept_greedy_triton);
                 # sampling batches must take the eager accept path even when the
@@ -700,9 +744,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                     target_verify = self._verify_executor.run_non_compact(
                         batch=batch,
                         draft_input=draft_input,
-                        verify_ids_2d=verify_ids_2d,
-                        verify_window=verify_window,
+                        verify_ids_2d=(
+                            execution_ids_2d if self._lagom else verify_ids_2d
+                        ),
+                        verify_window=execution_window,
                         sampling_info=sampling_info,
+                        lagom_decode_width=(
+                            self.verify_num_draft_tokens if self._lagom else 0
+                        ),
                     )
                     hidden_strided = None
             logits_output = target_verify.logits_output
@@ -749,6 +798,23 @@ class DSparkWorkerV2(BaseSpecWorker):
                     hisparse_window, accept.commit_lens
                 )
                 hisparse_committed = True
+            if self._lagom:
+                clear_c128 = getattr(
+                    self.model_runner.token_to_kv_pool,
+                    "clear_unaccepted_c128_draft_states",
+                    None,
+                )
+                if clear_c128 is not None:
+                    clear_c128(
+                        batch.req_pool_indices,
+                        prefix_lens,
+                        accept.commit_lens,
+                        self._execution_width,
+                    )
+                # The suffix only supplies hints. Publish after the C4 scratch
+                # transaction commits, so side-stream eviction cannot race its
+                # authoritative mapping updates or the current attention reads.
+                hisparse_coordinator.submit_lagom_prefetches()
 
         finally:
             if hisparse_window is not None and not hisparse_committed:
@@ -756,6 +822,23 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # forward, grammar, acceptance, logprob, or commit must restore
                 # it before the scheduler can continue or retract the request.
                 hisparse_coordinator.rollback_dspark_verify_window(hisparse_window)
+                if self._lagom:
+                    clear_c128 = getattr(
+                        self.model_runner.token_to_kv_pool,
+                        "clear_unaccepted_c128_draft_states",
+                        None,
+                    )
+                    if clear_c128 is not None:
+                        clear_c128(
+                            batch.req_pool_indices,
+                            prefix_lens,
+                            torch.zeros_like(prefix_lens),
+                            self._execution_width,
+                        )
+            if self._lagom:
+                # Also clears descriptors if target forward or commit raised.
+                # Successful submission has already transferred their ownership.
+                hisparse_coordinator.discard_lagom_prefetches()
 
         if on_publish is not None:
             if confidence is not None:

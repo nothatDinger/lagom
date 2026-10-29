@@ -765,7 +765,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
             hisparse_cfg = parse_hisparse_config(kvc.server_args)
             self.c4_shrink_factor = hisparse_cfg.host_to_device_ratio
-            verify_width = kvc.server_args.speculative_num_draft_tokens or 0
+            verify_width = (kvc.server_args.speculative_num_draft_tokens or 0) + (
+                kvc.server_args.lagom_prefetch_tokens if kvc.server_args.is_lagom else 0
+            )
             if (
                 verify_width > 0
                 and not is_hip()
@@ -778,15 +780,23 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 )
             ):
                 top_k = getattr(cfg.hf_text_config, "index_topk", hisparse_cfg.top_k)
+                work_width = (
+                    max(
+                        kvc.server_args.speculative_num_draft_tokens or 0,
+                        kvc.server_args.lagom_prefetch_tokens,
+                    )
+                    if kvc.server_args.is_lagom
+                    else verify_width
+                )
                 if kvc.spec_algorithm.is_dspark():
                     hisparse_cfg = resolve_dspark_device_buffer_size(
                         hisparse_cfg,
                         raw_hisparse_config=kvc.server_args.hisparse_config,
-                        verify_width=verify_width,
+                        verify_width=work_width,
                         effective_top_k=top_k,
                     )
                 self.hisparse_spec_layout = HiSparseSpecLayout(
-                    hisparse_cfg.device_buffer_size, verify_width, top_k
+                    hisparse_cfg.device_buffer_size, work_width, top_k
                 )
         else:
             self.c4_shrink_factor = 1
@@ -794,8 +804,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self.c4_shrink_factor > 1:
             logger.info(f"HiSparse c4 host-to-device ratio = {self.c4_shrink_factor}")
 
-        self.c4_ring_size = get_compress_state_ring_size(4, self.is_speculative)
-        self.c128_ring_size = get_compress_state_ring_size(128, self.is_speculative)
+        execution_width = (
+            kvc.server_args.max_speculative_num_draft_tokens or 0
+            if kvc.server_args.is_lagom
+            else 0
+        )
+        self.c4_ring_size = get_compress_state_ring_size(
+            4, self.is_speculative, execution_width
+        )
+        self.c128_ring_size = get_compress_state_ring_size(
+            128, self.is_speculative, execution_width
+        )
 
         self.num_layers_total = len(self.compression_ratios)
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)

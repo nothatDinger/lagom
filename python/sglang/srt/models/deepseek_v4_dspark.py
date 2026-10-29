@@ -887,10 +887,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if confidence_head is None:
             return None
         bs = int(anchor_tokens.shape[0])
-        x_post_hc = x_post_hc.view(bs, self.gamma, -1)
+        # Lagom generates a wider block but only scores the decoding prefix.
+        # Runtime W can also differ from the checkpoint's configured gamma.
+        candidate_width = sampled_tokens.shape[1]
+        x_post_hc = x_post_hc.view(bs, candidate_width, -1)
         if confidence_head.with_markov:
             prev_seq = torch.cat(
-                [anchor_tokens.view(-1, 1), sampled_tokens[:, : self.gamma - 1]], dim=1
+                [anchor_tokens.view(-1, 1), sampled_tokens[:, : candidate_width - 1]],
+                dim=1,
             )
             markov_embed_stack = self.markov_head.get_prev_embeddings(prev_seq)
         else:

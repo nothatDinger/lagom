@@ -1132,4 +1132,92 @@ void initialize_hisparse_spec_state(
       num_request_slots);
 }
 
+// Forecast queries only read the current working set. Unlike gather/commit,
+// this kernel cannot evict a real verify row or fetch an unneeded host entry.
+template <int HOT_BUFFER_SIZE>
+__global__ void lookup_hisparse_spec_resident_kernel(
+    const int32_t* top_k_tokens,
+    const int32_t* device_buffer_tokens,
+    const int32_t* device_buffer_locs,
+    const int64_t* req_pool_indices,
+    const int32_t* seq_lens,
+    const int64_t* cache_index,
+    const int32_t* scratch_state,
+    const int32_t* num_real_reqs,
+    int32_t* output,
+    int64_t occurrences,
+    int64_t top_k,
+    int64_t buffer_stride,
+    int64_t active_tail_slots,
+    int64_t hash_stride,
+    int64_t hash_bank_stride,
+    int64_t hash_size,
+    int64_t request_capacity) {
+  const int64_t bid = blockIdx.x;
+  const bool real = bid < num_real_reqs[0];
+  const int64_t rid = real ? req_pool_indices[bid] : 0;
+  const int32_t* tokens = device_buffer_tokens + rid * buffer_stride;
+  const int32_t* locs = device_buffer_locs + rid * buffer_stride;
+  const int64_t* primary = cache_index + rid * hash_stride;
+  const int64_t* secondary = primary + hash_bank_stride;
+  const bool degraded = real && (static_cast<uint32_t>(scratch_state[3 * request_capacity + rid]) & HASH_DEGRADED_FLAG);
+  for (int64_t i = threadIdx.x; i < occurrences; i += blockDim.x) {
+    int32_t loc = -1;
+    if (real) {
+      const int32_t token = top_k_tokens[bid * occurrences + i];
+      const int32_t length = seq_lens[bid * (occurrences / top_k) + i / top_k];
+      if (token >= 0 && token < length && !try_get_active_tail_device_loc<HOT_BUFFER_SIZE>(
+              token, length, tokens, locs, active_tail_slots, &loc)) {
+        const int32_t slot = hot_cache_lookup<HOT_BUFFER_SIZE>(primary, secondary, hash_size, token, tokens, degraded);
+        if (slot >= 0) loc = locs[slot];
+      }
+    }
+    output[bid * occurrences + i] = loc;
+  }
+}
+
+template <int HOT_BUFFER_SIZE>
+void lookup_hisparse_spec_resident(
+    tvm::ffi::TensorView top_k_tokens,
+    tvm::ffi::TensorView device_buffer_tokens,
+    tvm::ffi::TensorView device_buffer_locs,
+    tvm::ffi::TensorView req_pool_indices,
+    tvm::ffi::TensorView seq_lens,
+    tvm::ffi::TensorView cache_index,
+    tvm::ffi::TensorView scratch_state,
+    tvm::ffi::TensorView num_real_reqs,
+    tvm::ffi::TensorView output) {
+  using namespace host;
+  RuntimeCheck(top_k_tokens.ndim() == 3, "resident lookup expects [batch, steps, top_k]");
+  const int64_t batch = top_k_tokens.shape()[0];
+  const int64_t steps = top_k_tokens.shape()[1];
+  const int64_t top_k = top_k_tokens.shape()[2];
+  RuntimeCheck(steps > 0 && top_k > 0, "resident lookup dimensions must be positive");
+  auto cuda_device = SymbolicDevice{};
+  cuda_device.set_options<kDLCUDA>();
+  TensorMatcher({batch, steps, top_k}).with_dtype<int32_t>().with_device(cuda_device).verify(top_k_tokens);
+  TensorMatcher({batch, steps, top_k}).with_dtype<int32_t>().with_device(cuda_device).verify(output);
+  TensorMatcher({batch}).with_dtype<int64_t>().with_device(cuda_device).verify(req_pool_indices);
+  TensorMatcher({batch * steps}).with_dtype<int32_t>().with_device(cuda_device).verify(seq_lens);
+  LaunchKernel(static_cast<uint32_t>(batch), 256, cuda_device.unwrap())(
+      lookup_hisparse_spec_resident_kernel<HOT_BUFFER_SIZE>,
+      static_cast<const int32_t*>(top_k_tokens.data_ptr()),
+      static_cast<const int32_t*>(device_buffer_tokens.data_ptr()),
+      static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
+      static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+      static_cast<const int32_t*>(seq_lens.data_ptr()),
+      static_cast<const int64_t*>(cache_index.data_ptr()),
+      static_cast<const int32_t*>(scratch_state.data_ptr()),
+      static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+      static_cast<int32_t*>(output.data_ptr()),
+      steps * top_k,
+      top_k,
+      device_buffer_tokens.strides()[0],
+      device_buffer_tokens.shape()[1] - HOT_BUFFER_SIZE,
+      cache_index.strides()[0],
+      cache_index.strides()[1],
+      cache_index.shape()[2],
+      cache_index.shape()[0]);
+}
+
 }  // namespace sglang

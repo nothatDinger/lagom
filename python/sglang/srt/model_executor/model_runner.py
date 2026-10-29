@@ -785,6 +785,8 @@ class ModelRunner:
     ) -> int:
         """Logits rows per decode batch slot."""
         if self.spec_algorithm.is_speculative():
+            if num_draft_tokens is None and self.server_args.is_lagom:
+                num_draft_tokens = self.server_args.max_speculative_num_draft_tokens
             return resolve_num_tokens_per_req(
                 phase="target_verify",
                 spec_algorithm=self.spec_algorithm,
@@ -861,12 +863,22 @@ class ModelRunner:
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
-        speculative_verify_width = get_spec().speculative_num_draft_tokens or 0
+        speculative_verify_width = (get_spec().speculative_num_draft_tokens or 0) + (
+            self.server_args.lagom_prefetch_tokens if self.server_args.is_lagom else 0
+        )
+        swap_in_width = (
+            max(
+                get_spec().speculative_num_draft_tokens or 0,
+                self.server_args.lagom_prefetch_tokens,
+            )
+            if self.server_args.is_lagom
+            else speculative_verify_width
+        )
         if self.spec_algorithm.is_dspark():
             hisparse_cfg = resolve_dspark_device_buffer_size(
                 hisparse_cfg,
                 raw_hisparse_config=self.server_args.hisparse_config,
-                verify_width=speculative_verify_width,
+                verify_width=swap_in_width,
                 effective_top_k=hisparse_top_k,
             )
             logger.info(
@@ -874,7 +886,7 @@ class ModelRunner:
                 "(verify_width=%d, effective_top_k=%d; "
                 "default=2 * verify_width * effective_top_k).",
                 hisparse_cfg.device_buffer_size,
-                speculative_verify_width,
+                swap_in_width,
                 hisparse_top_k,
             )
         if hisparse_top_k != hisparse_cfg.top_k:
@@ -945,7 +957,12 @@ class ModelRunner:
                 read_ragged_verify_mode,
             )
 
-            if read_ragged_verify_mode() != RaggedVerifyMode.STATIC:
+            # Lagom selects static verify independently of the ordinary
+            # DSPARK scheduler's environment default (which may be compact).
+            if (
+                not self.server_args.is_lagom
+                and read_ragged_verify_mode() != RaggedVerifyMode.STATIC
+            ):
                 disable_decode_graph_reason = (
                     "HiSparse with compact/ragged DFLASH/DSPARK verify requires "
                     "eager decode; static verify retains decode CUDA Graph."
@@ -954,7 +971,11 @@ class ModelRunner:
             # Candidate tensors and side-stream plans change each decode step.
             # Graph-safe modes retain fixed graph outputs and publish dynamic
             # Python/H2D work after replay instead of capturing its descriptors.
-            if self.hisparse_coordinator.prefetcher_name in ("oasiskv", "ema") or (
+            if self.hisparse_coordinator.prefetcher_name in (
+                "oasiskv",
+                "ema",
+                "lagom",
+            ) or (
                 self.hisparse_coordinator.prefetcher_name == "previous"
                 and self.hisparse_coordinator.is_dsv4_hisparse
             ):
