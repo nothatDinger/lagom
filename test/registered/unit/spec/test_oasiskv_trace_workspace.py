@@ -149,15 +149,15 @@ def test_plan_w6_p6_extends_proposal_but_not_real_residency():
         requests=1,
         snapshot_gib=32,
         max_windows=8,
-        resident_units=3072,
+        resident_units=3584,
         top_k=512,
         mem_fraction=0.9,
         prefetch_units="all",
         gpus="0,1,2,3",
     )
-    assert runner.validate_args(args, 5) == 5
-    assert runner.proposal_gamma(args, 5) == 11
-    assert runner.resident_verify_width(args, 5) == 6
+    assert runner.validate_args(args, 5) == 6
+    assert runner.proposal_gamma(args, 5) == 12
+    assert runner.resident_verify_width(args, 5) == 7
     args.resident_units = 2560
     with pytest.raises(ValueError, match="Real verify requires capacity"):
         runner.validate_args(args, 5)
@@ -166,7 +166,7 @@ def test_plan_w6_p6_extends_proposal_but_not_real_residency():
     assert runner.resident_verify_width(args, 5) == 6
 
 
-def test_runtime_proposer_generates_eleven_candidates_from_five_token_config(
+def test_runtime_proposer_generates_twelve_candidates_from_five_token_config(
     monkeypatch,
 ):
     from sglang.srt.models.dspark import VanillaMarkov
@@ -177,9 +177,9 @@ def test_runtime_proposer_generates_eleven_candidates_from_five_token_config(
 
     config = NS(dspark_block_size=5, dspark_markov_rank=2, dspark_noise_token_id=15)
     runtime = resolve_runtime_config(
-        draft_hf_config=config, speculative_num_draft_tokens=12, target_vocab_size=16
+        draft_hf_config=config, speculative_num_draft_tokens=13, target_vocab_size=16
     )
-    assert runtime.gamma == 11 and config.dspark_block_size == 5
+    assert runtime.gamma == 12 and config.dspark_block_size == 5
     head = VanillaMarkov(vocab_size=16, markov_rank=2)
     with torch.no_grad():
         head.markov_w2.weight.zero_()
@@ -192,9 +192,9 @@ def test_runtime_proposer_generates_eleven_candidates_from_five_token_config(
         )
 
     def logits(hidden):
-        assert hidden.shape == (11, 4)
-        result = torch.full((11, 16), -100.0)
-        result[torch.arange(11), torch.arange(1, 12)] = 100
+        assert hidden.shape == (12, 4)
+        result = torch.full((12, 16), -100.0)
+        result[torch.arange(12), torch.arange(1, 13)] = 100
         return result, None
 
     monkeypatch.setattr(dspark_draft, "_make_num_token_non_padded", lambda *args: None)
@@ -214,23 +214,25 @@ def test_runtime_proposer_generates_eleven_candidates_from_five_token_config(
         ),
         draft_input=NS(bonus_tokens=torch.tensor([7])),
         verify_window=NS(
-            positions_2d=torch.arange(16384, 16396).view(1, 12),
-            verify_cache_loc_2d=torch.arange(12).view(1, 12),
+            positions_2d=torch.arange(16384, 16397).view(1, 13),
+            verify_cache_loc_2d=torch.arange(13).view(1, 13),
         ),
         bs=1,
         device="cpu",
         target_model=NS(get_input_embeddings=lambda: torch.nn.Embedding(16, 4)),
         sampling_info=None,
     )
-    assert seen[0].input_ids.tolist() == [7] + [15] * 10
-    assert seen[0].positions.tolist() == list(range(16384, 16395))
-    assert result.draft_block.draft_tokens.tolist() == [list(range(1, 12))]
+    assert len(seen) == 1  # One wide draft forward, never W then P.
+    assert seen[0].input_ids.tolist() == [7] + [15] * 11
+    assert seen[0].positions.tolist() == list(range(16384, 16396))
+    assert result.draft_block.draft_tokens.tolist() == [list(range(1, 13))]
 
 
 def test_workspace_bytes_are_separate_from_misses_and_protocols_cannot_mix():
     protocol = {
         "checkpoint_gamma": 5,
         "proposal_gamma": 11,
+        "token_counting": "including-anchor",
         "probe_workspace": "row-copy",
     }
     source, following, probe = [dict(r, **protocol) for r in records()]

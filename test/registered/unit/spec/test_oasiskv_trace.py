@@ -523,8 +523,8 @@ def test_delivered_server_command_is_accepted_by_real_cli_parser(wide):
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     parsed = parser.parse_args(command[3:])
-    assert parsed.speculative_num_draft_tokens == (12 if wide else 8)
-    assert parsed.speculative_dspark_block_size == (11 if wide else 7)
+    assert parsed.speculative_num_draft_tokens == (13 if wide else 8)
+    assert parsed.speculative_dspark_block_size == (12 if wide else 7)
     assert parsed.tp_size == 4
     assert parsed.disable_overlap_schedule
     assert parsed.attention_backend == "dsv4"
@@ -539,7 +539,7 @@ def test_delivered_server_command_is_accepted_by_real_cli_parser(wide):
     server_args.speculative_dspark_block_size = parsed.speculative_dspark_block_size
     server_args.speculative_num_draft_tokens = parsed.speculative_num_draft_tokens
     _handle_dspark(server_args)
-    assert server_args.speculative_num_draft_tokens == (12 if wide else 8)
+    assert server_args.speculative_num_draft_tokens == (13 if wide else 8)
 
 
 def test_untraced_arm_removes_inherited_hook_but_keeps_real_io(monkeypatch, tmp_path):
@@ -735,6 +735,7 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
         c4_indexer_kv_pool=NS(index_k_with_scale_buffer=[]),
         compress_state_pools=[],
         indexer_compress_state_pools=[],
+        layer_mapping=[None] * 9 + [NS(compress_ratio=4, compress_layer_id=0)],
     )
     trace = OasisKVTrace.__new__(OasisKVTrace)
     trace.runner = NS(
@@ -759,6 +760,8 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
 
     def forward(**kw):
         width = kw["layout"].verify_lens_cpu[0]
+        assert kw["draft_tokens"] is kwargs["draft_tokens"]
+        assert kw["draft_block_ids"] is kwargs["draft_block_ids"]
         calls.append(width)
         state.add_(1)
         if fail_shadow and width > 2:
@@ -848,6 +851,12 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
         )
         assert len(trace.pending) == 1 + 2 * len(trace.probes)
         for record in trace.pending:
+            assert record["model_layer"] == 9
+            assert record["proposal_input_ids"] == [20, 21, 22, 23]
+            assert (
+                record["input_ids"]
+                == record["proposal_input_ids"][: len(record["input_ids"])]
+            )
             if record.get("p") == 0:
                 assert record["topk"] == []
                 assert record["input_ids"] == [20, 21]
@@ -1214,7 +1223,8 @@ def test_within_server_audit_and_analysis_bind_exact_artifacts(tmp_path):
     assert result["validation"] == report and result["matched_records"] == 2
     assert result["prefetch_cap_units"] is None
     assert result["prefetch_policy"] == "full-probe-union"
-    assert result["analysis_version"] == 2
+    assert result["analysis_version"] == 3
+    assert result["samples"][0]["model_layer"] == 4
     with gzip.open(trace, "at") as stream:
         stream.write("\n")
     with pytest.raises(ValueError, match="different trace bytes"):

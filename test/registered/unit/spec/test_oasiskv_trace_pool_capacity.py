@@ -1,7 +1,7 @@
 """Trace CLI -> real V4 memory sizing -> real state allocation, without weights.
 
 Allocate small CPU pools, but keep the production configurator, KV pool and
-compressor state constructors. Parsing a twelve-row command alone did not catch
+compressor state constructors. Parsing a thirteen-row command alone did not catch
 the old sixteen-slot C4 ring's ten-row startup limit.
 """
 
@@ -45,7 +45,7 @@ def make_configurator(server_args):
 
 
 @pytest.mark.parametrize("width", [6, 7])
-def test_matrix_command_sizes_and_allocates_twelve_row_compressor(width, tmp_path):
+def test_matrix_command_sizes_and_allocates_thirteen_row_compressor(width, tmp_path):
     args = runner.build_parser().parse_args(
         ["--mode", "paired", "--verify-widths", "6", "7", "--output", str(tmp_path)]
     )
@@ -66,14 +66,14 @@ def test_matrix_command_sizes_and_allocates_twelve_row_compressor(width, tmp_pat
     ).items():
         setattr(server_args, key, value)
     assert server_args.page_size == 256
-    assert server_args.max_speculative_num_draft_tokens == 12
-    assert run.resident_units == 3584
+    assert server_args.max_speculative_num_draft_tokens == 13
+    assert run.resident_units == 4096
 
     with (
         envs.SGLANG_OPT_USE_ONLINE_COMPRESS.override(False),
         get_context().override_server_args(
             speculative_algorithm="DSPARK",
-            speculative_num_draft_tokens=12,
+            speculative_num_draft_tokens=13,
             speculative_adaptive=False,
         ),
     ):
@@ -82,7 +82,7 @@ def test_matrix_command_sizes_and_allocates_twelve_row_compressor(width, tmp_pat
         # Keep the safety guard: an undersized pool must still reject G=12.
         config.c4_ring_size = 16
         with pytest.raises(AssertionError, match="serves at most 10"):
-            config._assert_ring_serves_draft_tokens(12)
+            config._assert_ring_serves_draft_tokens(13)
         config.c4_ring_size = 32
 
         sizes = config.calculate_pool_sizes_from_max_tokens(8192, 256)
@@ -90,7 +90,7 @@ def test_matrix_command_sizes_and_allocates_twelve_row_compressor(width, tmp_pat
         config.finalize_with_max_running_requests(sizes)
         assert sizes.c4_state_pool_size == sizes.swa_max_total_num_tokens // 256 * 32
 
-        # A twelve-row ring costs more state memory; profiling must account for
+        # A thirteen-row ring costs more state memory; profiling must account for
         # it too, rather than only enlarging the physical allocation.
         server_args.__dict__.pop("max_speculative_num_draft_tokens")
         server_args.speculative_num_draft_tokens = 10
@@ -129,14 +129,14 @@ def test_matrix_command_sizes_and_allocates_twelve_row_compressor(width, tmp_pat
         ):
             assert state.ring_size == 32
             assert state.kv_score_buffer.shape[0] >= sizes.c4_state_pool_size + 32
-            # Last SWA page, including a wrap in the ring; all twelve writes
+            # Last SWA page, including a wrap in the ring; all thirteen writes
             # stay distinct and in bounds for both attention and indexer state.
             for offset in range(32):
                 loc = sizes.swa_max_total_num_tokens - 256 + 64 + offset
                 slots = state.translate_from_swa_loc_to_state_loc(
-                    torch.arange(loc, loc + 12)
+                    torch.arange(loc, loc + 13)
                 )
-                assert slots.unique().numel() == 12
+                assert slots.unique().numel() == 13
                 assert slots.max() < state.kv_score_buffer.shape[0] - 1
         assert pool.compress_state_pools[1].ring_size == 256
         # An adaptive tier/temporary width override cannot change allocated

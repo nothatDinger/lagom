@@ -132,32 +132,32 @@ class TestCompressWritePlanDraftPad(CustomTestCase):
     def test_c128_ring_residency(self):
         self._assert_ring_residency(128, C128_RING_SIZE)
 
-    def test_c4_twelve_row_verify_preserves_rollback_history(self):
-        """G=12 writes every row without aliasing pre-verify history.
+    def test_c4_thirteen_row_verify_preserves_rollback_history(self):
+        """G=12 plus anchor writes every row without aliasing pre-verify history.
 
         Exercise both native planner paths across a SWA-page boundary and every
         ring offset. W=6/7 may commit only one row, so the next compression can
-        still need six positions preceding this optimistic twelve-row tail.
+        still need six positions preceding this optimistic thirteen-row tail.
         """
-        ring = get_compress_state_ring_size(4, True, 12)
+        ring = get_compress_state_ring_size(4, True, 13)
         self.assertEqual(ring, 32)
         ctx = make_paged_context(bs=1, compress_ratio=4, ring_size=ring)
         for on_gpu in (False, True):
             for prefix in range(500, 532):
                 with self.subTest(on_gpu=on_gpu, prefix=prefix):
-                    seq_lens, extend_lens, num_q = to_seq_extend([(prefix + 12, 12)])
+                    seq_lens, extend_lens, num_q = to_seq_extend([(prefix + 13, 13)])
                     if on_gpu:
                         seq_lens = seq_lens.to(ctx.req_to_token.device)
                         extend_lens = extend_lens.to(ctx.req_to_token.device)
                     plan = ctx.make_prefill_plan(seq_lens, extend_lens, num_q)
                     pairs = plan.plan_w.cpu().view(torch.int32).view(-1, 2).tolist()
                     writes = {row: loc for row, loc in pairs if row >= 0}
-                    self.assertEqual(set(writes), set(range(12)))
+                    self.assertEqual(set(writes), set(range(13)))
                     expected = {
-                        row: ctx.state_loc(0, prefix + row) for row in range(12)
+                        row: ctx.state_loc(0, prefix + row) for row in range(13)
                     }
                     self.assertEqual(writes, expected)
-                    self.assertEqual(len(set(writes.values())), 12)
+                    self.assertEqual(len(set(writes.values())), 13)
                     retained = {ctx.state_loc(0, p) for p in range(prefix - 6, prefix)}
                     self.assertFalse(retained.intersection(writes.values()))
 

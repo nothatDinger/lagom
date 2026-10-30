@@ -25,16 +25,16 @@ def test_matrix_uses_fixed_g12_and_common_capacity(tmp_path):
     runs = runner.resolve_runs(args, 5)
     assert len(runs) == 2
     for w, run in zip((6, 7), runs):
-        assert runner.real_candidates(run) == w - 1
+        assert runner.real_candidates(run) == w
         assert run.probes == list(range(13 - w))
         assert run.input_lengths == [16384, 32768, 65536, 131072]
         assert run.context_length == 139264
-        assert run.resident_units == 3584
+        assert run.resident_units == 4096
         assert run.prefetch_units == "all"
         assert run.output == args.output / f"w{w}"
         command = runner.server_command(run, 5)
-        assert command[command.index("--speculative-num-draft-tokens") + 1] == "12"
-        assert command[command.index("--speculative-dspark-block-size") + 1] == "11"
+        assert command[command.index("--speculative-num-draft-tokens") + 1] == "13"
+        assert command[command.index("--speculative-dspark-block-size") + 1] == "12"
     assert args.context_length is None and args.resident_units is None
 
 
@@ -43,7 +43,7 @@ def test_p_subset_does_not_shrink_proposal(tmp_path, probes):
     args = args_for(tmp_path, "--probes", *map(str, probes))
     (run,) = runner.resolve_runs(args, 5)
     assert run.probes == probes
-    assert runner.proposal_gamma(run, 5) == 11
+    assert runner.proposal_gamma(run, 5) == 12
 
 
 @pytest.mark.parametrize(
@@ -95,7 +95,7 @@ def test_cli_dry_run_delivers_both_twelve_row_server_commands(tmp_path):
         capture_output=True,
         check=True,
     )
-    assert result.stdout.count("--speculative-num-draft-tokens 12") == 2
+    assert result.stdout.count("--speculative-num-draft-tokens 13") == 2
     assert "W=6, P=[0, 1, 2, 3, 4, 5, 6]" in result.stdout
     assert "W=7, P=[0, 1, 2, 3, 4, 5]" in result.stdout
     assert result.stdout.count("--context-length 139264") == 2
@@ -128,7 +128,7 @@ def test_sweep_runs_each_w_once_and_records_failures(
     widths = []
 
     def collect(args, gamma):
-        width = runner.real_candidates(args) + 1
+        width = runner.real_candidates(args)
         widths.append(width)
         assert len(runner.mode_plan(args)) == 1
         assert runner.mode_plan(args)[0][0] == "probes"
@@ -179,7 +179,7 @@ def test_p0_measures_no_new_prefetch_without_inventing_hits(mode, empty_denomina
     assert row["history_coverage"] == (None if empty_denominator else 0)
     assert row["potential_unique_miss_coverage"] == (None if empty_denominator else 0)
     assert row["candidate_precision"] is None
-    assert row["verify_width"] == source["verify_candidates"] + 1
+    assert row["verify_width"] == source["verify_candidates"]
 
 
 def test_p0_rejects_fake_probe_io():

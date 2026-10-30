@@ -489,9 +489,13 @@ class OasisKVTrace:
             raise ValueError("Trace probe_workspace must be none or row-copy")
         if config.get("proposal_gamma", worker.gamma) != worker.gamma:
             raise ValueError("Trace proposal_gamma must match DSPARK runtime gamma")
-        if config.get("total_width", worker.gamma + 1) != worker.gamma + 1:
+        token_counting = config.get("token_counting", "including-anchor")
+        if token_counting not in ("generated", "including-anchor"):
+            raise ValueError("Unknown trace token_counting convention")
+        total_width = worker.gamma + (token_counting == "including-anchor")
+        if config.get("total_width", total_width) != total_width:
             raise ValueError(
-                "Trace total_width includes anchor and must equal runtime gamma + 1"
+                "Trace total_width must match runtime gamma and token_counting"
             )
         topk_order = config.get("topk_order", "native")
         if topk_order not in ("native", "logical", "logical-all"):
@@ -536,6 +540,8 @@ class OasisKVTrace:
                     {
                         **config,
                         "gamma": worker.gamma,
+                        "target_total_width": worker.gamma + 1,
+                        "target_verify_width": self.v + 1,
                         "hisparse_runtime": hisparse_state,
                         "tp": get_parallel().tp_size,
                         "c4_bytes": self.coordinator.item_size_bytes,
@@ -609,6 +615,17 @@ class OasisKVTrace:
         inputs = (
             torch.cat((draft_block_ids[:, :1], draft_tokens), dim=1)[0].cpu().tolist()
         )
+        if len(inputs) != self.worker.gamma + 1:
+            raise ValueError(
+                "Trace requires one complete proposal, including its anchor"
+            )
+        model_layers = {
+            item.compress_layer_id: layer
+            for layer, item in enumerate(
+                getattr(self.runner.token_to_kv_pool, "layer_mapping", [])
+            )
+            if item is not None and item.compress_ratio == 4
+        }
         common = {
             "schema_version": 1,
             "run_id": self.config["run_id"],
@@ -625,7 +642,13 @@ class OasisKVTrace:
             "topk_order": self.config.get("topk_order", "native"),
             "checkpoint_gamma": self.config.get("checkpoint_gamma"),
             "proposal_gamma": self.config.get("proposal_gamma"),
-            "total_width": self.worker.gamma + 1,
+            "total_width": self.worker.gamma
+            + (
+                self.config.get("token_counting", "including-anchor")
+                == "including-anchor"
+            ),
+            "token_counting": self.config.get("token_counting", "including-anchor"),
+            "proposal_input_ids": inputs,
             "probe_workspace": self.config.get("probe_workspace", "none"),
         }
 
@@ -730,6 +753,7 @@ class OasisKVTrace:
                                     common,
                                     kind="probe",
                                     layer=layer,
+                                    model_layer=model_layers.get(layer),
                                     p=p,
                                     mode=mode,
                                     input_ids=inputs[: self.v + 1 + p],
@@ -800,6 +824,7 @@ class OasisKVTrace:
                     common,
                     kind="window",
                     layer=layer,
+                    model_layer=model_layers.get(layer),
                     prefix_len=prefix,
                     prompt_len=len(batch.reqs[0].origin_input_ids),
                     history_units=history_units,
@@ -817,6 +842,7 @@ class OasisKVTrace:
                     common,
                     kind="window",
                     layer=layer,
+                    model_layer=model_layers.get(layer),
                     prefix_len=prefix,
                     prompt_len=len(batch.reqs[0].origin_input_ids),
                     history_units=history_units,

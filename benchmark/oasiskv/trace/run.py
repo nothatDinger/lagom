@@ -38,7 +38,7 @@ def digest(path):
 
 def checkpoint_gamma(path):
     # Checkpoint gamma counts candidates, excluding the anchor. The experiment's
-    # total width G (CLI --total-width) includes it; runtime gamma = G - 1.
+    # G and W count newly generated tokens, excluding the existing anchor.
     config = json.loads((Path(path) / "config.json").read_text())
     gamma = config.get("dspark_block_size")
     if gamma is None:
@@ -65,7 +65,7 @@ def checkpoint_topk(path):
 
 def real_candidates(args):
     value = getattr(args, "verify_candidates", None)
-    return value if value is not None else getattr(args, "verify_width", 6) - 1
+    return value if value is not None else getattr(args, "verify_width", 6)
 
 
 def proposal_gamma(args, trained_gamma):
@@ -73,7 +73,7 @@ def proposal_gamma(args, trained_gamma):
     if mode in ("untraced", "full-control") or not hasattr(args, "probes"):
         return trained_gamma
     if getattr(args, "total_width", None) is not None:
-        return args.total_width - 1
+        return args.total_width
     return max(trained_gamma, real_candidates(args) + max(args.probes))
 
 
@@ -152,15 +152,19 @@ def validate_args(args, gamma):
         raise ValueError(
             "Untraced mode has no ordering hook; use replay-check or control"
         )
-    v = real_candidates(args)
+    v = (
+        gamma
+        if getattr(args, "mode", None) in ("untraced", "full-control")
+        else real_candidates(args)
+    )
     if v < 1 or not args.probes or any(p < 0 for p in args.probes):
-        raise ValueError("Need W >= 2 and nonnegative probe lengths")
+        raise ValueError("Need W >= 1 and nonnegative probe lengths")
     runtime_gamma = proposal_gamma(args, gamma)
     if (
         getattr(args, "mode", None) not in ("untraced", "full-control")
         and v + max(args.probes) > runtime_gamma
     ):
-        raise ValueError("Need W + max(P) <= G (--total-width includes anchor)")
+        raise ValueError("Need W + max(P) <= G (G/W exclude anchor)")
     if len(set(args.probes)) != len(args.probes):
         raise ValueError("Duplicate probe lengths")
     if min(args.input_lengths) < 1 or len(set(args.input_lengths)) != len(
@@ -180,7 +184,7 @@ def validate_args(args, gamma):
     baseline_width = resident_verify_width(args, gamma)
     if args.resident_units < baseline_width * args.top_k:
         raise ValueError(
-            f"Real verify requires capacity >= W*index_topk = {baseline_width * args.top_k} C4 units"
+            f"Real verify requires capacity >= (W+1)*index_topk = {baseline_width * args.top_k} C4 units"
         )
     if not 0 < args.mem_fraction < 1:
         raise ValueError("Invalid memory fraction")
@@ -208,11 +212,11 @@ def validate_args(args, gamma):
 
 def resolve_runs(args, gamma):
     """Validate every W before loading a model; share G, capacity and contexts."""
-    widths = getattr(args, "verify_widths", None) or [real_candidates(args) + 1]
+    widths = getattr(args, "verify_widths", None) or [real_candidates(args)]
     if args.verify_widths is not None and args.mode in ("untraced", "full-control"):
         raise ValueError("Native full-width modes do not support a fixed-W sweep")
-    if len(set(widths)) != len(widths) or any(w < 2 for w in widths):
-        raise ValueError("Verify widths must be unique integers >= 2")
+    if len(set(widths)) != len(widths) or any(w < 1 for w in widths):
+        raise ValueError("Verify widths must be unique integers >= 1")
     if args.total_width < max(widths):
         raise ValueError("--total-width must cover every real verify width")
     runs = []
@@ -233,7 +237,7 @@ def resolve_runs(args, gamma):
     if args.context_length is None:
         # Leave prefill/scratch and output headroom; 40K is also enough for the
         # default G=12 exact workspace outside the persistent W=7 cache.
-        extra = max(8192, args.output_length + max(args.total_width, gamma + 1) + 512)
+        extra = max(8192, args.output_length + max(args.total_width, gamma) + 1 + 512)
         context = max(40960, (max(args.input_lengths) + extra + 255) // 256 * 256)
         for run in runs:
             run.context_length = context
@@ -654,7 +658,7 @@ def build_parser():
         "--verify-width",
         type=int,
         default=6,
-        help="Real target verify rows including anchor (W); probes are appended",
+        help="W: draft candidates verified per step, excluding the anchor",
     )
     widths.add_argument(
         "--verify-widths",
@@ -665,13 +669,13 @@ def build_parser():
     widths.add_argument(
         "--verify-candidates",
         type=int,
-        help="Equivalent to W-1; retained for old experiment recipes",
+        help="Alias for W (both count draft candidates, excluding the anchor)",
     )
     parser.add_argument(
         "--total-width",
         type=int,
         default=12,
-        help="G: maximum target width including anchor; runtime DSPARK gamma is G-1",
+        help="G: tokens generated in one draft call; target allocates G+1 rows including anchor",
     )
     parser.add_argument(
         "--probes",
@@ -735,7 +739,7 @@ def build_parser():
     parser.add_argument(
         "--resident-units",
         type=int,
-        help="Persistent C4 capacity; default W*index_topk (also covers native full-control if requested)",
+        help="Persistent C4 capacity; default (W+1)*index_topk including anchor (also covers native full-control)",
     )
     parser.add_argument(
         "--prefetch-units",
@@ -787,12 +791,15 @@ def main():
             args.output / "sweep.json",
             {
                 "total_width": args.total_width,
+                "token_counting": "generated",
+                "target_total_width": args.total_width + 1,
                 "input_lengths": args.input_lengths,
                 "checkpoint_gamma": gamma,
                 "timing_valid": False,
                 "runs": [
                     {
-                        "verify_width": real_candidates(run) + 1,
+                        "verify_width": real_candidates(run),
+                        "target_verify_width": real_candidates(run) + 1,
                         "probes": run.probes,
                         "resident_units": run.resident_units,
                         "context_length": run.context_length,
@@ -809,7 +816,7 @@ def main():
             path = args.output / "sweep.json"
             manifest = json.loads(path.read_text())
             for entry in manifest["runs"]:
-                if entry["verify_width"] == real_candidates(run) + 1:
+                if entry["verify_width"] == real_candidates(run):
                     entry["status"] = status
                     if error is not None:
                         entry["error"] = f"{type(error).__name__}: {error}"
@@ -829,7 +836,7 @@ def run_experiment(args, gamma):
     v = validate_args(args, gamma)
     plan = mode_plan(args)
     print(
-        f"mode={args.mode}; checkpoint_gamma={gamma}, G_total={proposal_gamma(args, gamma)+1}, proposal_gamma={proposal_gamma(args, gamma)}, W={v+1}, P={args.probes}, index_topk={args.top_k}, resident_C4={args.resident_units}, context={args.context_length}; prefetch=all (full probe union, no cap); B=1, TP=4; offline quality, graphs disabled"
+        f"mode={args.mode}; checkpoint_gamma={gamma}, G_total={proposal_gamma(args, gamma)}, proposal_gamma={proposal_gamma(args, gamma)}, W={v}, P={args.probes}, target_rows={proposal_gamma(args, gamma)+1}, index_topk={args.top_k}, resident_C4={args.resident_units}, context={args.context_length}; G/W exclude anchor; prefetch=all (full probe union, no cap); B=1, TP=4; offline quality, graphs disabled"
     )
     for mode, mode_args in plan:
         print(f"{mode}: {shlex.join(server_command(mode_args, gamma))}")
@@ -858,8 +865,11 @@ def run_experiment(args, gamma):
             "gamma": gamma,
             "checkpoint_gamma": gamma,
             "proposal_gamma": proposal_gamma(args, gamma),
-            "total_width": proposal_gamma(args, gamma) + 1,
-            "verify_width": v + 1,
+            "total_width": proposal_gamma(args, gamma),
+            "verify_width": v,
+            "target_total_width": proposal_gamma(args, gamma) + 1,
+            "target_verify_width": v + 1,
+            "token_counting": "generated",
             "max_target_width": v + 1 + max(args.probes),
             "verify_candidates": v,
             "prefetch_policy": "full-probe-union",
@@ -877,7 +887,8 @@ def run_experiment(args, gamma):
             "verify_candidates": gamma if mode == "full-control" else v,
             "checkpoint_gamma": gamma,
             "proposal_gamma": proposal_gamma(mode_args, gamma),
-            "total_width": proposal_gamma(mode_args, gamma) + 1,
+            "total_width": proposal_gamma(mode_args, gamma),
+            "token_counting": "generated",
             "probe_workspace": "row-copy",
             "probes": args.probes if mode == "probes" else [],
             "shadows": mode in ("probes", "replay-check"),

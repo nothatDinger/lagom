@@ -10,6 +10,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 import torch
+
 from sglang.srt import runtime_context
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -33,8 +34,11 @@ def test_trace_binds_after_both_pools_and_still_fails_closed(
     config_path.write_text(
         json.dumps(
             {
-                "verify_candidates": 1,
-                "probes": [1, 2],
+                "verify_candidates": 6,
+                "probes": list(range(7)),
+                "total_width": 12,
+                "proposal_gamma": 12,
+                "token_counting": "generated",
                 "max_windows": 3,
                 "output": str(output),
             }
@@ -134,8 +138,8 @@ def test_trace_binds_after_both_pools_and_still_fails_closed(
         worker_module,
         "resolve_runtime_config",
         lambda **kw: NS(
-            gamma=7,
-            verify_num_draft_tokens=8,
+            gamma=12,
+            verify_num_draft_tokens=13,
             mask_token_id=99,
         ),
     )
@@ -163,7 +167,7 @@ def test_trace_binds_after_both_pools_and_still_fails_closed(
             server_args=NS(
                 is_oasiskv_lookahead=False,
                 disaggregation_mode="null",
-                speculative_num_draft_tokens=8,
+                speculative_num_draft_tokens=13,
             ),
             gpu_id=0,
             ps=ParallelState.trivial(tp_rank=rank, tp_size=4),
@@ -201,6 +205,10 @@ def test_trace_binds_after_both_pools_and_still_fails_closed(
     assert events == expected + ["hicache-plan"]
     if trace_mode == "enabled" and rank == 0:
         runtime = json.loads((output / "runtime.json").read_text())
+        assert runtime["gamma"] == runtime["total_width"] == 12
+        assert runtime["target_total_width"] == 13
+        assert runtime["target_verify_width"] == 7
+        assert runtime["token_counting"] == "generated"
         assert runtime["tp"] == 4
         assert runtime["hisparse_runtime"]["runner_allocator_type"] == "builtins.object"
         assert runtime["hisparse_runtime"]["skip_io"] is False

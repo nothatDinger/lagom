@@ -17,6 +17,7 @@ def proposal_protocol(record):
         "checkpoint_gamma": record.get("checkpoint_gamma"),
         "proposal_gamma": record.get("proposal_gamma"),
         "probe_workspace": record.get("probe_workspace", "none"),
+        "token_counting": record.get("token_counting", "including-anchor"),
     }
 
 
@@ -83,6 +84,8 @@ def windows(directory, filename="trace.jsonl.gz", *, paired=False):
             ]
             if paired:
                 result[key].update(proposal_protocol(r))
+                result[key]["proposal_input_ids"] = r.get("proposal_input_ids")
+                result[key]["model_layer"] = r.get("model_layer")
                 result[key].update(
                     {
                         field: r[field]
@@ -182,6 +185,17 @@ def audit_within_server(directory):
         ):
             raise ValueError(f"Missing or failed strict replay evidence at {key}")
         canonical = next(iter(layers.values()))
+        proposal = canonical["proposal_input_ids"]
+        if config.get("token_counting") == "generated":
+            if proposal is None or len(proposal) != config["proposal_gamma"] + 1:
+                raise ValueError(f"Missing complete single-proposal evidence at {key}")
+        if (
+            proposal is not None
+            and canonical["input_ids"] != proposal[: len(canonical["input_ids"])]
+        ):
+            raise ValueError(f"Baseline is not a prefix of its full proposal at {key}")
+        if proposal is not None and diagnostic.get("proposal_input_ids") != proposal:
+            raise ValueError(f"Replay evidence uses a different full proposal at {key}")
         for field in ("snapshot_id", "input_ids", "topk_order", "verify_candidates"):
             if canonical[field] != diagnostic[field]:
                 raise ValueError(f"Replay evidence {field} differs at {key}")
@@ -200,6 +214,7 @@ def audit_within_server(directory):
                 "prefix_len",
                 "prompt_len",
                 "snapshot_id",
+                "proposal_input_ids",
             ):
                 if record[field] != canonical[field]:
                     raise ValueError(f"Inconsistent {field} across layers at {key}")
@@ -269,6 +284,13 @@ def audit_within_server(directory):
                 record["snapshot_id"] != source["snapshot_id"]
                 or record["input_ids"][: len(source["input_ids"])]
                 != source["input_ids"]
+                or record.get("proposal_input_ids") != source["proposal_input_ids"]
+                or (
+                    record.get("proposal_input_ids") is not None
+                    and record["input_ids"]
+                    != record["proposal_input_ids"][: len(record["input_ids"])]
+                )
+                or record.get("model_layer") != source["model_layer"]
             ):
                 raise ValueError(
                     f"Probe uses a different snapshot/proposal at {identity}"
@@ -288,7 +310,10 @@ def audit_within_server(directory):
         "request_windows": len(grouped),
         "layer_windows": len(right),
         "probe_records": len(probes),
-        "verify_width": config["verify_candidates"] + 1,
+        "verify_width": config["verify_candidates"]
+        + (config.get("token_counting", "including-anchor") == "including-anchor"),
+        "target_verify_width": config["verify_candidates"] + 1,
+        "token_counting": config.get("token_counting", "including-anchor"),
         "probe_lengths": config["probes"],
         "checkpoint_gamma": config.get("checkpoint_gamma"),
         "proposal_gamma": config.get("proposal_gamma"),

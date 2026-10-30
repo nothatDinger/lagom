@@ -16,13 +16,14 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 VERSION = 1
-ANALYSIS_VERSION = 2
+ANALYSIS_VERSION = 3
 PREFETCH_POLICY = "full-probe-union"
 KEY = ("run_id", "request_id", "generation", "window_id", "layer", "head")
 GROUP = (
     "run_id",
     "prompt_len",
     "layer",
+    "model_layer",
     "head",
     "unit",
     "unit_tokens",
@@ -37,6 +38,8 @@ GROUP = (
     "prefetch_policy",
 )
 COUNTS = (
+    "probe_topk_units",
+    "covered_next_units",
     "prediction_units",
     "prediction_resident_units",
     "prefetch_candidate_units",
@@ -87,6 +90,13 @@ def validate(record):
             raise ValueError(f"{field} must be a nonempty string")
     for field in ("generation", "window_id", "layer", "head", "verify_candidates"):
         _integer(record, field)
+    if record.get("token_counting", "including-anchor") not in (
+        "generated",
+        "including-anchor",
+    ):
+        raise ValueError("Unknown token_counting convention")
+    if record.get("model_layer") is not None:
+        _integer(record, "model_layer")
     if record.get("unit") not in ("token", "block", "c4"):
         raise ValueError("unit must be token, block or c4")
     _integer(record, "unit_tokens", 1)
@@ -154,6 +164,31 @@ def validate(record):
             raise ValueError("resident probe must not use the exact shadow workspace")
         if p == 0 and (io or d2d):
             raise ValueError("P=0 must have no probe IO")
+    proposal = record.get("proposal_input_ids")
+    if proposal is not None:
+        _ids(proposal)
+        if (
+            -1 in proposal
+            or record["input_ids"] != proposal[: len(record["input_ids"])]
+        ):
+            raise ValueError("Record does not use a prefix of its complete proposal")
+        gamma = generated_width(record)
+        if gamma is not None and len(proposal) != gamma + 1:
+            raise ValueError("Complete proposal width differs from G plus anchor")
+
+
+def generated_width(record):
+    """Normalize old traces whose total_width included the anchor."""
+    gamma = record.get("proposal_gamma")
+    if gamma is not None:
+        return gamma
+    total = record.get("total_width")
+    return (
+        None
+        if total is None
+        else total
+        - (record.get("token_counting", "including-anchor") == "including-anchor")
+    )
 
 
 def _key(record):
@@ -166,6 +201,7 @@ def _ratio(numerator, denominator):
 
 def _ratios(row):
     row.update(
+        next_step_coverage=_ratio(row["covered_next_units"], row["next_all_units"]),
         history_coverage=_ratio(
             row["covered_history_units"], row["next_history_units"]
         ),
@@ -187,8 +223,12 @@ def compare(source, following, probe):
         for field in ("unit", "unit_tokens", "bytes_per_unit"):
             if record[field] != source[field]:
                 raise ValueError(f"inconsistent {field} between matched records")
+        if record.get("model_layer") != source.get("model_layer"):
+            raise ValueError("Mismatched model layer between matched records")
     if probe["snapshot_id"] != source["snapshot_id"]:
         raise ValueError("probe must replay the exact source snapshot")
+    if probe.get("proposal_input_ids") != source.get("proposal_input_ids"):
+        raise ValueError("Probe did not reuse the same complete draft proposal")
     if probe["verify_candidates"] != source["verify_candidates"] or (
         probe["input_ids"][: len(source["input_ids"])] != source["input_ids"]
     ):
@@ -205,7 +245,10 @@ def compare(source, following, probe):
     # Top-K order and vote frequency do not matter for the full union.
     prediction = {unit for row in probe["topk"] for unit in row if 0 <= unit < history}
     fetch = prediction - resident
-    needed = set().union(*(_ids(row) for row in following["topk"]))
+    # The main question is P(t) vs W(t+1), separately at this CSA layer.
+    # Anchor row 0 is not a draft candidate and is excluded from the W union.
+    raw_prediction = set().union(*(_ids(row) for row in probe["topk"]))
+    needed = set().union(*(_ids(row) for row in following["topk"][1:]))
     old_needed = {unit for unit in needed if unit < history}
     events = following.get("miss_events")
     misses = (
@@ -218,11 +261,19 @@ def compare(source, following, probe):
     row.update({field: source[field] for field in GROUP if field in source})
     row.update(
         next_verify_candidates=following["verify_candidates"],
-        verify_width=source["verify_candidates"] + 1,
-        total_width=source.get("total_width"),
+        next_verify_width=following["verify_candidates"],
+        next_window_id=following["window_id"],
+        next_snapshot_id=following["snapshot_id"],
+        model_layer=source.get("model_layer"),
+        verify_width=source["verify_candidates"],
+        target_verify_width=source["verify_candidates"] + 1,
+        total_width=generated_width(source),
+        token_counting="generated",
         p=probe["p"],
         mode=probe["mode"],
         prefetch_policy=PREFETCH_POLICY,
+        probe_topk_units=len(raw_prediction),
+        covered_next_units=len(raw_prediction & needed),
         prediction_units=len(prediction),
         prediction_resident_units=len(prediction & resident),
         prefetch_candidate_units=len(fetch),
@@ -270,10 +321,13 @@ def analyze(records, cap=None):
                 record.get("checkpoint_gamma"),
                 record.get("proposal_gamma"),
                 record.get("probe_workspace", "none"),
+                record.get("token_counting", "including-anchor"),
             )
         )
         if len(protocols) > 1:
-            raise ValueError("Cannot mix proposal widths or probe workspace policies")
+            raise ValueError(
+                "Cannot mix proposal widths, probe workspace policies or token counting"
+            )
         if not orders <= {"native", "logical", "logical-all"} or len(orders) > 1:
             raise ValueError("Cannot mix different topk_order experiments")
         key = _key(record)
@@ -296,12 +350,54 @@ def analyze(records, cap=None):
             skipped["no_immediate_next_window"] += 1
             continue
         rows.append(compare(source, following, probe))
+    summary = aggregate(rows, GROUP)
+    # The acceptance-stratified table is useful diagnostically, but a CSA
+    # curve needs one point per layer/P across all actual acceptance lengths.
+    layer_summary = aggregate(
+        rows, tuple(field for field in GROUP if field != "accepted_drafts")
+    )
+    return {
+        "schema_version": VERSION,
+        "analysis_version": ANALYSIS_VERSION,
+        "primary_metric": "next_step_coverage",
+        "coverage_definition": "|union(P queries at step t) intersect union(W draft queries at step t+1)| / |union(W draft queries at step t+1)|; per CSA layer; exclude anchor; no resident subtraction or miss filtering",
+        "token_counting": "generated",
+        "layer_scope": "C4 CSA indexer layers; model_layer is the original target layer ID",
+        "topk_order": next(iter(orders), "native"),
+        "proposal_protocol": dict(
+            zip(
+                (
+                    "checkpoint_gamma",
+                    "proposal_gamma",
+                    "probe_workspace",
+                    "token_counting",
+                ),
+                next(iter(protocols), (None, None, "none", "including-anchor")),
+            )
+        ),
+        "prefetch_cap_units": None,
+        "prefetch_policy": PREFETCH_POLICY,
+        "candidate_policy": "all-probe-topk; dedup; committed-history; subtract-residency; no-cap",
+        "measurement": "offline Top-K logical-ID coverage; tentative future IDs do not establish identical KV contents or realized transfer hits",
+        "p0_policy": "no appended query; empty prediction/candidate set; zero additional IO; resident KV is not counted as new prefetch",
+        "validation": {"scope": "not_audited", "passed": None},
+        "baseline_records": len(windows),
+        "probe_records": len(probes),
+        "matched_records": len(rows),
+        "skipped": dict(skipped),
+        "groups": summary,
+        "layers": layer_summary,
+        "samples": rows,
+    }
+
+
+def aggregate(rows, fields):
     groups = defaultdict(list)
     for row in rows:
-        groups[tuple(row[field] for field in GROUP)].append(row)
+        groups[tuple(row[field] for field in fields)].append(row)
     summary = []
     for key, members in sorted(groups.items()):
-        entry = dict(zip(GROUP, key))
+        entry = dict(zip(fields, key))
         entry["samples"] = len(members)
         entry["samples_with_miss_events"] = sum(
             row["next_miss_events"] is not None for row in members
@@ -318,31 +414,18 @@ def analyze(records, cap=None):
         ]
         entry["samples_with_timing"] = len(costs)
         entry["mean_delta_target_ms"] = sum(costs) / len(costs) if costs else None
+        coverage = [
+            row["next_step_coverage"]
+            for row in members
+            if row["next_step_coverage"] is not None
+        ]
+        entry["steps_with_nonempty_demand"] = len(coverage)
+        entry["mean_step_coverage"] = (
+            sum(coverage) / len(coverage) if coverage else None
+        )
         _ratios(entry)
         summary.append(entry)
-    return {
-        "schema_version": VERSION,
-        "analysis_version": ANALYSIS_VERSION,
-        "topk_order": next(iter(orders), "native"),
-        "proposal_protocol": dict(
-            zip(
-                ("checkpoint_gamma", "proposal_gamma", "probe_workspace"),
-                next(iter(protocols), (None, None, "none")),
-            )
-        ),
-        "prefetch_cap_units": None,
-        "prefetch_policy": PREFETCH_POLICY,
-        "candidate_policy": "all-probe-topk; dedup; committed-history; subtract-residency; no-cap",
-        "measurement": "offline prediction potential; no eviction or asynchronous timing simulation",
-        "p0_policy": "no appended query; empty prediction/candidate set; zero additional IO; resident KV is not counted as new prefetch",
-        "validation": {"scope": "not_audited", "passed": None},
-        "baseline_records": len(windows),
-        "probe_records": len(probes),
-        "matched_records": len(rows),
-        "skipped": dict(skipped),
-        "groups": summary,
-        "samples": rows,
-    }
+    return summary
 
 
 def read_records(paths):
@@ -351,6 +434,12 @@ def read_records(paths):
             raise ValueError(
                 f"Rejected shadow replay in {path.parent}; inspect rejection.json"
             )
+        runtime_path = path.parent / "runtime.json"
+        layer_map = (
+            json.loads(runtime_path.read_text()).get("c4_layer_to_model_layer", {})
+            if runtime_path.exists()
+            else {}
+        )
         opener = gzip.open if path.suffix == ".gz" else open
         with opener(path, "rt", encoding="utf-8") as stream:
             for number, line in enumerate(stream, 1):
@@ -358,6 +447,8 @@ def read_records(paths):
                     continue
                 try:
                     record = json.loads(line)
+                    if record.get("model_layer") is None:
+                        record["model_layer"] = layer_map.get(str(record["layer"]))
                     validate(record)
                 except (KeyError, TypeError, ValueError) as error:
                     raise ValueError(f"{path}:{number}: {error}") from error
@@ -389,7 +480,7 @@ def main():
     (args.output / "report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     )
-    for name in ("samples", "groups"):
+    for name in ("samples", "groups", "layers"):
         with (args.output / f"{name}.csv").open("w", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=list(report[name][0]))
             writer.writeheader()

@@ -5,6 +5,7 @@ from dataclasses import replace
 from typing import Optional
 
 import torch
+
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
@@ -675,8 +676,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
         if self._oasiskv_trace is not None:
-            # Keep the checkpoint proposal width G. Only V candidates participate
-            # in ordinary acceptance; the suffix is reserved for offline probes.
+            # Reuse the single full proposal above. Only W candidates participate
+            # in acceptance; each P uses a prefix of its already-generated suffix.
             layout = self._oasiskv_trace.layout(self._oasiskv_trace.v + 1)
             run_compact = True
 

@@ -1,6 +1,6 @@
 # V4 + DSPARK：扩展验证窗口的离线 probe 实验
 
-本实验判断：**当前 DSPARK proposal 的后缀，在额外执行 target 层后，能否预测下一次实际验证窗口的历史 KV misses？**
+本实验判断：**draft 每步一次生成 G 个新 token；其中后缀的 P 个 probe，在每个 CSA 层选出的 KV 集合，对下一步 W 个 draft token 所需 KV 集合的覆盖率是多少？** G/W 均不包含已有 anchor。逐层 Top-K 集合覆盖率是主指标，miss/搬运相关指标仅作辅助。
 
 分支：`exp/oasiskv-trace`，基于 `oasiskv` 的 `ef8bbeae7`。这里只增加 opt-in 采集入口，不启用在线多 token 预取，不改变原有 OasisKV 的 root-only 提交语义。
 
@@ -13,32 +13,36 @@
 | GPU | 4 × H100，TP=4，纯 TP，单机 |
 | 数据 | `/home/jovyan/td69032/ShareGPT_V3_unfiltered_cleaned_split.json` |
 | 输入 | 16384 / 32768 / 65536 / 131072 token，沿用 ShareGPT 拼接规则 |
-| 验证范围 | B=1，greedy，W 固定为 6 或 7（含 anchor），无 grammar/logprob |
-| 总宽度 G | 默认 12，等于服务端 `speculative_num_draft_tokens`，包含 anchor |
+| 验证范围 | B=1，greedy，W 固定为 6 或 7 个 draft 候选，不含 anchor；target 实际输入 7/8 行 |
+| 总宽度 G | 一次生成 12 个新 draft token；服务端 `speculative_num_draft_tokens=13`，额外含 anchor |
 | Probe | W=6：P=0～6；W=7：P=0～5；始终满足 W+P≤G |
-| DSPARK proposal | `checkpoint_gamma` 单独记录；运行时 `proposal_gamma=G−1=11` 个候选 |
+| DSPARK proposal | `checkpoint_gamma` 单独记录；运行时 `proposal_gamma=G=12` 个候选；所有 P 复用同一份 proposal |
 | 输出 / 采集窗口 | 每请求 256 输出 token；只记录前 32 个验证窗口 |
-| KV | 原生 V4 + HiSparse；Top-K 读取 target 的 `index_topk`；W=6/7 联合扫描统一常驻 `7×512=3584` |
+| KV | 原生 V4 + HiSparse；Top-K 读取 target 的 `index_topk`；W=6/7 联合扫描统一常驻 `(7+1)×512=4096` |
 | 路由专家 | 显式 `--moe-runner-backend flashinfer_mxfp4`；H100 使用 CUTLASS W4A16，保持 checkpoint MXFP4 存储 |
 | 全局 C4 池 | `host_to_device_ratio=1`，容纳完整 prefill；不改变每请求 decode 的 `resident_units` |
 
-**验证状态：测试方反馈上一轮缩小至 G=10 后可运行，但固定 G=12 的矩阵曾被 C4 compressor ring 的启动检查拒绝。本轮已补齐按最大宽度扩容的实现及实际内存池配置/分配的 CPU 回归；G=12 的 GPU 启动与矩阵仍待实测。** 独立服务仍可能产生不同 proposal/Top-K，因此质量审计使用同服务、同 proposal、同快照的基线。需要使用已能运行该仓库 V4/DSPARK 的 CUDA、FlashMLA、DeepGEMM 等环境；脚本不自动安装或下载模型依赖。
+**协议变更：旧版本的 G/W 包含 anchor，新版本改为新生成 token 数，并记录 `token_counting="generated"`。** 旧 `G=12,W=6/7` 实际生成 11 个、验证 5/6 个候选，不能当成新配置的结果；必须重新采集才能测试本轮 12 个 proposal、6/7 个验证候选。旧完整 trace 可重新分析，但会按实际候选数标注。新矩阵的 GPU 运行仍待验证；本地回归不代替模型实测。
+
+独立服务仍可能产生不同 proposal/Top-K，因此质量审计使用同服务、同 proposal、同快照的基线。需要使用已能运行该仓库 V4/DSPARK 的 CUDA、FlashMLA、DeepGEMM 等环境；脚本不自动安装或下载模型依赖。
 
 ## G、W、P 的口径
 
-这里 G 和 W **都包含 anchor**。W=6 验证 5 个候选、最多提交 6 个 token；W=7 验证 6 个候选、最多提交 7 个 token。
-P 是额外 probe，不是 W 的一部分。G=12 时，W=6/P=6 与 W=7/P=5 的 target shadow 都计算 12 行。
-默认同时传入 `--speculative-dspark-block-size 11 --speculative-num-draft-tokens 12`，
-为 DSPARK 生成 11 个候选并预留相应事务 scratch；两个参数必须匹配，单独设置后者会被 CLI 的 checkpoint 宽度校验拒绝。
+这里 G 和 W **都不包含 anchor**。W=6 验证 6 个候选、最多提交 7 个 token；W=7 验证 7 个候选、最多提交 8 个 token（含 target 的 bonus）。
+每步仅一次调用 draft proposer，生成 `d₁…d₁₂`；真实验证使用 `[anchor,d₁…d_W]`，P 预测使用紧随其后的 `d_(W+1)…d_(W+P)`。
+P 是额外 probe，不是 W 的一部分。G=12 时，W=6/P=6 与 W=7/P=5 的 target shadow 都计算 13 行；P 较小时只取同一份 proposal 的相应前缀，不重新生成。
+默认同时传入 `--speculative-dspark-block-size 12 --speculative-num-draft-tokens 13`，
+为 DSPARK 一次生成 12 个候选并预留相应事务 scratch；两个参数必须匹配，单独设置后者会被 CLI 的 checkpoint 宽度校验拒绝。
 trace 的 compact verify 把真实窗口限制为 W 行，额外候选不会被接受。
-`--total-width 12` 固定 proposal 宽度；即使只测试 `--probes 0` 或 `--probes 1 2 3 4`，服务端也仍是 12，不能因最大 P 较小而自动缩为 10。
+`--total-width 12` 固定 proposal 宽度；即使只测试 `--probes 0` 或 `--probes 1 2 3 4`，仍一次生成 12 个，target 总容量仍是 13 行。只有最大 P 满足 W+P=G；其余 P 满足 W+P<G。
+多次执行的是 target 的离线基线/shadow/恢复验证，不是分别调用 draft 生成 W 和 P。每条新 trace 保存含 anchor 的完整 `proposal_input_ids`，audit 检查所有 P 与基线复用同一 proposal 及其正确前缀。
 
 **Compressor 状态环随服务最大推测宽度分配。** 旧 C4 ring=16 的安全上限为 `16−8+2=10` 行，不能支持 G=12。
 现在 G=12 选择 ring=32（安全上限 26），同时用于内存预算、attention/indexer 的原始压缩状态池和读写计划；
 ring 必须整除 SWA page=256，因此不直接使用最小的 18。C128 ring 仍为 256，G≤10 的 C4 ring 仍为 16。
 构造池后固定 stride，避免后续缩短 verify 宽度改变寻址。启动容量检查保留，超过页内可支持的宽度仍报错。
-这会增加 C4 compressor 的状态显存预算，**不增加 HiSparse 的 3584 个压缩 KV 驻留槽**，也不改变 W/P 或接受规则。
-日志应出现 `max_draft_tokens=12, c4_ring_size=32, c128_ring_size=256`；
+Compressor ring 与压缩 KV 常驻表是两种容量。本轮真实 target 窗口多了 anchor，常驻安全下界按 `(W+1)×K` 计算；联合扫描为 4096。
+日志应出现 `max_draft_tokens=13, c4_ring_size=32, c128_ring_size=256`；
 `runtime.json` 的 `hisparse_runtime.compress_state_ring_sizes` 应为 `{"4": 32, "128": 256}`。
 
 加载模型前可先验证配置到真实状态池的 CPU 链路，再在 GPU 上验证原生 planner 的十二行写入与回滚历史保护：
@@ -53,16 +57,16 @@ PYTHONPATH=python python -m pytest -q \
 
 对于原生 `checkpoint_gamma=5` 的 checkpoint，这属于**扩大运行时 proposal 长度的离线实验**，没有修改或重训 checkpoint。
 draft 的 forward/Markov sampler 支持该宽度；离线固定窗口不调用按训练宽度校准的 confidence planner。
-更宽的 draft forward 也可能改变前 5 个候选，所以“真实验证宽度等于普通 DSPARK 的 6”不等于“proposal 或接受率等于原生 5 候选”。
+更宽的 draft forward 也可能改变前 5 个候选，本轮 proposal 或接受率不等同于 checkpoint 原生 5 候选。
 每步只生成一次宽 proposal，不同 P 共用它的前缀；不要混合不同 G 的运行。W 的改变也会改变接受轨迹，每个 W 单独做同快照审计，不要求跨 W 窗口逐字段相同。
 `manifest.json`、`runtime.json` 和 trace 记录 `total_width`、`checkpoint_gamma`、`proposal_gamma`、`probe_workspace`；分析 CSV 显式列出 `verify_width` 和 `total_width`。
 
-**W=6/7 联合扫描统一使用 3584 常驻槽，而非随 G=12 升至 6144。** W=7 的安全下界为 7×512；统一容量便于对比 W。
-单独 W=6 默认仍为 3072，可显式设置 3584 与扫描矩阵对齐。此前 3072 的结果不能与本轮 3584 的结果视为同配置。
+**W=6/7 联合扫描统一使用 4096 常驻槽。** W=7 的真实窗口含 anchor 共 8 行，安全下界为 8×512；统一容量便于对比 W。
+单独 W=6 默认使用 3584，可显式设置 4096 与扫描矩阵对齐。此前 3072/3584 的结果不能与本轮 4096 的结果视为同配置。16K 历史可能完全驻留，这不影响主指标：Top-K 集合覆盖率不要求产生 miss。
 exact shadow 的每行完成原生补载后，把该行选中的历史 KV 复制到临时 C4 位置，attention 读取这些副本，
 防止后面行换入时覆盖前面行仍要读取的历史 KV。当前窗口新生成的 KV 继续由事务 scratch 处理。
 临时位置来自全局 C4 池的空闲页，在 prefill 完成后、每次 exact shadow 开始时借用，forward 完成后归还并恢复 free-list 顺序。
-每个 TP rank 最大借用 12×512=6144 个位置，在全部 C4 层对应独立数据；不会加入常驻表，也不保留到下一真实窗口。
+每个 TP rank 最大借用 13×512=6656 个位置，在全部 C4 层对应独立数据；不会加入常驻表，也不保留到下一真实窗口。
 全局池不够时会明确报错；应增大全局池/`--context-length`，不要扩大 `--resident-units` 来掩盖缺口。
 
 resident shadow 只给前 W 行补载，probe 历史 miss 不补载、不使用副本。
@@ -85,7 +89,7 @@ python benchmark/oasiskv/trace/run.py --mode paired --total-width 12 \
 # 首先验证模型入口、快照恢复和接受边界。4K可以没有miss，不作为覆盖率曲线。
 python benchmark/oasiskv/trace/run.py --mode paired \
   --topk-order logical-all \
-  --total-width 12 --verify-widths 6 7 --resident-units 3584 \
+  --total-width 12 --verify-widths 6 7 --resident-units 4096 \
   --output /srv/oasiskv/trace-g12-w6-w7-smoke \
   --input-lengths 4096 --output-length 32 \
   --requests 1 --max-windows 3 \
@@ -94,7 +98,7 @@ python benchmark/oasiskv/trace/run.py --mode paired \
 # 正式矩阵：4 个输入长度 × 2 个 W；各 W 的 P 自动取 0..G-W。
 python benchmark/oasiskv/trace/run.py --mode paired \
   --topk-order logical-all \
-  --total-width 12 --verify-widths 6 7 --resident-units 3584 \
+  --total-width 12 --verify-widths 6 7 --resident-units 4096 \
   --input-lengths 16384 32768 65536 131072 \
   --output /srv/oasiskv/trace-g12-w6-w7-16k-128k --execute
 ```
@@ -105,7 +109,7 @@ python benchmark/oasiskv/trace/run.py --mode paired \
 
 128K 输入默认把 `--context-length` 与 `--max-total-tokens` 设为 **139264**，给输出、C4 scratch 和 prefill 页留余量；
 16K/32K 单独运行仍至少用 40960，64K 单独运行默认 73728。显式覆盖 context 时仍会检查容量，不能沿用 40960 跑 64K/128K。
-全局 C4 池仍保持 `host_to_device_ratio=1`，每请求 decode 常驻仍为 3584，不随输入长度增长。
+全局 C4 池仍保持 `host_to_device_ratio=1`，每请求 decode 常驻仍为 4096，不随输入长度增长。
 `--snapshot-gib` 仍是 32 GiB/rank 的上限，不是预留量；长上下文的实际占用查看 `snapshot-inventory.json`，超限会报出所需大小，不会自动放宽主机内存预算。
 
 已有本地实验分支时使用 `git switch exp/oasiskv-trace`。输出目录必须不存在，以防混合旧 trace。默认使用 GPU `0,1,2,3`；可通过 `--gpus` 修改。推荐 `--mode paired`：只启动一个 probes 服务，基线来自该服务每个窗口的同快照对照。`--mode experiment` 仍顺序启动独立的 control/probes/full-control 服务，各自重新加载模型，共用 `prompts.npy`；它增加跨服务复现性和checkpoint 原生接受长度参考。请求串行执行。
@@ -189,7 +193,7 @@ client请求超时和scheduler watchdog分别设置，默认后者600秒；长�
 且DSPARK scratch还占用其中部分。32K prompt需要8192个C4单元，当前HiSparse在最后一个prefill chunk后才卸载历史，
 所以减小chunk不能解决这一容量问题。脚本现在默认比例1，并在计划阶段拒绝明显装不下的组合。
 这只扩大prefill可用的全局物理池，**每请求decode驻留仍按 `resident_units` 裁剪**；
-旧配置 W=6、K=512 时仍为3072；本轮 W=6/7 扫描为3584，不会因为全局池扩大而让16K/32K历史全部常驻。
+旧口径 W=6、K=512 时容量为3072；本轮新口径 W=6/7 扫描为4096。16K初始历史可全部常驻，32K以上仍会超过容量；主指标不以miss为分母。
 
 MXFP4方面，脚本显式选 `flashinfer_mxfp4` 并设置 `SGLANG_DSV4_FP4_DEQUANT=0`。
 CUDA上 packed MXFP4 不再静默落到普通FP8 MoE；不支持的runner（包括原来的auto回退）会提前报出可用选择。
@@ -334,15 +338,15 @@ PYTHONPATH=python python -m pytest -q \
 新实验配置列出允许采集的request IDs：server warmup只执行正常验证，不保存window、不做shadow，
 不进入覆盖率和接受长度统计。原日志中的 `history_units=1–2` 不能代表4K请求；
 4K真实历史应约为1024个C4单元，16K约4096、32K约8192。
-4K小于3072驻留容量，miss分母为0是合理的；只有16K/32K正式样本才用于研究预取覆盖率随P的变化。
+4K通常全驻留，miss分母为0是合理的；逐层集合覆盖率仍可计算。正式矩阵按16K/32K/64K/128K分别报告。
 
-当前 `--total-width G` 默认 12，包含 anchor，独立于 checkpoint 原生候选数；运行时 proposal gamma 为 G−1。
+当前 `--total-width G` 默认 12，不含 anchor，独立于 checkpoint 原生候选数；运行时 proposal gamma 为 G，target 总行数为 G+1。
 未显式传 `--probes` 时自动扫描 0..G−W，所有 P 共用固定 proposal 宽度。
-旧的 `--verify-candidates V` 参数仍可用，等价于 `--verify-width V+1`。control 与 probes 使用相同运行时 proposal gamma 和 W。
+旧的 `--verify-candidates V` 参数仍可用，等价于 `--verify-width V`（此处 V=W，均为候选数）。control 与 probes 使用相同运行时 proposal gamma 和 W。
 untraced/full-control 使用 checkpoint 原生候选数；前者不做采集，后者用于提供原生接受长度参考，不属于本轮 paired 矩阵。
 
 Top-K 使用模型原生设置，不用通用 Qwen 实验的 2048 代替 V4 的 indexer 配置。
-paired 默认容量是 `W×index_topk`。若 experiment 还包含比 W 更宽的原生 full-control，则共同容量也必须满足原生宽度下界；
+paired 默认容量是 `(W+1)×index_topk`。若 experiment 还包含比 W 更宽的原生 full-control，则共同容量也必须满足原生宽度下界；
 所有组实际容量写入 `runtime.json`。只有 opt-in trace 的 exact shadow 使用上述临时副本；普通 DSPARK 的容量检查不变。
 
 ### 16K 首窗口误报 C4 4095 被淘汰
@@ -371,7 +375,7 @@ PYTHONPATH=python python -m pytest -q \
 
 python benchmark/oasiskv/trace/run.py --mode paired --topk-order logical-all \
   --gpus 1,5,6,7 --port 31010 --input-lengths 16384 --output-length 32 \
-  --verify-width 6 --probes 1 2 3 4 5 6 --resident-units 3072 \
+  --verify-width 6 --probes 1 2 3 4 5 6 --resident-units 4096 \
   --requests 1 --max-windows 3 --diagnostics --request-timeout 1800 \
   --output /srv/oasiskv/paired-16k-w6-p6 --execute
 ```
@@ -413,7 +417,7 @@ PYTHONPATH=python python -m pytest -q test/registered/kernels/ops/kvcache/test_h
 2. **probes**：同一个固定 V 基线轨迹，每个采集窗口执行 P=1..G−W 的 exact、resident 影子 forward；P=0 复用同快照基线，不额外 forward。这些 probe 不进入接受流程、不提交 KV，也不执行后台预取。最后恢复并重放原来的 V 窗口，走普通 DSPARK 接受流程。
 3. **full-control**：用 checkpoint 原生候选数生成并验证完整候选，无 probe。用于观察扩大 proposal 长度/限制真实 V 后接受长度的变化，不强行逐窗口配对。Smoke 可以省略这一组。
 
-每个 shadow 仍在**一次 target forward** 中计算 `[anchor, V 个验证候选, P 个 probe]`，让 probe 的 hidden state 经过所有 target 层。离线实验为做对照而多次重放；这不代表未来线上实现必须额外启动这些 forward。
+每个 shadow 仍在**一次 target forward** 中计算 `[anchor, W 个验证候选, P 个 probe]`，让 probe 的 hidden state 经过所有 target 层。离线实验为做对照而多次重放；这不代表未来线上实现必须额外启动这些 forward。
 
 P=0 没有新的预测集合。验证行自己的 Top-K 已经为本轮 attention 获取，不能把它重新统计成下一轮新增预取。
 P=0 会记录 exact/resident 两条相同的零 probe 基线，Top-K 行列表为空、额外 H2D/D2D 均为 0；不会因此多跑两次 target forward。
@@ -422,12 +426,12 @@ P=0 会记录 exact/resident 两条相同的零 probe 基线，Top-K 行列表�
 
 ## exact / resident 的具体语义
 
-- **exact**：所有 V+1+P 行使用原生稀疏 Top-K 和按需补载，历史 KV 逐行复制到临时位置保护其读取生命周期。它是相同 draft 分支的精确稀疏 attention 参考，不是 dense attention，也不是下一轮命中率的数学上界。
-- **resident**：前 V+1 行照常补载。probe 先记录原始预测 Top-K，再仅映射其中已驻留的历史项，未驻留项的 attention 索引置为 −1；**不调用 probe 历史补载 kernel**。本窗口已计算的 C4 仍经过现有事务 scratch 映射和因果限制，SWA/C128 路径照常执行。
+- **exact**：所有 W+1+P 行使用原生稀疏 Top-K 和按需补载，历史 KV 逐行复制到临时位置保护其读取生命周期。它是相同 draft 分支的精确稀疏 attention 参考，不是 dense attention，也不是下一轮命中率的数学上界。
+- **resident**：前 W+1 行照常补载。probe 先记录原始预测 Top-K，再仅映射其中已驻留的历史项，未驻留项的 attention 索引置为 −1；**不调用 probe 历史补载 kernel**。本窗口已计算的 C4 仍经过现有事务 scratch 映射和因果限制，SWA/C128 路径照常执行。
 
 resident 的策略是“probe Top-K 与本层真实验证后驻留集合的交集”，不是把任意驻留项补满 K。这个选择会影响深层 hidden state，因此报告必须保留 mode 标签。记录 probe Top-K 的动作发生在这一层 attention 之前；下一层的 Top-K 已受前一层近似 attention 影响。
 
-真正验证的接受规则沿用原来的 `accept_and_finalize`，用 compact layout 把接受边界限制为 V；最多提交 V+1 个 token。Probe logits 即使算出来也不参与基线接受判断。
+真正验证的接受规则沿用原来的 `accept_and_finalize`，用 compact layout 把接受边界限制为 W 个候选；最多提交 W+1 个 token。Probe logits 即使算出来也不参与基线接受判断。
 
 ## 隔离与正确性检查
 
@@ -470,7 +474,8 @@ trace-v4-16k-32k/
   cross-server-audit*.json      # experiment 的独立进程复现性诊断
   acceptance.json               # 每种 V 的 A 分布、平均提交 token 数
   analysis/samples.csv           # 每窗口、每层、P、mode 的明细
-  analysis/groups.csv            # 按输入长度、层、V、实际 A、P、mode 聚合
+  analysis/groups.csv            # 按输入长度、层、W、实际 A、P、mode 聚合
+  analysis/layers.csv            # 每个CSA层与P的主指标汇总，不按接受长度拆开
   analysis/report.json
 ```
 
@@ -478,18 +483,36 @@ trace 的 `layer` 是 C4 层序号；`runtime.json` 给出到原模型层号的�
 
 配对键为 `(run_id, request_id, generation, window_id, layer, head)`；window_id 是请求内的连续编号，**不按请求池槽号或全局 forward 计数配对**。要求下一窗口 `prefix_len = 当前 prefix_len + 实际 commit_len`。提前拒绝时也按这条真实路径配对，不能按 V 推测下一位置。
 
-**覆盖率分析使用 P 行 probe Top-K 的完整并集，不设置固定预取数量上限。** 令 `H` 为源窗口已提交的历史，`R` 为本层真实补载后的驻留集合，则预测集合为 `U_P = (TopK(q₁) ∪ … ∪ TopK(q_P)) ∩ H`，候选预取集合为 `F_P = U_P − R`。P=0 时二者为空。
+**主指标 `next_step_coverage`：本步 P 对下一步 W，逐 CSA 层计算。** 对层 ℓ，设 `S(t,ℓ,P)` 为本步 P 个 probe 的 Top-K 并集，`D(t+1,ℓ,W)` 为下一真实 step 的 W 个 draft 位置的 Top-K 并集：
+
+```text
+coverage(t, ℓ, P) = |S(t, ℓ, P) ∩ D(t+1, ℓ, W)| / |D(t+1, ℓ, W)|
+S = 本步 probe 记录的 P 行 Top-K 并集
+D = 下一步 window.topk[1:W+1] 的并集（排除第 0 行 anchor）
+```
+
+去掉 −1 padding、去重，不减驻留、不筛 misses、不限制数量。D 使用下一步实际执行的全部 W 个候选 query，即使该步最终拒绝部分候选，也不把分母改为接受 token 的需求。P 不与本步 W 比较，也不把本步 proposal 的后缀当作下一步 ground truth。
+
+`samples.csv` 每行是一对相邻 step、一个 CSA 层及 P/mode，包含 `window_id`、`next_window_id`、`next_snapshot_id`、`covered_next_units`、`next_all_units`、`next_step_coverage`。`layer` 保留 C4 层序号，`model_layer` 是原 target 模型层号；旧 trace 从同目录 `runtime.json` 的映射恢复，缺失时留空，不猜测层号。
+`layers.csv` 按输入长度、W/G、P、mode 和每个层单独汇总，不混合不同 CSA 层：`mean_step_coverage` 是有非空需求的各 step 覆盖率平均值，`next_step_coverage` 是交集数之和除以需求数之和。`groups.csv` 额外按实际接受长度分组，用于诊断。
+本采集覆盖 V4 中带 indexer Top-K 的 C4 CSA 层；C128 压缩注意力和 SWA 没有这套逐行 Top-K 选择，不混入这些层的覆盖率曲线。
+
+主指标衡量逻辑 C4 ID 的选择集合重合。未提交分支中同位置 ID 并不能证明 KV 内容相同，也不能据此声称异步预取命中；下面的历史/搬运辅助指标会另行过滤尚未提交的 KV。
+
+**辅助预取候选仍使用 P 行 Top-K 的完整并集，不设置固定上限。** 令 `H` 为源窗口已提交的历史，`R` 为本层真实补载后的驻留集合，则历史预测集合为 `U_P = S(t,ℓ,P) ∩ H`，候选预取集合为 `F_P = U_P − R`。P=0 时二者为空。
 
 每个 P 的候选数取实际 `|F_P|`，不做频次投票筛选或截断，也不强行补到 P×K。K=512 时，P=0～6 的原始条目数上界依次为 0、512、1024、1536、2048、2560、3072；去重、排除未提交历史及扣除驻留后，实际数量通常更小。各 P 的 shadow 使用各自观测到的 Top-K，不人为保证曲线单调。
 
 旧版 `--prefetch-units` 默认 256，只截断离线分析中的候选集合，不控制模型或 GPU 搬运。它影响 `potential_unique_miss_coverage`、候选量及 precision；旧版 `history_coverage` 已使用完整预测并集，未受该上限影响。本轮取消这种固定预算口径：两个脚本均可省略该参数；兼容写法为 `run.py --prefetch-units all` / `analyze.py --max-prefetch-units all`，传入旧的数字值会在执行前报错。
 
-`report.json` 标记 `analysis_version=2`、`prefetch_policy="full-probe-union"`、`prefetch_cap_units=null`；两个 CSV 也包含 `prefetch_policy`，不要与旧的固定预算报告混合。该变化只涉及离线集合统计，W/P、index_topk、3584 的常驻容量及真实接受路径不变。
+`report.json` 标记 `analysis_version=3`、`prefetch_policy="full-probe-union"`、`prefetch_cap_units=null`；所有 CSV 也包含 `prefetch_policy`，不要与旧的固定预算报告混合。该变化只涉及离线集合统计，W/P、index_topk、常驻容量及真实接受路径不由候选预算改变。
 
 核心字段：
 
 | 字段 | 含义 |
 | --- | --- |
+| `next_step_coverage` | **主指标**：本步 P 的完整 Top-K 并集，对下一步 W（不含 anchor）需求并集的覆盖率 |
+| `probe_topk_units` / `covered_next_units` / `next_all_units` | 主指标预测集合大小 / 与下一步需求的交集大小 / 下一步需求集合大小 |
 | `history_coverage` | 对下一窗口需要的、源窗口已有历史 KV 的覆盖率 |
 | `prefetch_candidate_units` / `prefetch_candidate_bytes` | P 行预测的全部历史候选去重、扣除驻留后的数量 / 潜在搬运量，无截断 |
 | `next_miss_bytes` | 下一真实窗口 kernel miss plan 的实际 H2D 字节；重复补载按实际次数计 |
@@ -502,11 +525,11 @@ trace 的 `layer` 是 C4 层序号；`runtime.json` 给出到原模型层号的�
 
 没有用 kernel 调用次数代替搬运量；实际 miss 来自 swap kernel 输出的 `miss_src/miss_count`，再映射回逻辑 C4 ID。
 
-16K/32K/64K/128K 原始输入分别约对应 4096/8192/16384/32768 个 C4 单元，本轮共同常驻容量为3584。
+16K/32K/64K/128K 原始输入分别约对应 4096/8192/16384/32768 个 C4 单元，本轮共同常驻容量为4096。
 历史超过容量不保证每个窗口都有 miss；若分母为零，指标输出 null，不伪造 100% 覆盖率。
 若另外扩大 W 或 K，常驻安全下界也会上升；若调整容量，基线和影子组必须一起重跑并区分配置。
 
-**已有完整 trace 无需重跑模型。** 原始 probe 记录已保存全部 Top-K，可使用原有 audit 重新生成无截断的报告，写入新目录以保留旧结果，例如 W=6（W=7 同样执行）：
+**已有完整 trace 可以重新计算这些指标，但不能补出未生成的第 12 个 draft token。** 要测试本轮 G=12、W=6/7 新生成 token，需按新协议重新采集。若只是重新分析旧轨迹，可保留原 audit，写入新目录；新报告会按实际候选数标注 G/W，并记录原采集的计数口径：
 
 ```bash
 python benchmark/oasiskv/trace/analyze.py \
