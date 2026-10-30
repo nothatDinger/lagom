@@ -483,16 +483,20 @@ class OasisKVTrace:
             raise ValueError("Trace probe_workspace must be none or row-copy")
         if config.get("proposal_gamma", worker.gamma) != worker.gamma:
             raise ValueError("Trace proposal_gamma must match DSPARK runtime gamma")
+        if config.get("total_width", worker.gamma + 1) != worker.gamma + 1:
+            raise ValueError(
+                "Trace total_width includes anchor and must equal runtime gamma + 1"
+            )
         topk_order = config.get("topk_order", "native")
         if topk_order not in ("native", "logical", "logical-all"):
             raise ValueError("Trace topk_order must be native, logical or logical-all")
         if type(self.v) is not int or not 1 <= self.v <= worker.gamma:
             raise ValueError("Trace V must be in [1, runtime proposal gamma]")
         if any(
-            type(p) is not int or not 1 <= p <= worker.gamma - self.v
+            type(p) is not int or not 0 <= p <= worker.gamma - self.v
             for p in self.probes
         ):
-            raise ValueError("Trace requires 1 <= P <= runtime proposal gamma - V")
+            raise ValueError("Trace requires 0 <= P <= runtime proposal gamma - V")
         if len(set(self.probes)) != len(self.probes) or self.max_windows < 2:
             raise ValueError("Use unique P values and at least two trace windows")
         if (
@@ -615,6 +619,7 @@ class OasisKVTrace:
             "topk_order": self.config.get("topk_order", "native"),
             "checkpoint_gamma": self.config.get("checkpoint_gamma"),
             "proposal_gamma": self.config.get("proposal_gamma"),
+            "total_width": self.worker.gamma + 1,
             "probe_workspace": self.config.get("probe_workspace", "none"),
         }
 
@@ -700,9 +705,15 @@ class OasisKVTrace:
                 del trial
                 for p in self.probes:
                     for mode in ("exact", "resident"):
-                        restore()
-                        shadow, layers = observe(mode, p)
-                        del shadow
+                        if p == 0:
+                            # No appended query, hence no predicted Top-K or
+                            # extra IO. Reuse the paired baseline observation;
+                            # do not execute two redundant W-only shadows.
+                            layers = trial_layers
+                        else:
+                            restore()
+                            shadow, layers = observe(mode, p)
+                            del shadow
                         if layers.keys() != trial_layers.keys():
                             raise RuntimeError(
                                 "Shadow and baseline C4 layer sets differ"

@@ -37,8 +37,8 @@ def digest(path):
 
 
 def checkpoint_gamma(path):
-    # Matches parse_dspark_draft_config: DSPARK's G is the checkpoint's
-    # block_size; target verification has G+1 rows, including the anchor.
+    # Checkpoint gamma counts candidates, excluding the anchor. The experiment's
+    # total width G (CLI --total-width) includes it; runtime gamma = G - 1.
     config = json.loads((Path(path) / "config.json").read_text())
     gamma = config.get("dspark_block_size")
     if gamma is None:
@@ -72,6 +72,8 @@ def proposal_gamma(args, trained_gamma):
     mode = getattr(args, "collection_mode", getattr(args, "mode", "paired"))
     if mode in ("untraced", "full-control") or not hasattr(args, "probes"):
         return trained_gamma
+    if getattr(args, "total_width", None) is not None:
+        return args.total_width - 1
     return max(trained_gamma, real_candidates(args) + max(args.probes))
 
 
@@ -151,9 +153,14 @@ def validate_args(args, gamma):
             "Untraced mode has no ordering hook; use replay-check or control"
         )
     v = real_candidates(args)
-    if v < 1 or not args.probes or any(p < 1 for p in args.probes):
-        raise ValueError("Need W >= 2 and positive probe lengths")
+    if v < 1 or not args.probes or any(p < 0 for p in args.probes):
+        raise ValueError("Need W >= 2 and nonnegative probe lengths")
     runtime_gamma = proposal_gamma(args, gamma)
+    if (
+        getattr(args, "mode", None) not in ("untraced", "full-control")
+        and v + max(args.probes) > runtime_gamma
+    ):
+        raise ValueError("Need W + max(P) <= G (--total-width includes anchor)")
     if len(set(args.probes)) != len(args.probes):
         raise ValueError("Duplicate probe lengths")
     if min(args.input_lengths) < 1 or len(set(args.input_lengths)) != len(
@@ -192,6 +199,42 @@ def validate_args(args, gamma):
             "--resident-units controls the separate per-request decode working set."
         )
     return v
+
+
+def resolve_runs(args, gamma):
+    """Validate every W before loading a model; share G, capacity and contexts."""
+    widths = getattr(args, "verify_widths", None) or [real_candidates(args) + 1]
+    if args.verify_widths is not None and args.mode in ("untraced", "full-control"):
+        raise ValueError("Native full-width modes do not support a fixed-W sweep")
+    if len(set(widths)) != len(widths) or any(w < 2 for w in widths):
+        raise ValueError("Verify widths must be unique integers >= 2")
+    if args.total_width < max(widths):
+        raise ValueError("--total-width must cover every real verify width")
+    runs = []
+    for width in widths:
+        values = vars(args) | {"verify_width": width, "verify_candidates": None}
+        if args.verify_widths is not None:
+            values["output"] = args.output / f"w{width}"
+        values["probes"] = (
+            args.probes
+            if args.probes is not None
+            else list(range(args.total_width - width + 1))
+        )
+        runs.append(argparse.Namespace(**values))
+    if args.resident_units is None:
+        capacity = max(resident_verify_width(run, gamma) for run in runs) * args.top_k
+        for run in runs:
+            run.resident_units = capacity
+    if args.context_length is None:
+        # Leave prefill/scratch and output headroom; 40K is also enough for the
+        # default G=12 exact workspace outside the persistent W=7 cache.
+        extra = max(8192, args.output_length + max(args.total_width, gamma + 1) + 512)
+        context = max(40960, (max(args.input_lengths) + extra + 255) // 256 * 256)
+        for run in runs:
+            run.context_length = context
+    for run in runs:
+        validate_args(run, gamma)
+    return runs
 
 
 def preflight(args):
@@ -590,7 +633,7 @@ def run_one(args, directory, config, command, prompts):
                 raise
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", default=TARGET)
     parser.add_argument("--draft", default=DRAFT)
@@ -609,12 +652,31 @@ def main():
         help="Real target verify rows including anchor (W); probes are appended",
     )
     widths.add_argument(
+        "--verify-widths",
+        type=int,
+        nargs="+",
+        help="Sweep fixed W values, with one paired server and report per W",
+    )
+    widths.add_argument(
         "--verify-candidates",
         type=int,
         help="Equivalent to W-1; retained for old experiment recipes",
     )
-    parser.add_argument("--probes", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6])
-    parser.add_argument("--input-lengths", type=int, nargs="+", default=[16384, 32768])
+    parser.add_argument(
+        "--total-width",
+        type=int,
+        default=12,
+        help="G: maximum target width including anchor; runtime DSPARK gamma is G-1",
+    )
+    parser.add_argument(
+        "--probes",
+        type=int,
+        nargs="+",
+        help="Default: all P from 0 through G-W for each W; proposal width stays fixed",
+    )
+    parser.add_argument(
+        "--input-lengths", type=int, nargs="+", default=[16384, 32768, 65536, 131072]
+    )
     parser.add_argument("--output-length", type=int, default=256)
     parser.add_argument("--requests", type=int, default=2)
     parser.add_argument(
@@ -676,7 +738,11 @@ def main():
         default=256,
         help="Offline admission cap in C4 units, not an online setting",
     )
-    parser.add_argument("--context-length", type=int, default=40960)
+    parser.add_argument(
+        "--context-length",
+        type=int,
+        help="Default: auto, with prefill/output headroom (139264 for 128K input)",
+    )
     parser.add_argument("--mem-fraction", type=float, default=0.9)
     parser.add_argument("--gpus", default="0,1,2,3")
     parser.add_argument(
@@ -699,17 +765,66 @@ def main():
         action="store_true",
         help="Smoke runs only: omit the full-G acceptance reference",
     )
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
     if args.require_cross_server_match and args.mode != "experiment":
         parser.error("--require-cross-server-match requires --mode experiment")
     gamma = checkpoint_gamma(args.draft)
     args.top_k = checkpoint_topk(args.target)
-    if args.resident_units is None:
-        args.resident_units = resident_verify_width(args, gamma) * args.top_k
+    runs = resolve_runs(args, gamma)
+    if args.execute and args.verify_widths is not None:
+        args.output.mkdir(parents=True, exist_ok=False)
+        write_json(
+            args.output / "sweep.json",
+            {
+                "total_width": args.total_width,
+                "input_lengths": args.input_lengths,
+                "checkpoint_gamma": gamma,
+                "timing_valid": False,
+                "runs": [
+                    {
+                        "verify_width": real_candidates(run) + 1,
+                        "probes": run.probes,
+                        "resident_units": run.resident_units,
+                        "context_length": run.context_length,
+                        "output": str(run.output.resolve()),
+                        "status": "pending",
+                    }
+                    for run in runs
+                ],
+            },
+        )
+
+    def update_status(run, status, error=None):
+        if args.execute and args.verify_widths is not None:
+            path = args.output / "sweep.json"
+            manifest = json.loads(path.read_text())
+            for entry in manifest["runs"]:
+                if entry["verify_width"] == real_candidates(run) + 1:
+                    entry["status"] = status
+                    if error is not None:
+                        entry["error"] = f"{type(error).__name__}: {error}"
+            write_json(path, manifest)
+
+    for run in runs:
+        update_status(run, "running")
+        try:
+            run_experiment(run, gamma)
+        except BaseException as error:
+            update_status(run, "failed", error)
+            raise
+        update_status(run, "completed")
+
+
+def run_experiment(args, gamma):
     v = validate_args(args, gamma)
     plan = mode_plan(args)
     print(
-        f"mode={args.mode}; checkpoint_G={gamma}, proposal_G={proposal_gamma(args, gamma)}, W={v+1}, P={args.probes}, index_topk={args.top_k}, resident_C4={args.resident_units}; B=1, TP=4; offline quality, graphs disabled"
+        f"mode={args.mode}; checkpoint_gamma={gamma}, G_total={proposal_gamma(args, gamma)+1}, proposal_gamma={proposal_gamma(args, gamma)}, W={v+1}, P={args.probes}, index_topk={args.top_k}, resident_C4={args.resident_units}, context={args.context_length}; B=1, TP=4; offline quality, graphs disabled"
     )
     for mode, mode_args in plan:
         print(f"{mode}: {shlex.join(server_command(mode_args, gamma))}")
@@ -738,6 +853,7 @@ def main():
             "gamma": gamma,
             "checkpoint_gamma": gamma,
             "proposal_gamma": proposal_gamma(args, gamma),
+            "total_width": proposal_gamma(args, gamma) + 1,
             "verify_width": v + 1,
             "max_target_width": v + 1 + max(args.probes),
             "verify_candidates": v,
@@ -754,6 +870,7 @@ def main():
             "verify_candidates": gamma if mode == "full-control" else v,
             "checkpoint_gamma": gamma,
             "proposal_gamma": proposal_gamma(mode_args, gamma),
+            "total_width": proposal_gamma(mode_args, gamma) + 1,
             "probe_workspace": "row-copy",
             "probes": args.probes if mode == "probes" else [],
             "shadows": mode in ("probes", "replay-check"),

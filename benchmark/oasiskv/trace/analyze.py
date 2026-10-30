@@ -26,6 +26,8 @@ GROUP = (
     "unit_tokens",
     "bytes_per_unit",
     "verify_candidates",
+    "verify_width",
+    "total_width",
     "accepted_drafts",
     "next_verify_candidates",
     "p",
@@ -126,7 +128,7 @@ def validate(record):
                     "miss_events must include every row, even zero-miss rows"
                 )
     else:
-        p = _integer(record, "p", 1)
+        p = _integer(record, "p")
         if record.get("mode") not in ("resident", "exact"):
             raise ValueError("probe mode must be resident or exact")
         _rows(record["topk"], p)
@@ -147,6 +149,8 @@ def validate(record):
             raise ValueError("resident probe must not cause synchronous history H2D")
         if record["mode"] == "resident" and d2d:
             raise ValueError("resident probe must not use the exact shadow workspace")
+        if p == 0 and (io or d2d):
+            raise ValueError("P=0 must have no probe IO")
 
 
 def _key(record):
@@ -219,6 +223,8 @@ def compare(source, following, probe, cap):
     row.update({field: source[field] for field in GROUP if field in source})
     row.update(
         next_verify_candidates=following["verify_candidates"],
+        verify_width=source["verify_candidates"] + 1,
+        total_width=source.get("total_width"),
         p=probe["p"],
         mode=probe["mode"],
         prediction_units=len(prediction),
@@ -325,6 +331,7 @@ def analyze(records, cap):
         "prefetch_cap_units": cap,
         "candidate_policy": "probe-frequency; ties-by-logical-ID; dedup; committed-history; subtract-residency; cap",
         "measurement": "offline prediction potential; no eviction or asynchronous timing simulation",
+        "p0_policy": "no appended query; empty prediction/candidate set; zero additional IO; resident KV is not counted as new prefetch",
         "validation": {"scope": "not_audited", "passed": None},
         "baseline_records": len(windows),
         "probe_records": len(probes),

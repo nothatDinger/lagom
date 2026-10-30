@@ -243,6 +243,12 @@ def audit_within_server(directory):
                 raise ValueError(
                     "Probe proposal/workspace policy differs from configuration"
                 )
+            if record["p"] == 0 and (
+                record["topk"] != []
+                or record["probe_demand_h2d_bytes"] != 0
+                or record.get("probe_workspace_d2d_bytes", 0) != 0
+            ):
+                raise ValueError("P=0 must have empty predictions and no probe IO")
             key = tuple(
                 record[x]
                 for x in (
@@ -286,6 +292,7 @@ def audit_within_server(directory):
         "probe_lengths": config["probes"],
         "checkpoint_gamma": config.get("checkpoint_gamma"),
         "proposal_gamma": config.get("proposal_gamma"),
+        "total_width": config.get("total_width"),
         "probe_workspace": config.get("probe_workspace", "none"),
         "resident_units": runtime.get("device_buffer_size"),
         "trace_sha256": file_digest(directory / "trace.jsonl.gz"),

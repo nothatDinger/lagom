@@ -12,39 +12,42 @@
 | DSPARK | `/mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-DSpark` |
 | GPU | 4 × H100，TP=4，纯 TP，单机 |
 | 数据 | `/home/jovyan/td69032/ShareGPT_V3_unfiltered_cleaned_split.json` |
-| 输入 | 16384 / 32768 token，沿用性能 harness 的 ShareGPT 拼接规则 |
-| 首轮范围 | B=1，greedy，真实验证 W=6（anchor＋V=5 候选），无 grammar/logprob |
-| Probe | P=1～6；shadow 总宽度 W+P=7～12 |
-| DSPARK proposal | checkpoint G 单独记录；运行时生成 max(G, V+max(P)) 个候选，G=5 时扩至 11 |
+| 输入 | 16384 / 32768 / 65536 / 131072 token，沿用 ShareGPT 拼接规则 |
+| 验证范围 | B=1，greedy，W 固定为 6 或 7（含 anchor），无 grammar/logprob |
+| 总宽度 G | 默认 12，等于服务端 `speculative_num_draft_tokens`，包含 anchor |
+| Probe | W=6：P=0～6；W=7：P=0～5；始终满足 W+P≤G |
+| DSPARK proposal | `checkpoint_gamma` 单独记录；运行时 `proposal_gamma=G−1=11` 个候选 |
 | 输出 / 采集窗口 | 每请求 256 输出 token；只记录前 32 个验证窗口 |
-| KV | 原生 V4 + HiSparse；Top-K 读取 target 的 `index_topk`；paired 默认常驻 `W×index_topk=3072` |
+| KV | 原生 V4 + HiSparse；Top-K 读取 target 的 `index_topk`；W=6/7 联合扫描统一常驻 `7×512=3584` |
 | 路由专家 | 显式 `--moe-runner-backend flashinfer_mxfp4`；H100 使用 CUTLASS W4A16，保持 checkpoint MXFP4 存储 |
 | 全局 C4 池 | `host_to_device_ratio=1`，容纳完整 prefill；不改变每请求 decode 的 `resident_units` |
 
-**验证状态：GPU 测试方已报告旧 W=3、P=1/2/3 的 4K paired smoke 通过，但全驻留、没有 miss。此次 W=6、P=1～6 和 exact 临时 KV 副本已补 CPU 回归，尚待 GPU 验证。** 独立服务仍可能产生不同 proposal/Top-K，因此质量审计使用同服务、同 proposal、同快照的基线。需要使用已能运行该仓库 V4/DSPARK 的 CUDA、FlashMLA、DeepGEMM 等环境；脚本不自动安装或下载模型依赖。
+**验证状态：测试方已反馈上一轮修复后正常运行。本次新增固定 G、W=6/7、P=0 及 64K/128K 配置的 CPU 回归；新矩阵尚待 GPU 实测。** 独立服务仍可能产生不同 proposal/Top-K，因此质量审计使用同服务、同 proposal、同快照的基线。需要使用已能运行该仓库 V4/DSPARK 的 CUDA、FlashMLA、DeepGEMM 等环境；脚本不自动安装或下载模型依赖。
 
-## W=6、P=1～6 的口径
+## G、W、P 的口径
 
-这里 W **包含 anchor**：真实接受流程只验证 5 个候选，最多提交 6 个 token。
-P 是额外 probe，不是 W 的一部分；P=6 时 target shadow 一次计算 12 行。
+这里 G 和 W **都包含 anchor**。W=6 验证 5 个候选、最多提交 6 个 token；W=7 验证 6 个候选、最多提交 7 个 token。
+P 是额外 probe，不是 W 的一部分。G=12 时，W=6/P=6 与 W=7/P=5 的 target shadow 都计算 12 行。
 默认同时传入 `--speculative-dspark-block-size 11 --speculative-num-draft-tokens 12`，
 为 DSPARK 生成 11 个候选并预留相应事务 scratch；两个参数必须匹配，单独设置后者会被 CLI 的 checkpoint 宽度校验拒绝。
-trace 的 compact verify 把真实窗口限制为 6 行，额外候选不会被接受。
+trace 的 compact verify 把真实窗口限制为 W 行，额外候选不会被接受。
+`--total-width 12` 固定 proposal 宽度；即使只测试 `--probes 0` 或 `--probes 1 2 3 4`，服务端也仍是 12，不能因最大 P 较小而自动缩为 10。
 
-对于原生 G=5 的 checkpoint，这属于**扩大运行时 proposal 长度的离线实验**，没有修改或重训 checkpoint。
+对于原生 `checkpoint_gamma=5` 的 checkpoint，这属于**扩大运行时 proposal 长度的离线实验**，没有修改或重训 checkpoint。
 draft 的 forward/Markov sampler 支持该宽度；离线固定窗口不调用按训练宽度校准的 confidence planner。
-更宽的 draft forward 也可能改变前 5 个候选，所以“真实验证宽度等于普通 DSPARK 的 6”不等于“proposal 或接受率等于原生 G=5”。
-每步只生成一次宽 proposal，不同 P 共用它的前缀；不要把不同最大 P（从而不同运行时 proposal 长度）的独立运行混为一条曲线。
-`manifest.json`、`runtime.json`、trace 和分析报告分别记录 `checkpoint_gamma`、`proposal_gamma`、`probe_workspace`。
+更宽的 draft forward 也可能改变前 5 个候选，所以“真实验证宽度等于普通 DSPARK 的 6”不等于“proposal 或接受率等于原生 5 候选”。
+每步只生成一次宽 proposal，不同 P 共用它的前缀；不要混合不同 G 的运行。W 的改变也会改变接受轨迹，每个 W 单独做同快照审计，不要求跨 W 窗口逐字段相同。
+`manifest.json`、`runtime.json` 和 trace 记录 `total_width`、`checkpoint_gamma`、`proposal_gamma`、`probe_workspace`；分析 CSV 显式列出 `verify_width` 和 `total_width`。
 
-**常驻容量保持 3072，而非随 12 行升至 6144。** 真实 W=6 仍满足普通的 W×K 容量下界。
+**W=6/7 联合扫描统一使用 3584 常驻槽，而非随 G=12 升至 6144。** W=7 的安全下界为 7×512；统一容量便于对比 W。
+单独 W=6 默认仍为 3072，可显式设置 3584 与扫描矩阵对齐。此前 3072 的结果不能与本轮 3584 的结果视为同配置。
 exact shadow 的每行完成原生补载后，把该行选中的历史 KV 复制到临时 C4 位置，attention 读取这些副本，
 防止后面行换入时覆盖前面行仍要读取的历史 KV。当前窗口新生成的 KV 继续由事务 scratch 处理。
 临时位置来自全局 C4 池的空闲页，在 prefill 完成后、每次 exact shadow 开始时借用，forward 完成后归还并恢复 free-list 顺序。
 每个 TP rank 最大借用 12×512=6144 个位置，在全部 C4 层对应独立数据；不会加入常驻表，也不保留到下一真实窗口。
 全局池不够时会明确报错；应增大全局池/`--context-length`，不要扩大 `--resident-units` 来掩盖缺口。
 
-resident shadow 仍只给前 6 行补载，probe 历史 miss 不补载、不使用副本。
+resident shadow 只给前 W 行补载，probe 历史 miss 不补载、不使用副本。
 新增 `probe_workspace_d2d_bytes` 单独统计 exact 全部行（含真实前缀）的临时复制量，不计入 H2D miss、候选命中或真实常驻容量。
 这仅用于离线质量采集，不代表线上采用双缓冲，也不能据其耗时推导性能。
 
@@ -58,25 +61,36 @@ git switch --track origin/exp/oasiskv-trace
 export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
 
 # 只读 checkpoint 配置并打印命令；不加载模型、不运行 GPU。
-python benchmark/oasiskv/trace/run.py --output /srv/oasiskv/trace-plan
+python benchmark/oasiskv/trace/run.py --mode paired --total-width 12 \
+  --verify-widths 6 7 --output /srv/oasiskv/trace-plan
 
 # 首先验证模型入口、快照恢复和接受边界。4K可以没有miss，不作为覆盖率曲线。
 python benchmark/oasiskv/trace/run.py --mode paired \
   --topk-order logical-all \
-  --verify-width 6 --probes 1 2 3 4 5 6 --resident-units 3072 \
-  --output /srv/oasiskv/trace-w6-p6-smoke \
+  --total-width 12 --verify-widths 6 7 --resident-units 3584 \
+  --output /srv/oasiskv/trace-g12-w6-w7-smoke \
   --input-lengths 4096 --output-length 32 \
   --requests 1 --max-windows 3 \
   --diagnostics --request-timeout 1800 --execute
 
-# Smoke 成功后，再跑 16K / 32K。
+# 正式矩阵：4 个输入长度 × 2 个 W；各 W 的 P 自动取 0..G-W。
 python benchmark/oasiskv/trace/run.py --mode paired \
   --topk-order logical-all \
-  --verify-width 6 --probes 1 2 3 4 5 6 --resident-units 3072 \
-  --output /srv/oasiskv/trace-v4-16k-32k --execute
+  --total-width 12 --verify-widths 6 7 --resident-units 3584 \
+  --input-lengths 16384 32768 65536 131072 \
+  --output /srv/oasiskv/trace-g12-w6-w7-16k-128k --execute
 ```
 
-已有本地实验分支时使用 `git switch exp/oasiskv-trace`。输出目录必须不存在，以防混合旧 trace。默认使用 GPU `0,1,2,3`；可通过 `--gpus` 修改。推荐 `--mode paired`：只启动一个 probes 服务，基线来自该服务每个窗口的同快照对照。`--mode experiment` 仍顺序启动独立的 control/probes/full-control 服务，各自重新加载模型，共用 `prompts.npy`；它增加跨服务复现性和完整 G 接受长度参考。请求串行执行。
+输出根目录的 `sweep.json` 列出各 W 的解析参数和完成状态；`w6/`、`w7/` 各有独立 manifest、paired trace、audit 和 analysis。
+`--mode paired --verify-widths 6 7` 顺序启动两个服务，每个 W 一个，各自串行处理全部四档输入；P 扫描在同一 proposal/快照内完成，不为每个 P 重启服务。
+四档输入由同一最长 ShareGPT prompt 取前缀，W 两组使用相同 seed/数据和输入长度集合；`prompts_sha256` 可核对输入一致。
+
+128K 输入默认把 `--context-length` 与 `--max-total-tokens` 设为 **139264**，给输出、C4 scratch 和 prefill 页留余量；
+16K/32K 单独运行仍至少用 40960，64K 单独运行默认 73728。显式覆盖 context 时仍会检查容量，不能沿用 40960 跑 64K/128K。
+全局 C4 池仍保持 `host_to_device_ratio=1`，每请求 decode 常驻仍为 3584，不随输入长度增长。
+`--snapshot-gib` 仍是 32 GiB/rank 的上限，不是预留量；长上下文的实际占用查看 `snapshot-inventory.json`，超限会报出所需大小，不会自动放宽主机内存预算。
+
+已有本地实验分支时使用 `git switch exp/oasiskv-trace`。输出目录必须不存在，以防混合旧 trace。默认使用 GPU `0,1,2,3`；可通过 `--gpus` 修改。推荐 `--mode paired`：只启动一个 probes 服务，基线来自该服务每个窗口的同快照对照。`--mode experiment` 仍顺序启动独立的 control/probes/full-control 服务，各自重新加载模型，共用 `prompts.npy`；它增加跨服务复现性和checkpoint 原生接受长度参考。请求串行执行。
 `--port` 为基准端口：experiment 的三组分别使用 base、base+1、base+2；单独运行一个模式使用 base。
 启动前用 `SO_REUSEADDR` 的 bind/listen 检查端口，与服务端语义一致，避免把旧连接的 TIME_WAIT 误报为活跃 listener。
 已有活跃 listener 仍报错；预检查不持有服务 socket，不能防止其他作业恰在启动之间抢占端口，也不会清理其他作业。
@@ -157,7 +171,7 @@ client请求超时和scheduler watchdog分别设置，默认后者600秒；长�
 且DSPARK scratch还占用其中部分。32K prompt需要8192个C4单元，当前HiSparse在最后一个prefill chunk后才卸载历史，
 所以减小chunk不能解决这一容量问题。脚本现在默认比例1，并在计划阶段拒绝明显装不下的组合。
 这只扩大prefill可用的全局物理池，**每请求decode驻留仍按 `resident_units` 裁剪**；
-G=5、K=512时仍为3072，不会因为全局池扩大而让16K/32K历史全部常驻。
+旧配置 W=6、K=512 时仍为3072；本轮 W=6/7 扫描为3584，不会因为全局池扩大而让16K/32K历史全部常驻。
 
 MXFP4方面，脚本显式选 `flashinfer_mxfp4` 并设置 `SGLANG_DSV4_FP4_DEQUANT=0`。
 CUDA上 packed MXFP4 不再静默落到普通FP8 MoE；不支持的runner（包括原来的auto回退）会提前报出可用选择。
@@ -304,9 +318,10 @@ PYTHONPATH=python python -m pytest -q \
 4K真实历史应约为1024个C4单元，16K约4096、32K约8192。
 4K小于3072驻留容量，miss分母为0是合理的；只有16K/32K正式样本才用于研究预取覆盖率随P的变化。
 
-`G` 从 DSPARK checkpoint 的配置中读取；当前默认 W=6、P=[1,2,3,4,5,6]，运行时 proposal gamma 为 `max(G, W−1+max(P))`。
+当前 `--total-width G` 默认 12，包含 anchor，独立于 checkpoint 原生候选数；运行时 proposal gamma 为 G−1。
+未显式传 `--probes` 时自动扫描 0..G−W，所有 P 共用固定 proposal 宽度。
 旧的 `--verify-candidates V` 参数仍可用，等价于 `--verify-width V+1`。control 与 probes 使用相同运行时 proposal gamma 和 W。
-untraced/full-control 使用 checkpoint 原生 G；前者不做采集，后者用于提供原生接受长度参考。
+untraced/full-control 使用 checkpoint 原生候选数；前者不做采集，后者用于提供原生接受长度参考，不属于本轮 paired 矩阵。
 
 Top-K 使用模型原生设置，不用通用 Qwen 实验的 2048 代替 V4 的 indexer 配置。
 paired 默认容量是 `W×index_topk`。若 experiment 还包含比 W 更宽的原生 full-control，则共同容量也必须满足原生宽度下界；
@@ -377,12 +392,15 @@ PYTHONPATH=python python -m pytest -q test/registered/kernels/ops/kvcache/test_h
 `--mode experiment` 额外启动独立 control/full-control，它们提供复现性与接受长度参考，不作为下一真实窗口 ground truth 的来源。
 
 1. **control，P=0**：固定 V 的普通 DSPARK 接受流程，无 probe，无预测预取。
-2. **probes**：同一个固定 V 基线轨迹，每个采集窗口执行 P=1～6 的 exact、resident 影子 forward；这些 forward 不进入接受流程、不提交 KV，也不执行后台预取。最后恢复并重放原来的 V 窗口，走普通 DSPARK 接受流程。
-3. **full-control**：用 checkpoint 原生 G 生成并验证完整候选，无 probe。用于观察扩大 proposal 长度/限制真实 V 后接受长度的变化，不强行逐窗口配对。Smoke 可以省略这一组。
+2. **probes**：同一个固定 V 基线轨迹，每个采集窗口执行 P=1..G−W 的 exact、resident 影子 forward；P=0 复用同快照基线，不额外 forward。这些 probe 不进入接受流程、不提交 KV，也不执行后台预取。最后恢复并重放原来的 V 窗口，走普通 DSPARK 接受流程。
+3. **full-control**：用 checkpoint 原生候选数生成并验证完整候选，无 probe。用于观察扩大 proposal 长度/限制真实 V 后接受长度的变化，不强行逐窗口配对。Smoke 可以省略这一组。
 
 每个 shadow 仍在**一次 target forward** 中计算 `[anchor, V 个验证候选, P 个 probe]`，让 probe 的 hidden state 经过所有 target 层。离线实验为做对照而多次重放；这不代表未来线上实现必须额外启动这些 forward。
 
 P=0 没有新的预测集合。验证行自己的 Top-K 已经为本轮 attention 获取，不能把它重新统计成下一轮新增预取。
+P=0 会记录 exact/resident 两条相同的零 probe 基线，Top-K 行列表为空、额外 H2D/D2D 均为 0；不会因此多跑两次 target forward。
+存在分母时，预测集合覆盖率和潜在 miss 覆盖率均为 0；分母为空时仍为 null，candidate_precision 因没有候选而为 null。
+这不是“GPU 没有任何 KV”，也不是总驻留集合的覆盖率，不能与 `history_coverage` 的预测集合口径混用。
 
 ## exact / resident 的具体语义
 
@@ -460,7 +478,9 @@ trace 的 `layer` 是 C4 层序号；`runtime.json` 给出到原模型层号的�
 
 没有用 kernel 调用次数代替搬运量；实际 miss 来自 swap kernel 输出的 `miss_src/miss_count`，再映射回逻辑 C4 ID。
 
-16K 原始输入约对应 4096 C4 单元；若解析得到的容量是 4096，此组最初可能几乎没有 miss。若分母为零，指标输出 null，不伪造 100% 覆盖率，32K 组更有区分度。若 checkpoint 的 G 或 K 更大，安全容量可能覆盖这两档全部历史，报告会如实反映没有预取空间；需要另选更长输入研究容量压力。若调整容量，控制组和影子组必须一起重跑。
+16K/32K/64K/128K 原始输入分别约对应 4096/8192/16384/32768 个 C4 单元，本轮共同常驻容量为3584。
+历史超过容量不保证每个窗口都有 miss；若分母为零，指标输出 null，不伪造 100% 覆盖率。
+若另外扩大 W 或 K，常驻安全下界也会上升；若调整容量，基线和影子组必须一起重跑并区分配置。
 
 无需重跑模型即可扫描不同候选预算，例如：
 
@@ -490,6 +510,7 @@ PYTHONPATH=python SGLANG_USE_CPU_ENGINE=0 python -m pytest -q \
   test/registered/unit/spec/test_oasiskv_trace.py \
   test/registered/unit/spec/test_oasiskv_trace_startup.py \
   test/registered/unit/spec/test_oasiskv_trace_workspace.py \
+  test/registered/unit/spec/test_oasiskv_trace_sweep.py \
   test/registered/unit/managers/test_prefill_adder.py \
   test/registered/unit/layers/quantization/test_fp4_moe_routing.py
 ```

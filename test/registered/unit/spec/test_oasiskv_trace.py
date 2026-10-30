@@ -681,7 +681,7 @@ def test_finish_rejects_acceptance_that_disagrees_with_pre_shadow_control(tmp_pa
     assert not (tmp_path / "paired-baseline.jsonl.gz").exists()
 
 
-@pytest.mark.parametrize("v", [1, 2, 3, 5])
+@pytest.mark.parametrize("v", [1, 2, 3, 5, 6])
 def test_native_acceptance_cannot_accept_the_reserved_suffix(v):
     # Even when *every* candidate matches, only V may be accepted. The bonus
     # must come from target row V, not a later probe row or a zero-padded row.
@@ -709,6 +709,8 @@ def test_native_acceptance_cannot_accept_the_reserved_suffix(v):
         "same_argmax_logits",
         "changed_hidden",
         "replay_check",
+        "p0",
+        "p0_only",
     ],
 )
 @pytest.mark.parametrize("fail_shadow", [False, True])
@@ -741,6 +743,10 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
     trace.v, trace.probes, trace.shadows, trace.max_windows = 1, [1, 2], True, 3
     if variant == "replay_check":
         trace.probes = []
+    elif variant == "p0":
+        trace.probes = [0, 1, 2]
+    elif variant == "p0_only":
+        trace.probes = [0]
     trace.config = {"snapshot_gib": 0.01, "run_id": "test"}
     trace.coordinator, trace.writer, trace.windows = c, tmp_path / "trace.jsonl.gz", {}
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
@@ -779,7 +785,7 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
             hidden.add_(1)
         return NS(logits_output=NS(next_token_logits=logits)), hidden
 
-    trace.worker = NS(device="cpu", _verify_executor=NS(run_compact=forward))
+    trace.worker = NS(gamma=3, device="cpu", _verify_executor=NS(run_compact=forward))
     batch = NS(
         reqs=[NS(rid="r", origin_input_ids=list(range(40)))],
         has_grammar=False,
@@ -793,7 +799,7 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
         "draft_tokens": torch.tensor([[21, 22, 23]]),
         "sampling_info": None,
     }
-    if fail_shadow and variant != "replay_check":
+    if fail_shadow and variant not in ("replay_check", "p0_only"):
         with pytest.raises(RuntimeError, match="shadow failed inside target"):
             trace.run(**kwargs)
         assert state.item() == 0
@@ -835,8 +841,19 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
         trace.run(**kwargs)
         assert state.item() == 1  # Only the final baseline forward survives.
         assert c.req_device_buffer_tokens.tolist() == [[[0, 1, 2, 3, -1, -1]]]
-        assert calls == ([2, 2] if variant == "replay_check" else [2, 3, 3, 4, 4, 2])
-        assert len(trace.pending) == (1 if variant == "replay_check" else 5)
+        assert calls == (
+            [2, 2] if variant in ("replay_check", "p0_only") else [2, 3, 3, 4, 4, 2]
+        )
+        assert len(trace.pending) == 1 + 2 * len(trace.probes)
+        for record in trace.pending:
+            if record.get("p") == 0:
+                assert record["topk"] == []
+                assert record["input_ids"] == [20, 21]
+                assert (
+                    record["probe_demand_h2d_bytes"]
+                    == record["probe_workspace_d2d_bytes"]
+                    == 0
+                )
         assert all(
             r["probe_demand_h2d_bytes"] == 0
             for r in trace.pending
@@ -858,7 +875,7 @@ def test_whole_shadow_loop_restores_target_state_and_never_commits(
                 json.dumps(
                     {
                         "shadows": True,
-                        "probes": [1, 2],
+                        "probes": trace.probes,
                         "verify_candidates": 1,
                     }
                 )
