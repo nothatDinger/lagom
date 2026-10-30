@@ -3,7 +3,9 @@
 import importlib.util
 import json
 import sqlite3
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -173,6 +175,86 @@ def test_disabled_trace_does_not_access_cuda_or_change_result(monkeypatch):
     assert lagom_perf.prefetch_slot(1) is None
 
 
+@pytest.mark.parametrize("cpu_lengths", [False, True])
+def test_verify_step_snapshots_optional_cpu_lengths_without_host_wait(
+    monkeypatch, tmp_path, cpu_lengths
+):
+    import torch
+
+    ready = False
+
+    class DeviceValues:
+        def __init__(self, values):
+            self.values = list(values)
+            self.clones = 0
+
+        def detach(self):
+            return self
+
+        def clone(self):
+            self.clones += 1
+            return DeviceValues(self.values)
+
+        def cpu(self):
+            assert ready, "trace must not read device values before completion"
+            return self
+
+        def tolist(self):
+            assert ready, "trace must not implicitly synchronize for metadata"
+            return list(self.values)
+
+    trace = object.__new__(lagom_perf.StepTrace)
+    trace.written, trace.nsys, trace.nsys_running = False, False, False
+    trace.seen, trace.skip, trace.steps, trace.active = 0, 1, 2, -1
+    trace.output, trace.device = tmp_path, 0
+    trace.records, trace.cpu, trace.events = [], [], []
+    trace.accepted, trace.prefix_lens_gpu = {}, {}
+    trace.slot = torch.tensor([-1])
+    trace.stamps = torch.tensor([[[100, 200], [300, 400]]])
+    trace.names = {("step", None): 0}
+    event = Mock(query=lambda: ready)
+    trace.torch = SimpleNamespace(cuda=SimpleNamespace(Event=lambda: event))
+    # Exercise the real decorator/begin/finish/export; only CUDA timers are mocked.
+    trace.region = lambda *_: nullcontext()
+    monkeypatch.setattr(lagom_perf, "get_trace", lambda: trace)
+    batch = SimpleNamespace(
+        seq_lens=DeviceValues([32000]),
+        seq_lens_cpu=torch.tensor([32000]) if cpu_lengths else None,
+        reqs=[SimpleNamespace(rid="baseline")],
+        forward_iter=0,
+        forward_mode=SimpleNamespace(is_idle=lambda: False),
+    )
+    result = SimpleNamespace(can_run_cuda_graph=True, accept_lens=DeviceValues([1]))
+
+    @lagom_perf.verify_step
+    def decode(self, batch):
+        lagom_perf.note_draft_graph(True)
+        batch.seq_lens.values[0] += 1
+        if batch.seq_lens_cpu is not None:
+            batch.seq_lens_cpu.add_(1)
+        return result
+
+    # One skipped step, two recorded steps, then an unrecorded step while the
+    # completion event is still pending. Batch storage is reused every time.
+    for iteration in range(4):
+        batch.forward_iter = iteration
+        assert decode(None, batch) is result
+    assert not trace.written and not list(tmp_path.iterdir())
+    assert len(trace.records) == 2 and trace.active == -1
+    assert batch.seq_lens.clones == (0 if cpu_lengths else 2)
+    assert (batch.seq_lens_cpu is None) == (not cpu_lengths)
+    ready = True
+    trace.poll()
+    report = next(
+        p for p in tmp_path.glob("rank-*.json") if not p.name.endswith(".trace.json")
+    )
+    records = json.loads(report.read_text())["records"]
+    assert [r["prefix_lens"] for r in records] == [[32001], [32002]]
+    assert [r["forward_iter"] for r in records] == [1, 2]
+    assert all(r["cuda_graph"] and r["draft_cuda_graph"] for r in records)
+    assert all(r["accepted_tokens"] == [1] for r in records)
+
+
 def test_nsys_idle_is_conservative_union_across_devices(tmp_path):
     path = tmp_path / "nsys.sqlite"
     with sqlite3.connect(path) as db:
@@ -210,7 +292,14 @@ def test_export_waits_for_transfer_completion_and_writes_valid_tracks(tmp_path):
     trace.events = [Mock(query=Mock(side_effect=[False, True]))]
     trace.stamps = torch.tensor([[[100, 200]], [[120, 220]]])
     trace.names = {("step", None): 0, ("target.kv_prefetch", 2): 1}
-    trace.records = [{"step": 0, "cuda_graph": True, "draft_cuda_graph": True}]
+    trace.records = [
+        {
+            "step": 0,
+            "cuda_graph": True,
+            "draft_cuda_graph": True,
+            "prefix_lens": [32000],
+        }
+    ]
     trace.accepted = {0: torch.tensor([2])}
     trace.output, trace.device, trace.steps = tmp_path, 0, 1
     trace.cpu = [
@@ -238,6 +327,17 @@ def test_timestamp_ring_survives_independent_graph_replays(tmp_path):
         pytest.skip("requires CUDA Graph and globaltimer")
     trace = lagom_perf.StepTrace({"output_dir": str(tmp_path), "steps": 2, "skip": 0})
     side = torch.cuda.Stream()
+    trace.streams = [side]
+    batch = SimpleNamespace(
+        seq_lens=torch.tensor([32000], device="cuda"),
+        seq_lens_cpu=None,
+        reqs=[SimpleNamespace(rid="baseline")],
+        forward_iter=0,
+    )
+    result = SimpleNamespace(
+        can_run_cuda_graph=True,
+        accept_lens=torch.ones(1, dtype=torch.int32, device="cuda"),
+    )
     side_slot = torch.full_like(trace.slot, -1)
     ready = torch.cuda.Event(external=True)
     done = torch.cuda.Event(external=True)
@@ -266,13 +366,24 @@ def test_timestamp_ring_survives_independent_graph_replays(tmp_path):
     with torch.cuda.graph(side_graph, stream=side):
         prefetch()
     for step in (0, 1):
-        trace.slot.fill_(step)
+        batch.forward_iter = step
+        trace.begin(batch)
         main_graph.replay()
         with torch.cuda.stream(side):
             side_graph.replay()
+        batch.seq_lens.add_(1)
+        trace.finish(result)
     torch.cuda.synchronize()
     values = trace.stamps.cpu()
     for index in trace.names.values():
         assert (values[index, :, 0] > 0).all()
         assert (values[index, :, 1] >= values[index, :, 0]).all()
         assert values[index, 1, 0] >= values[index, 0, 1]
+    trace.poll()
+    report = next(
+        p for p in tmp_path.glob("rank-*.json") if not p.name.endswith(".trace.json")
+    )
+    assert [r["prefix_lens"] for r in json.loads(report.read_text())["records"]] == [
+        [32000],
+        [32001],
+    ]

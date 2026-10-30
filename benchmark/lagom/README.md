@@ -132,6 +132,10 @@ GPU 标记在 graph 内使用 `%globaltimer` 写固定的 `[region,step,edge]` �
 不为读取时间戳增加逐 step synchronize；结束后等待事件 query 完成才导出。
 标记 kernel 会扰动运行，所以 **详细 trace 不能用于报告无插桩吞吐**。
 
+`prefix_lens` 记录每轮 forward 开始前的实际序列长度。纯 DSPARK 的
+`seq_lens_cpu` 可以为空，此时在 GPU 上保留长度快照，采样结束且完成事件就绪后
+才读取到 CPU 并导出；不会在采样轮内为此增加 D2H 同步。
+
 | 字段/区间 | 含义 |
 |---|---|
 | `step_ms` | draft、verify、accept/commit/inject 的主流总跨度，包含其间的等待和 GPU 空洞 |

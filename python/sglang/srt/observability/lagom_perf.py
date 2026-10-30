@@ -165,7 +165,7 @@ class StepTrace:
             (self.MAX_REGIONS, self.steps, 2), dtype=torch.int64, device="cuda"
         )
         self.names, self.side_slots, self.records, self.cpu = {}, {}, [], []
-        self.accepted, self.events = {}, []
+        self.accepted, self.prefix_lens_gpu, self.events = {}, {}, []
         self.role, self.seen, self.active, self.written = "target", 0, -1, False
         # Compile before graph capture. No synchronization is added to a
         # recorded verify step; collection happens after the bounded window.
@@ -230,13 +230,23 @@ class StepTrace:
             self.torch.cuda.cudart().cudaProfilerStart()
             self.nsys_running = True
         if self.active >= 0:
+            prefix_lens_cpu = batch.seq_lens_cpu
+            if prefix_lens_cpu is None:
+                # Plain DSPARK can keep lengths only on device. Preserve the
+                # pre-forward values before the batch reuses/mutates them, but
+                # defer D2H until the sampled window's completion events fire.
+                self.prefix_lens_gpu[self.active] = batch.seq_lens.detach().clone()
             self.records.append(
                 {
                     "step": self.active,
                     "forward_iter": int(batch.forward_iter),
                     "batch_size": len(batch.reqs),
                     "request_ids": [r.rid for r in batch.reqs],
-                    "prefix_lens": batch.seq_lens_cpu.tolist(),
+                    "prefix_lens": (
+                        prefix_lens_cpu.tolist()
+                        if prefix_lens_cpu is not None
+                        else None
+                    ),
                 }
             )
 
@@ -278,6 +288,10 @@ class StepTrace:
                         }
                     )
         for record in self.records:
+            if record["prefix_lens"] is None:
+                record["prefix_lens"] = (
+                    self.prefix_lens_gpu[record["step"]].cpu().tolist()
+                )
             record["accepted_tokens"] = self.accepted[record["step"]].cpu().tolist()
         self.written = True
         pid = os.getpid()
