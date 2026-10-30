@@ -22,7 +22,7 @@
 | 路由专家 | 显式 `--moe-runner-backend flashinfer_mxfp4`；H100 使用 CUTLASS W4A16，保持 checkpoint MXFP4 存储 |
 | 全局 C4 池 | `host_to_device_ratio=1`，容纳完整 prefill；不改变每请求 decode 的 `resident_units` |
 
-**验证状态：测试方已反馈上一轮修复后正常运行。本次新增固定 G、W=6/7、P=0 及 64K/128K 配置的 CPU 回归；新矩阵尚待 GPU 实测。** 独立服务仍可能产生不同 proposal/Top-K，因此质量审计使用同服务、同 proposal、同快照的基线。需要使用已能运行该仓库 V4/DSPARK 的 CUDA、FlashMLA、DeepGEMM 等环境；脚本不自动安装或下载模型依赖。
+**验证状态：测试方反馈上一轮缩小至 G=10 后可运行，但固定 G=12 的矩阵曾被 C4 compressor ring 的启动检查拒绝。本轮已补齐按最大宽度扩容的实现及实际内存池配置/分配的 CPU 回归；G=12 的 GPU 启动与矩阵仍待实测。** 独立服务仍可能产生不同 proposal/Top-K，因此质量审计使用同服务、同 proposal、同快照的基线。需要使用已能运行该仓库 V4/DSPARK 的 CUDA、FlashMLA、DeepGEMM 等环境；脚本不自动安装或下载模型依赖。
 
 ## G、W、P 的口径
 
@@ -32,6 +32,24 @@ P 是额外 probe，不是 W 的一部分。G=12 时，W=6/P=6 与 W=7/P=5 的 t
 为 DSPARK 生成 11 个候选并预留相应事务 scratch；两个参数必须匹配，单独设置后者会被 CLI 的 checkpoint 宽度校验拒绝。
 trace 的 compact verify 把真实窗口限制为 W 行，额外候选不会被接受。
 `--total-width 12` 固定 proposal 宽度；即使只测试 `--probes 0` 或 `--probes 1 2 3 4`，服务端也仍是 12，不能因最大 P 较小而自动缩为 10。
+
+**Compressor 状态环随服务最大推测宽度分配。** 旧 C4 ring=16 的安全上限为 `16−8+2=10` 行，不能支持 G=12。
+现在 G=12 选择 ring=32（安全上限 26），同时用于内存预算、attention/indexer 的原始压缩状态池和读写计划；
+ring 必须整除 SWA page=256，因此不直接使用最小的 18。C128 ring 仍为 256，G≤10 的 C4 ring 仍为 16。
+构造池后固定 stride，避免后续缩短 verify 宽度改变寻址。启动容量检查保留，超过页内可支持的宽度仍报错。
+这会增加 C4 compressor 的状态显存预算，**不增加 HiSparse 的 3584 个压缩 KV 驻留槽**，也不改变 W/P 或接受规则。
+日志应出现 `max_draft_tokens=12, c4_ring_size=32, c128_ring_size=256`；
+`runtime.json` 的 `hisparse_runtime.compress_state_ring_sizes` 应为 `{"4": 32, "128": 256}`。
+
+加载模型前可先验证配置到真实状态池的 CPU 链路，再在 GPU 上验证原生 planner 的十二行写入与回滚历史保护：
+
+```bash
+PYTHONPATH=python SGLANG_USE_CPU_ENGINE=0 python -m pytest -q \
+  test/registered/unit/spec/test_oasiskv_trace_pool_capacity.py \
+  test/registered/unit/mem_cache/test_dsv4_compress_write_pad.py
+PYTHONPATH=python python -m pytest -q \
+  test/registered/kernels/ops/attention/test_deepseek_v4_compress_plan_draft_pad.py
+```
 
 对于原生 `checkpoint_gamma=5` 的 checkpoint，这属于**扩大运行时 proposal 长度的离线实验**，没有修改或重训 checkpoint。
 draft 的 forward/Markov sampler 支持该宽度；离线固定窗口不调用按训练宽度校准的 confidence planner。

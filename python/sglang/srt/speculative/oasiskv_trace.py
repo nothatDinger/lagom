@@ -17,6 +17,7 @@ from itertools import zip_longest
 from pathlib import Path
 
 import torch
+
 from sglang.srt.speculative.oasiskv_trace_diagnostics import log_progress
 
 
@@ -51,6 +52,11 @@ def validate_trace_hisparse(runner):
         "full_pool_tokens": getattr(allocator, "size_full", None),
         "swa_pool_tokens": getattr(allocator, "size_swa", None),
         "c4_pool_units": getattr(allocator, "_size_hisparse", None),
+        "compress_state_ring_sizes": getattr(
+            getattr(runner, "token_to_kv_pool", None),
+            "_compress_state_ring_sizes",
+            None,
+        ),
     }
     failed = []
     if coordinator is None:

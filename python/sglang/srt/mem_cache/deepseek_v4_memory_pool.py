@@ -21,7 +21,11 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_spec,
+    max_speculative_num_draft_tokens,
+)
 from sglang.srt.utils import ceil_div, is_hip
 
 logger = logging.getLogger(__name__)
@@ -32,8 +36,19 @@ ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
 def get_compress_state_ring_size(
-    compress_ratio: int, is_speculative: bool = False
+    compress_ratio: int,
+    is_speculative: bool = False,
+    max_draft_tokens: int = 0,
+    *,
+    swa_page_size: int = 256,
 ) -> int:
+    """Size raw compressor state for the largest optimistic verify tail.
+
+    This is separate from HiSparse's resident compressed-KV capacity. The
+    C4's planner requires its ring to divide a SWA page and cover whole
+    compression groups. Grow C4 to a power of two, retaining the existing
+    minimum. Request-scoped C128 keeps its existing ring and capacity bound.
+    """
     assert compress_ratio in [4, 128], f"Unsupported {compress_ratio = }"
     # Online c128 keeps a single (max, sum, kv) state per index instead of a
     # 128-slot ring buffer of raw tokens, so ring_size collapses to 1. Online
@@ -43,7 +58,20 @@ def get_compress_state_ring_size(
             raise AssertionError("online c128 does not support MTP")
         return 1
     if is_speculative:
-        return 16 if compress_ratio == 4 else 256
+        if compress_ratio == 128:
+            # C128 is request-scoped; in particular NPU's 128-token SWA page
+            # must not cap this existing 256-slot request ring.
+            return 256
+        window_size = compress_ratio * (2 if compress_ratio == 4 else 1)
+        minimum = max(2 * window_size, window_size + max_draft_tokens - 2)
+        ring_size = 1 << (minimum - 1).bit_length()
+        if swa_page_size % ring_size != 0:
+            raise ValueError(
+                f"speculative_num_draft_tokens={max_draft_tokens} requires c{compress_ratio} "
+                f"compress state ring_size={ring_size}, which must divide "
+                f"swa_page_size={swa_page_size}. Lower the draft count."
+            )
+        return ring_size
     else:
         return 8 if compress_ratio == 4 else 128
 
@@ -519,6 +547,19 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
         self.c4_state_pool_size = c4_state_pool_size
+        # Freeze the allocation geometry at the largest adaptive tier. Later
+        # changes to the active speculative width must not change state strides.
+        is_speculative = get_spec().speculative_algorithm is not None
+        max_draft_tokens = max_speculative_num_draft_tokens() or 0
+        self._compress_state_ring_sizes = {
+            ratio: get_compress_state_ring_size(
+                ratio,
+                is_speculative,
+                max_draft_tokens,
+                swa_page_size=swa_page_size,
+            )
+            for ratio in (4, 128)
+        }
         c128_ring_size = self.get_ring_size(128)
         if ONLINE_C128:
             # Request-scoped online C128 state is indexed by req_pool_idx.
@@ -665,8 +706,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
     def get_ring_size(self, compress_ratio: int) -> int:
-        is_speculative = get_spec().speculative_algorithm is not None
-        return get_compress_state_ring_size(compress_ratio, is_speculative)
+        return self._compress_state_ring_sizes[compress_ratio]
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self.full_to_swa_index_mapping is not None
