@@ -5,10 +5,6 @@ from types import SimpleNamespace as NS
 
 import pytest
 import torch
-from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
-from sglang.srt.speculative import oasiskv_trace_workspace as workspace
-from sglang.srt.speculative.oasiskv_trace import ForwardObservation
-from sglang.test.ci.ci_register import register_cpu_ci
 from test_oasiskv_trace import (
     analyzer,
     auditor,
@@ -17,6 +13,11 @@ from test_oasiskv_trace import (
     runner,
     write_paired_run,
 )
+
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.speculative import oasiskv_trace_workspace as workspace
+from sglang.srt.speculative.oasiskv_trace import ForwardObservation
+from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -151,7 +152,7 @@ def test_plan_w6_p6_extends_proposal_but_not_real_residency():
         resident_units=3072,
         top_k=512,
         mem_fraction=0.9,
-        prefetch_units=256,
+        prefetch_units="all",
         gpus="0,1,2,3",
     )
     assert runner.validate_args(args, 5) == 5
@@ -235,16 +236,16 @@ def test_workspace_bytes_are_separate_from_misses_and_protocols_cannot_mix():
     source, following, probe = [dict(r, **protocol) for r in records()]
     probe.update(mode="exact", probe_workspace_d2d_bytes=12 * 512 * 584)
     before = analyzer.compare(
-        source, following, dict(probe, probe_workspace_d2d_bytes=0), 256
+        source, following, dict(probe, probe_workspace_d2d_bytes=0)
     )
-    after = analyzer.compare(source, following, probe, 256)
+    after = analyzer.compare(source, following, probe)
     assert after.pop("probe_workspace_d2d_bytes") == 12 * 512 * 584
     before.pop("probe_workspace_d2d_bytes")
     assert after == before
-    report = analyzer.analyze([source, following, probe], 256)
+    report = analyzer.analyze([source, following, probe])
     assert report["proposal_protocol"] == protocol
     with pytest.raises(ValueError, match="Cannot mix proposal widths"):
-        analyzer.analyze([source, following, dict(probe, proposal_gamma=5)], 256)
+        analyzer.analyze([source, following, dict(probe, proposal_gamma=5)])
     with pytest.raises(ValueError, match="must not use the exact shadow workspace"):
         analyzer.validate(dict(probe, mode="resident", probe_demand_h2d_bytes=0))
 

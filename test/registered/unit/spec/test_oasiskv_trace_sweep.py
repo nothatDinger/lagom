@@ -5,8 +5,9 @@ import subprocess
 import sys
 
 import pytest
-from sglang.test.ci.ci_register import register_cpu_ci
 from test_oasiskv_trace import analyzer, records, runner
+
+from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -29,6 +30,7 @@ def test_matrix_uses_fixed_g12_and_common_capacity(tmp_path):
         assert run.input_lengths == [16384, 32768, 65536, 131072]
         assert run.context_length == 139264
         assert run.resident_units == 3584
+        assert run.prefetch_units == "all"
         assert run.output == args.output / f"w{w}"
         command = runner.server_command(run, 5)
         assert command[command.index("--speculative-num-draft-tokens") + 1] == "12"
@@ -97,6 +99,7 @@ def test_cli_dry_run_delivers_both_twelve_row_server_commands(tmp_path):
     assert "W=6, P=[0, 1, 2, 3, 4, 5, 6]" in result.stdout
     assert "W=7, P=[0, 1, 2, 3, 4, 5]" in result.stdout
     assert result.stdout.count("--context-length 139264") == 2
+    assert result.stdout.count("prefetch=all (full probe union, no cap)") == 2
     assert not (tmp_path / "results").exists()
 
 
@@ -164,7 +167,7 @@ def test_p0_measures_no_new_prefetch_without_inventing_hits(mode, empty_denomina
         following.update(
             topk=[[], []], miss_events=[{"row": 0, "ids": []}, {"row": 1, "ids": []}]
         )
-    report = analyzer.analyze([source, following, probe], 256)
+    report = analyzer.analyze([source, following, probe])
     (row,) = report["samples"]
     assert row["p"] == 0
     assert (

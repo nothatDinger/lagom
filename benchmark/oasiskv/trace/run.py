@@ -182,8 +182,13 @@ def validate_args(args, gamma):
         raise ValueError(
             f"Real verify requires capacity >= W*index_topk = {baseline_width * args.top_k} C4 units"
         )
-    if not 0 < args.mem_fraction < 1 or args.prefetch_units < 0:
-        raise ValueError("Invalid memory fraction or prefetch cap")
+    if not 0 < args.mem_fraction < 1:
+        raise ValueError("Invalid memory fraction")
+    if getattr(args, "prefetch_units", "all") != "all":
+        raise ValueError(
+            "Fixed prefetch caps are not supported by the coverage experiment; "
+            "omit --prefetch-units or use --prefetch-units all."
+        )
     if len(args.gpus.split(",")) != 4:
         raise ValueError("This recipe requires four GPU IDs")
     ratio = getattr(args, "host_to_device_ratio", 1)
@@ -734,9 +739,9 @@ def build_parser():
     )
     parser.add_argument(
         "--prefetch-units",
-        type=int,
-        default=256,
-        help="Offline admission cap in C4 units, not an online setting",
+        choices=["all"],
+        default="all",
+        help="Compatibility option: only 'all'; use every P's deduplicated nonresident historical candidates",
     )
     parser.add_argument(
         "--context-length",
@@ -824,7 +829,7 @@ def run_experiment(args, gamma):
     v = validate_args(args, gamma)
     plan = mode_plan(args)
     print(
-        f"mode={args.mode}; checkpoint_gamma={gamma}, G_total={proposal_gamma(args, gamma)+1}, proposal_gamma={proposal_gamma(args, gamma)}, W={v+1}, P={args.probes}, index_topk={args.top_k}, resident_C4={args.resident_units}, context={args.context_length}; B=1, TP=4; offline quality, graphs disabled"
+        f"mode={args.mode}; checkpoint_gamma={gamma}, G_total={proposal_gamma(args, gamma)+1}, proposal_gamma={proposal_gamma(args, gamma)}, W={v+1}, P={args.probes}, index_topk={args.top_k}, resident_C4={args.resident_units}, context={args.context_length}; prefetch=all (full probe union, no cap); B=1, TP=4; offline quality, graphs disabled"
     )
     for mode, mode_args in plan:
         print(f"{mode}: {shlex.join(server_command(mode_args, gamma))}")
@@ -857,6 +862,8 @@ def run_experiment(args, gamma):
             "verify_width": v + 1,
             "max_target_width": v + 1 + max(args.probes),
             "verify_candidates": v,
+            "prefetch_policy": "full-probe-union",
+            "prefetch_cap_units": None,
             "timing_valid": False,
         },
     )
@@ -931,8 +938,6 @@ def run_experiment(args, gamma):
             sys.executable,
             str(HERE / "analyze.py"),
             str(output / "probes" / "trace.jsonl.gz"),
-            "--max-prefetch-units",
-            str(args.prefetch_units),
             "--audit",
             str(output / "audit.json"),
             "--output",

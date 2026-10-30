@@ -16,6 +16,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 VERSION = 1
+ANALYSIS_VERSION = 2
+PREFETCH_POLICY = "full-probe-union"
 KEY = ("run_id", "request_id", "generation", "window_id", "layer", "head")
 GROUP = (
     "run_id",
@@ -32,6 +34,7 @@ GROUP = (
     "next_verify_candidates",
     "p",
     "mode",
+    "prefetch_policy",
 )
 COUNTS = (
     "prediction_units",
@@ -179,7 +182,7 @@ def _ratios(row):
     )
 
 
-def compare(source, following, probe, cap):
+def compare(source, following, probe):
     for record in (following, probe):
         for field in ("unit", "unit_tokens", "bytes_per_unit"):
             if record[field] != source[field]:
@@ -197,19 +200,11 @@ def compare(source, following, probe, cap):
 
     history = source["history_units"]
     resident = _ids(source["resident_after"])
-    # Frequency voting is a declared offline policy. Native Top-K output need
-    # not be score-sorted, so tensor position must not be treated as a rank.
-    # Deduplicate within a row; repeated padding/IDs cannot gain weight.
-    votes = defaultdict(float)
-    for row in probe["topk"]:
-        seen = set()
-        for unit in row:
-            if 0 <= unit < history and unit not in seen:
-                votes[unit] += 1
-                seen.add(unit)
-    prediction = set(votes)
-    fetch = sorted(prediction - resident, key=lambda unit: (-votes[unit], unit))[:cap]
-    fetch = set(fetch)
+    # Measure every prediction contributed by these P queries. A fixed budget
+    # would conflate prediction coverage with admission/ranking quality. Native
+    # Top-K order and vote frequency do not matter for the full union.
+    prediction = {unit for row in probe["topk"] for unit in row if 0 <= unit < history}
+    fetch = prediction - resident
     needed = set().union(*(_ids(row) for row in following["topk"]))
     old_needed = {unit for unit in needed if unit < history}
     events = following.get("miss_events")
@@ -227,6 +222,7 @@ def compare(source, following, probe, cap):
         total_width=source.get("total_width"),
         p=probe["p"],
         mode=probe["mode"],
+        prefetch_policy=PREFETCH_POLICY,
         prediction_units=len(prediction),
         prediction_resident_units=len(prediction & resident),
         prefetch_candidate_units=len(fetch),
@@ -255,9 +251,14 @@ def compare(source, following, probe, cap):
     return row
 
 
-def analyze(records, cap):
-    if type(cap) is not int or cap < 0:
-        raise ValueError("prefetch cap must be a nonnegative integer")
+def analyze(records, cap=None):
+    # Reject old callers explicitly rather than silently interpreting their
+    # fixed-budget experiment as an uncapped coverage measurement.
+    if cap is not None:
+        raise ValueError(
+            "Fixed prefetch caps are not supported by the coverage experiment; "
+            "omit the cap to use all candidates from each P's Top-K union."
+        )
     windows, probes = {}, {}
     orders = set()
     protocols = set()
@@ -294,7 +295,7 @@ def analyze(records, cap):
         if following is None:
             skipped["no_immediate_next_window"] += 1
             continue
-        rows.append(compare(source, following, probe, cap))
+        rows.append(compare(source, following, probe))
     groups = defaultdict(list)
     for row in rows:
         groups[tuple(row[field] for field in GROUP)].append(row)
@@ -321,6 +322,7 @@ def analyze(records, cap):
         summary.append(entry)
     return {
         "schema_version": VERSION,
+        "analysis_version": ANALYSIS_VERSION,
         "topk_order": next(iter(orders), "native"),
         "proposal_protocol": dict(
             zip(
@@ -328,8 +330,9 @@ def analyze(records, cap):
                 next(iter(protocols), (None, None, "none")),
             )
         ),
-        "prefetch_cap_units": cap,
-        "candidate_policy": "probe-frequency; ties-by-logical-ID; dedup; committed-history; subtract-residency; cap",
+        "prefetch_cap_units": None,
+        "prefetch_policy": PREFETCH_POLICY,
+        "candidate_policy": "all-probe-topk; dedup; committed-history; subtract-residency; no-cap",
         "measurement": "offline prediction potential; no eviction or asynchronous timing simulation",
         "p0_policy": "no appended query; empty prediction/candidate set; zero additional IO; resident KV is not counted as new prefetch",
         "validation": {"scope": "not_audited", "passed": None},
@@ -364,7 +367,12 @@ def read_records(paths):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("traces", type=Path, nargs="+")
-    parser.add_argument("--max-prefetch-units", type=int, required=True)
+    parser.add_argument(
+        "--max-prefetch-units",
+        choices=["all"],
+        default="all",
+        help="Compatibility option: only 'all' is supported; coverage has no fixed budget",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--audit",
@@ -372,7 +380,7 @@ def main():
         help="Bind a passed within-server audit to this exact trace file",
     )
     args = parser.parse_args()
-    report = analyze(read_records(args.traces), args.max_prefetch_units)
+    report = analyze(read_records(args.traces))
     if not report["matched_records"]:
         parser.error("no consecutive baseline windows with matching probe records")
     if args.audit is not None:

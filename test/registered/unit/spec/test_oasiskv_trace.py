@@ -16,6 +16,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 import torch
+
 from sglang.kernels.ops.speculative.dspark.dspark_accept import AcceptGreedy
 from sglang.srt.environ import envs
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -111,7 +112,7 @@ def records():
 
 def test_next_window_uses_actual_commit_and_deduplicates_resident_and_future_kv():
     source, following, probe = records()
-    report = analyzer.analyze([source, following, probe], 10)
+    report = analyzer.analyze([source, following, probe])
     sample = report["samples"][0]
     assert sample["prediction_units"] == 3  # 1,3,4; no tentative 10/11
     assert sample["prefetch_candidate_units"] == 2  # subtract resident 1
@@ -127,17 +128,18 @@ def test_next_window_uses_actual_commit_and_deduplicates_resident_and_future_kv(
 
 def test_no_implicit_prediction_from_p0():
     source, following, _ = records()
-    assert analyzer.analyze([source, following], 256)["matched_records"] == 0
+    assert analyzer.analyze([source, following])["matched_records"] == 0
 
 
-def test_admission_cap_and_unsorted_topk_frequency():
+def test_full_union_does_not_rank_or_truncate_unsorted_topk():
     source, following, probe = records()
     probe.update(p=2, input_ids=[20, 21, 25, 26], topk=[[3, 4], [4, 4]])
-    sample = analyzer.analyze([source, following, probe], 1)["samples"][0]
-    assert sample["prefetch_candidate_units"] == 1
-    assert sample["potential_first_fetch_bytes"] == 584
-    zero = analyzer.analyze([source, following, probe], 0)["samples"][0]
-    assert zero["prefetch_candidate_units"] == zero["potential_miss_units"] == 0
+    sample = analyzer.analyze([source, following, probe])["samples"][0]
+    assert sample["prefetch_candidate_units"] == 2
+    assert sample["potential_first_fetch_bytes"] == 2 * 584
+    assert sample["potential_unique_miss_coverage"] == pytest.approx(2 / 3)
+    probe["topk"] = [[4, 3], [3, 3]]
+    assert analyzer.analyze([source, following, probe])["samples"][0] == sample
 
 
 @pytest.mark.parametrize(
@@ -152,7 +154,7 @@ def test_rejects_mismatched_next_window(field, value):
     source, following, probe = records()
     following[field] = value
     with pytest.raises(ValueError):
-        analyzer.analyze([source, following, probe], 256)
+        analyzer.analyze([source, following, probe])
 
 
 @pytest.mark.parametrize(
@@ -168,25 +170,25 @@ def test_rejects_invalid_probe(change):
     source, following, probe = records()
     probe.update(change)
     with pytest.raises(ValueError):
-        analyzer.analyze([source, following, probe], 256)
+        analyzer.analyze([source, following, probe])
 
 
 def test_generation_reuse_missing_steps_and_duplicate_windows():
     source, following, probe = records()
     following["generation"] = 2
-    report = analyzer.analyze([source, following, probe], 256)
+    report = analyzer.analyze([source, following, probe])
     assert report["matched_records"] == 0
     assert report["skipped"]["no_immediate_next_window"] == 1
     following.update(generation=1, window_id=2)
-    assert analyzer.analyze([source, following, probe], 256)["matched_records"] == 0
+    assert analyzer.analyze([source, following, probe])["matched_records"] == 0
     with pytest.raises(ValueError, match="duplicate"):
-        analyzer.analyze([source, source], 256)
+        analyzer.analyze([source, source])
 
 
 def test_unknown_misses_are_not_filled_in_from_topk():
     source, following, probe = records()
     following["miss_events"] = None
-    sample = analyzer.analyze([source, following, probe], 256)["samples"][0]
+    sample = analyzer.analyze([source, following, probe])["samples"][0]
     assert sample["next_miss_bytes"] is None
     assert sample["potential_unique_miss_coverage"] is None
     assert sample["history_coverage"] == 1
@@ -572,7 +574,7 @@ def test_prefill_c4_capacity_is_distinct_from_decode_residency(length, ratio, va
         resident_units=3072,
         top_k=512,
         mem_fraction=0.9,
-        prefetch_units=256,
+        prefetch_units="all",
         gpus="0,1,2,3",
         host_to_device_ratio=ratio,
     )
@@ -967,9 +969,9 @@ def test_analysis_rejects_mixing_attention_visitation_order(order):
     source, following, probe = records()
     changed = dict(probe, topk_order=order)
     with pytest.raises(ValueError, match="different topk_order"):
-        analyzer.analyze([source, following, changed], 256)
+        analyzer.analyze([source, following, changed])
     report = analyzer.analyze(
-        [dict(r, topk_order=order) for r in (source, following, probe)], 256
+        [dict(r, topk_order=order) for r in (source, following, probe)]
     )
     assert report["topk_order"] == order
 
@@ -1201,8 +1203,6 @@ def test_within_server_audit_and_analysis_bind_exact_artifacts(tmp_path):
             str(trace),
             "--audit",
             str(path),
-            "--max-prefetch-units",
-            "256",
             "--output",
             str(analysis),
         ],
@@ -1212,6 +1212,9 @@ def test_within_server_audit_and_analysis_bind_exact_artifacts(tmp_path):
     )
     result = json.loads((analysis / "report.json").read_text())
     assert result["validation"] == report and result["matched_records"] == 2
+    assert result["prefetch_cap_units"] is None
+    assert result["prefetch_policy"] == "full-probe-union"
+    assert result["analysis_version"] == 2
     with gzip.open(trace, "at") as stream:
         stream.write("\n")
     with pytest.raises(ValueError, match="different trace bytes"):

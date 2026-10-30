@@ -478,14 +478,20 @@ trace 的 `layer` 是 C4 层序号；`runtime.json` 给出到原模型层号的�
 
 配对键为 `(run_id, request_id, generation, window_id, layer, head)`；window_id 是请求内的连续编号，**不按请求池槽号或全局 forward 计数配对**。要求下一窗口 `prefix_len = 当前 prefix_len + 实际 commit_len`。提前拒绝时也按这条真实路径配对，不能按 V 推测下一位置。
 
-默认分析策略：probe Top-K 去重，仅保留源窗口已经提交的历史，再减去本层真实补载后的驻留集合；按被不同 probe 选中的频次排序，频次相同按逻辑 ID 排序，然后施加 `--prefetch-units` 上限。原生 Top-K 输出未保证按分数排序，因此不按数组位置做 rank 加权。
+**覆盖率分析使用 P 行 probe Top-K 的完整并集，不设置固定预取数量上限。** 令 `H` 为源窗口已提交的历史，`R` 为本层真实补载后的驻留集合，则预测集合为 `U_P = (TopK(q₁) ∪ … ∪ TopK(q_P)) ∩ H`，候选预取集合为 `F_P = U_P − R`。P=0 时二者为空。
+
+每个 P 的候选数取实际 `|F_P|`，不做频次投票筛选或截断，也不强行补到 P×K。K=512 时，P=0～6 的原始条目数上界依次为 0、512、1024、1536、2048、2560、3072；去重、排除未提交历史及扣除驻留后，实际数量通常更小。各 P 的 shadow 使用各自观测到的 Top-K，不人为保证曲线单调。
+
+旧版 `--prefetch-units` 默认 256，只截断离线分析中的候选集合，不控制模型或 GPU 搬运。它影响 `potential_unique_miss_coverage`、候选量及 precision；旧版 `history_coverage` 已使用完整预测并集，未受该上限影响。本轮取消这种固定预算口径：两个脚本均可省略该参数；兼容写法为 `run.py --prefetch-units all` / `analyze.py --max-prefetch-units all`，传入旧的数字值会在执行前报错。
+
+`report.json` 标记 `analysis_version=2`、`prefetch_policy="full-probe-union"`、`prefetch_cap_units=null`；两个 CSV 也包含 `prefetch_policy`，不要与旧的固定预算报告混合。该变化只涉及离线集合统计，W/P、index_topk、3584 的常驻容量及真实接受路径不变。
 
 核心字段：
 
 | 字段 | 含义 |
 | --- | --- |
 | `history_coverage` | 对下一窗口需要的、源窗口已有历史 KV 的覆盖率 |
-| `prefetch_candidate_bytes` | 去重、扣除驻留、施加容量上限后的候选搬运量 |
+| `prefetch_candidate_units` / `prefetch_candidate_bytes` | P 行预测的全部历史候选去重、扣除驻留后的数量 / 潜在搬运量，无截断 |
 | `next_miss_bytes` | 下一真实窗口 kernel miss plan 的实际 H2D 字节；重复补载按实际次数计 |
 | `potential_unique_miss_coverage` | 候选集合覆盖下一窗口不同 miss 单元的比例 |
 | `potential_first_fetch_bytes` | 潜在可提前获取的不同单元字节；同一单元多次补载只记一次 |
@@ -500,17 +506,16 @@ trace 的 `layer` 是 C4 层序号；`runtime.json` 给出到原模型层号的�
 历史超过容量不保证每个窗口都有 miss；若分母为零，指标输出 null，不伪造 100% 覆盖率。
 若另外扩大 W 或 K，常驻安全下界也会上升；若调整容量，基线和影子组必须一起重跑并区分配置。
 
-无需重跑模型即可扫描不同候选预算，例如：
+**已有完整 trace 无需重跑模型。** 原始 probe 记录已保存全部 Top-K，可使用原有 audit 重新生成无截断的报告，写入新目录以保留旧结果，例如 W=6（W=7 同样执行）：
 
 ```bash
 python benchmark/oasiskv/trace/analyze.py \
-  /srv/oasiskv/trace-v4-16k-32k/probes/trace.jsonl.gz \
-  --audit /srv/oasiskv/trace-v4-16k-32k/audit.json \
-  --max-prefetch-units 64 \
-  --output /srv/oasiskv/trace-v4-16k-32k/analysis-cap64
+  /srv/oasiskv/trace-v4/w6/probes/trace.jsonl.gz \
+  --audit /srv/oasiskv/trace-v4/w6/audit.json \
+  --output /srv/oasiskv/trace-v4/w6/analysis-all
 ```
 
-这里的预算以 C4 单元计，是离线 admission 参数，不是通用路径 `max_new_blocks` 的论文推荐值。
+这统计的是完整预测集合的潜在覆盖率，既没有执行在线预取，也没有把通用路径 `max_new_blocks` 当作候选预算。
 
 ## 这些结果不能说明什么
 
@@ -529,6 +534,7 @@ PYTHONPATH=python SGLANG_USE_CPU_ENGINE=0 python -m pytest -q \
   test/registered/unit/spec/test_oasiskv_trace_startup.py \
   test/registered/unit/spec/test_oasiskv_trace_workspace.py \
   test/registered/unit/spec/test_oasiskv_trace_sweep.py \
+  test/registered/unit/spec/test_oasiskv_trace_coverage.py \
   test/registered/unit/managers/test_prefill_adder.py \
   test/registered/unit/layers/quantization/test_fp4_moe_routing.py
 ```
