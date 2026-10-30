@@ -10,6 +10,7 @@ import functools
 import json
 import os
 import time
+from collections import Counter
 from pathlib import Path
 
 
@@ -65,6 +66,71 @@ class FullBatchWindow:
         return slot
 
 
+class DecodeDiagnostics:
+    """CPU-only admission evidence, including full batches rejected at the cap."""
+
+    def __init__(self, batch_size, width, request_prefix):
+        self.batch_size, self.width, self.request_prefix = (
+            batch_size,
+            width,
+            request_prefix,
+        )
+        self.histogram, self.rejections = Counter(), Counter()
+        self.seen_requests, self.decoded_requests = set(), set()
+        self.full_steps, self.eligible_steps, self.longest_streak = 0, 0, 0
+        self.cohort, self.streak, self.first_full = None, 0, None
+
+    def observe(self, ids, remaining, pure_decode, forward_iter):
+        test_ids = [rid for rid in ids if rid.startswith(self.request_prefix)]
+        self.seen_requests.update(test_ids)
+        if pure_decode:
+            self.decoded_requests.update(test_ids)
+        benchmark_batch = bool(ids) and len(test_ids) == len(ids)
+        if benchmark_batch and pure_decode:
+            self.histogram[len(ids)] += 1
+            if len(ids) == self.batch_size:
+                self.full_steps += 1
+                if self.first_full is None:
+                    self.first_full = {
+                        "forward_iter": int(forward_iter),
+                        "request_ids": list(ids),
+                        "remaining_output_budget_cpu": list(remaining),
+                    }
+        if not benchmark_batch:
+            reason = "non_benchmark_request"
+        elif not pure_decode:
+            reason = "not_pure_decode"
+        elif len(ids) != self.batch_size:
+            reason = "batch_size_mismatch"
+        elif any(n <= 2 * self.width for n in remaining):
+            reason = "output_headroom"
+        else:
+            reason = None
+        cohort = tuple(sorted(ids))
+        if reason is not None or cohort != self.cohort:
+            self.streak = 0
+        self.cohort = cohort
+        if reason is None:
+            self.eligible_steps += 1
+            self.streak += 1
+            self.longest_streak = max(self.longest_streak, self.streak)
+        else:
+            self.rejections[reason] += 1
+        return reason is None
+
+    def snapshot(self):
+        return {
+            "benchmark_decode_batch_histogram": dict(self.histogram),
+            "benchmark_requests_seen": sorted(self.seen_requests),
+            "benchmark_requests_seen_in_decode": sorted(self.decoded_requests),
+            "full_decode_forwards_before_budget_filter": self.full_steps,
+            "eligible_full_decode_forwards": self.eligible_steps,
+            "longest_eligible_full_decode_streak": self.longest_streak,
+            "rejected_forward_counts": dict(self.rejections),
+            "first_full_decode": self.first_full,
+        }
+
+
 class DecodeMeter:
     def __init__(self, config):
         import torch
@@ -74,6 +140,10 @@ class DecodeMeter:
         )
         self.width = int(config["verify_width"])
         self.request_prefix = config["request_prefix"]
+        self.flush_request_id = config.get("flush_request_id")
+        self.diagnostics = DecodeDiagnostics(
+            self.window.batch_size, self.width, self.request_prefix
+        )
         self.output = Path(config["output_dir"])
         self.output.mkdir(parents=True, exist_ok=True)
         self.device = torch.cuda.current_device()
@@ -109,16 +179,16 @@ class DecodeMeter:
         remaining = [
             r.sampling_params.max_new_tokens - len(r.output_ids) for r in batch.reqs
         ]
-        eligible = (
-            pure_decode
-            and all(rid.startswith(self.request_prefix) for rid in ids)
-            and all(n > 2 * self.width for n in remaining)
+        eligible = self.diagnostics.observe(
+            ids, remaining, pure_decode, batch.forward_iter
         )
         slot = self.window.select(ids, eligible)
         if slot is None:
             if self.window.recorded == 0:
                 self.records, self.accepted, self.prefixes = [], [], []
-            self.progress()
+            # The benchmark sends this request after the cohort has finished.
+            # Force a final diagnostic snapshot even inside the 1s throttle.
+            self.progress(force=self.flush_request_id in ids)
             return
         if slot == 0:
             self.records, self.accepted, self.prefixes = [], [], []
@@ -159,19 +229,23 @@ class DecodeMeter:
             self.records, self.accepted, self.prefixes = [], [], []
         self.active = None
 
-    def progress(self):
+    def progress(self, *, force=False):
         now = time.monotonic()
-        if now - self.last_progress < 1:
+        if not force and now - self.last_progress < 1:
             return
         self.last_progress = now
         self.stem.with_suffix(".status.json").write_text(
             json.dumps(
                 {
-                    "status": "waiting_for_full_decode_window",
+                    "status": (
+                        "complete" if self.written else "waiting_for_full_decode_window"
+                    ),
+                    "cohort_finished": force and not self.written,
                     "required_batch_size": self.window.batch_size,
                     "observed_max_decode_batch_size": self.observed_max_batch,
                     "forwards_observed": self.forwards,
                     "discarded_partial_steps": self.window.discarded,
+                    **self.diagnostics.snapshot(),
                 },
                 indent=2,
             )
@@ -197,6 +271,7 @@ class DecodeMeter:
             "window_ms": self.starts[0].elapsed_time(self.ends[-1]),
             "records": self.records,
             "discarded_partial_steps": self.window.discarded,
+            "diagnostics": self.diagnostics.snapshot(),
             "notes": [
                 "Only consecutive pure decode forwards with the same full cohort are measured.",
                 "Window duration includes inter-step scheduler/CPU gaps; step spans are not additive with those gaps.",
@@ -206,3 +281,4 @@ class DecodeMeter:
         }
         self.stem.with_suffix(".json").write_text(json.dumps(payload, indent=2))
         self.written = True
+        self.progress(force=True)

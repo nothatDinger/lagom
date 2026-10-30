@@ -52,7 +52,8 @@ def validate(args):
     minimum = (steps + 3) * (args.w + 1) + 1
     if args.output_len < minimum:
         raise ValueError(
-            f"--output-len must be >= {minimum} to allow the full-batch window and output-cap headroom"
+            f"--output-len must be >= {minimum} to allow the full-batch window and output-cap headroom; "
+            "this lower bound does not cover admission skew or guarantee a full batch"
         )
 
 
@@ -168,6 +169,20 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
+def window_diagnostics(directory):
+    """Report observed admission separately from budget/window rejection."""
+    messages = []
+    for path in sorted(directory.glob("rank-*.status.json")):
+        data = json.loads(path.read_text())
+        messages.append(
+            f"{path.name}: max_decode_batch={data['observed_max_decode_batch_size']}, "
+            f"full_before_budget={data.get('full_decode_forwards_before_budget_filter', 'unknown')}, "
+            f"longest_eligible_streak={data.get('longest_eligible_full_decode_streak', 'unknown')}, "
+            f"rejections={data.get('rejected_forward_counts', {})}"
+        )
+    return "\n".join(messages)
+
+
 def run_cohort(args, url, rows, folder, deadline):
     barrier = threading.Barrier(args.max_concurrency)
     pool = ThreadPoolExecutor(max_workers=args.max_concurrency)
@@ -178,6 +193,7 @@ def run_cohort(args, url, rows, folder, deadline):
         if remaining <= 0:
             raise TimeoutError("mode runtime budget exhausted")
         rid = f"{REQUEST_PREFIX}{index:04d}"
+        submitted_s = time.monotonic() - started
         result = common.generate(
             url,
             row["input_ids"],
@@ -185,7 +201,13 @@ def run_cohort(args, url, rows, folder, deadline):
             min(args.request_timeout, remaining),
             rid=rid,
         )
-        result.update(rid=rid, prompt_sha256=row["token_sha256"])
+        result.update(
+            rid=rid,
+            prompt_sha256=row["token_sha256"],
+            submitted_s=submitted_s,
+            first_token_s=submitted_s + result["ttft_s"],
+            finished_s=time.monotonic() - started,
+        )
         return result
 
     results = []
@@ -206,6 +228,13 @@ def run_cohort(args, url, rows, folder, deadline):
             {
                 "requests": len(results),
                 "client_wall_s_including_prefill": time.monotonic() - started,
+                "first_token_spread_s": max(r["first_token_s"] for r in results)
+                - min(r["first_token_s"] for r in results),
+                "all_requests_token_stream_overlap_s": max(
+                    0,
+                    min(r["finished_s"] for r in results)
+                    - max(r["first_token_s"] for r in results),
+                ),
             },
             indent=2,
         )
@@ -237,6 +266,7 @@ def run_mode(args, mode, phase, rows):
             "warmup": args.full_batch_warmup,
             "verify_width": args.w + 1,
             "request_prefix": REQUEST_PREFIX,
+            "flush_request_id": "lagom-flush",
         }
         env["SGLANG_LAGOM_DECODE_PERF"] = str(config_file)
     else:
@@ -352,13 +382,22 @@ def run_mode(args, mode, phase, rows):
                     f"No complete full-batch window on all ranks: expected {args.tp} reports, got {len(files)}. "
                     f"Need {args.full_batch_warmup}+{args.measure_steps} consecutive decode steps at actual batch "
                     f"{args.max_concurrency}. Inspect decode/*.status.json and server.log for capacity/retractions; "
-                    "no partial-batch throughput is reported."
+                    "max_decode_batch is counted BEFORE the output-budget filter. "
+                    "No partial-batch throughput is reported.\n"
+                    + window_diagnostics(folder / "decode")
                 )
             summary, steps = aggregate_decode(
                 [json.loads(p.read_text()) for p in sorted(files)],
                 mode=mode,
                 batch_size=args.max_concurrency,
                 steps=args.measure_steps,
+            )
+            summary.update(
+                input_len=args.input_len,
+                requested_output_len=args.output_len,
+                full_batch_warmup=args.full_batch_warmup,
+                w=args.w,
+                p=args.p,
             )
             (folder / "summary.json").write_text(json.dumps(summary, indent=2))
             write_csv(folder / "decode_steps.csv", steps)

@@ -54,6 +54,54 @@ batch size，减少启动时间；小于 C 的请求数即使 padding 到 C，�
 上限 600 秒、每组启动后预算 900 秒、服务启动预算 900 秒，可用相应 timeout 参数
 调整。高并发的长输入 prefill 和模型加载可能耗时较长，不计入 decode 性能。
 
+## 满 batch 样本不足时如何排查
+
+`observed_max_decode_batch_size` 在输出预算检查**之前**更新。如果最终值是 7，
+不能解释为“实际 batch=8，但被 remaining_output_budget 排除”。旧版本的 status
+每秒最多写一次，且采样中不写，可能滞后；新版本在正式请求结束后的 flush 请求中
+强制刷新失败诊断，`cohort_finished=true` 表示这份失败状态覆盖了完整测试批次。
+成功测量以最终 rank report 为准，status 同步标为 `complete`。
+
+| 诊断字段 | 判断依据 |
+|---|---|
+| `benchmark_decode_batch_histogram` | 正式请求的真实纯 decode batch 分布，预算筛选前计数 |
+| `full_decode_forwards_before_budget_filter` | 是否实际出现过 C 条请求同时 decode |
+| `eligible_full_decode_forwards`、`longest_eligible_full_decode_streak` | 满 batch 是否满足预算要求，以及是否连续达到 warmup+measure 轮数 |
+| `rejected_forward_counts` | `batch_size_mismatch`、`output_headroom`、`not_pure_decode` 等排除原因；每轮记第一个不满足的条件 |
+| `first_full_decode` | 首次满 batch 的 forward_iter、请求 ID 和各请求剩余输出预算 |
+| `benchmark_requests_seen`、`benchmark_requests_seen_in_decode` | 正式请求是否都到过 worker / decode |
+
+`requests.json` 新增相对整批开始的提交、首 token、结束时间；首 token 时间由提交
+时间加客户端 TTFT 估算。`cohort.json` 汇总首 token 时间跨度与所有请求 token stream
+共同存活的时长。它们用于检查时间错位，**不能替代服务端真实 batch 的判定**。
+单个或平均 TTFT（例如 3.475 秒）不是 TTFT 波动范围，不能单独据此断定根因。
+
+若 `full_decode_forwards_before_budget_filter=0`，先核对 `server_info.json` 中
+`effective_max_running_requests_per_dp`、`server.log` 的 KV 容量 / admission /
+retraction，以及每条请求的生命周期。若已有满 batch，但连续窗口不足，再检查
+prefill 插入、请求集合变化和输出余量。接受长度允许 **1 ≤ accepted_tokens ≤ W+1**，
+包括所有 draft token 接受后的 bonus token，不会排除 `accepted_tokens == W+1`。
+
+`minimum=(warmup+measure+3)*(W+1)+1` 只校验采样和收尾所需输出预算，**没有覆盖
+请求 admission 时间差，也不保证满 batch**。保留默认 32000/1024 作为原始口径；
+需要增加请求共同存活时间时，另建结果目录，三组统一显式改成 32000/2048：
+
+```bash
+python benchmark/lagom/run_concurrent.py \
+  --model /mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --draft /mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-DSpark \
+  --sharegpt /data/ShareGPT_V3_unfiltered_cleaned_split.json \
+  --tp 4 --max-concurrency 8 --output-len 2048 \
+  --moe-runner-backend marlin --speculative-moe-runner-backend marlin \
+  --output ./results/lagom-c8-o2048
+```
+
+这组仍测量连续 32 轮满 batch decode。若只是短时排障，可以给三组统一加
+`--measure-steps 16 --full-batch-warmup 2`；不要只修改某一组后与其他组混合比较。
+2048 会延长请求、增加 KV 需求和 context-length，并不保证解决容量或调度限制。
+`manifest.json`、`summary.json` 和 `decode_throughput.csv` 都记录输出长度和采样配置，
+请将 1024 / 2048 的结果分开标注。
+
 ## 性能指标
 
 性能阶段关闭逐层 trace，只在 worker forward 外围记录 CUDA events，兼容 graph

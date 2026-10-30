@@ -85,6 +85,68 @@ def test_window_restarts_on_prefill_partial_batch_and_cohort_change():
     assert window.select(ids[:2], True) is None
 
 
+def test_diagnostics_distinguish_missing_batch_from_budget_rejection():
+    diagnostics = lagom_decode_perf.DecodeDiagnostics(8, 8, "r")
+    ids = [f"r{i}" for i in range(8)]
+    assert not diagnostics.observe(ids[:7], [900] * 7, True, 1)
+    assert not diagnostics.observe(ids, [16] + [900] * 7, True, 2)
+    assert diagnostics.observe(ids, [17] + [900] * 7, True, 3)
+    assert diagnostics.observe(ids, [17] + [900] * 7, True, 4)
+    assert not diagnostics.observe(ids, [900] * 8, False, 5)
+    assert diagnostics.observe(ids, [900] * 8, True, 6)
+    data = diagnostics.snapshot()
+    assert data["benchmark_decode_batch_histogram"] == {7: 1, 8: 4}
+    assert data["full_decode_forwards_before_budget_filter"] == 4
+    assert data["eligible_full_decode_forwards"] == 3
+    assert data["longest_eligible_full_decode_streak"] == 2
+    assert data["first_full_decode"]["remaining_output_budget_cpu"][0] == 16
+    assert data["rejected_forward_counts"] == {
+        "batch_size_mismatch": 1,
+        "output_headroom": 1,
+        "not_pure_decode": 1,
+    }
+
+
+def test_final_status_is_not_throttled_and_counts_batch_before_budget_filter(
+    bench, tmp_path
+):
+    meter = object.__new__(lagom_decode_perf.DecodeMeter)
+    meter.window = lagom_decode_perf.FullBatchWindow(8, 32, 4)
+    meter.width, meter.request_prefix, meter.flush_request_id = 8, "r", "flush"
+    meter.diagnostics = lagom_decode_perf.DecodeDiagnostics(8, 8, "r")
+    meter.poll = Mock()
+    meter.written, meter.active = False, None
+    meter.forwards, meter.observed_max_batch = 0, 0
+    meter.last_progress = time.monotonic() + 60  # Force the ordinary path to throttle.
+    meter.stem = tmp_path / "rank-test"
+
+    def batch(ids, remaining):
+        return SimpleNamespace(
+            forward_mode=SimpleNamespace(is_decode=lambda: True),
+            is_extend_in_batch=False,
+            forward_iter=10,
+            reqs=[
+                SimpleNamespace(
+                    rid=rid,
+                    sampling_params=SimpleNamespace(max_new_tokens=remaining),
+                    output_ids=[],
+                )
+                for rid in ids
+            ],
+        )
+
+    meter.begin(batch([f"r{i}" for i in range(8)], 16))
+    assert not meter.stem.with_suffix(".status.json").exists()
+    meter.begin(batch(["flush"], 8))
+    data = json.loads(meter.stem.with_suffix(".status.json").read_text())
+    assert data["cohort_finished"]
+    assert data["observed_max_decode_batch_size"] == 8
+    assert data["full_decode_forwards_before_budget_filter"] == 1
+    assert data["eligible_full_decode_forwards"] == 0
+    message = bench.window_diagnostics(tmp_path)
+    assert "max_decode_batch=8" in message and "full_before_budget=1" in message
+
+
 def reports():
     records = []
     for i, (start, end) in enumerate(((0, 4), (6, 12))):
@@ -115,6 +177,15 @@ def test_tp_tokens_count_once_and_window_includes_scheduler_gaps(bench):
     assert summary["decode_tokens_per_s"] == pytest.approx(32000 / 12)
     assert summary["gpu_forward_tokens_per_s"] == 3200
     assert steps[1]["inter_step_gap_ms_max_rank"] == 2
+
+
+def test_full_verify_acceptance_is_valid(bench):
+    data = reports()
+    for report in data:
+        for record in report["records"]:
+            record["accepted_tokens"] = [report["verify_width"]] * 8
+    summary, _ = bench.aggregate_decode(data, mode="dspark", batch_size=8, steps=2)
+    assert summary["output_tokens"] == 128
 
 
 @pytest.mark.parametrize(
@@ -167,13 +238,19 @@ def test_cohort_is_submitted_concurrently_with_distinct_ids(
         assert arrived.wait(5), "requests were serialized instead of submitted together"
         with lock:
             active -= 1
-        return {"output_tokens": output_len}
+        return {"output_tokens": output_len, "ttft_s": 0.001}
 
     monkeypatch.setattr(bench.common, "generate", generate)
     rows = [{"input_ids": [i], "token_sha256": str(i)} for i in range(9)]
     bench.run_cohort(args, "http://unused", rows, tmp_path, time.monotonic() + 10)
     assert peak == 8 and len(seen) == 8
-    assert len(json.loads((tmp_path / "requests.json").read_text())) == 8
+    results = json.loads((tmp_path / "requests.json").read_text())
+    assert len(results) == 8
+    assert all(r["first_token_s"] == r["submitted_s"] + r["ttft_s"] for r in results)
+    cohort = json.loads((tmp_path / "cohort.json").read_text())
+    assert cohort["first_token_spread_s"] == max(
+        r["first_token_s"] for r in results
+    ) - min(r["first_token_s"] for r in results)
 
 
 def test_meter_defers_device_reads_and_discards_prefill_interruption(
@@ -213,6 +290,8 @@ def test_meter_defers_device_reads_and_discards_prefill_interruption(
     meter = object.__new__(lagom_decode_perf.DecodeMeter)
     meter.window = lagom_decode_perf.FullBatchWindow(8, 2, 1)
     meter.width, meter.request_prefix = 8, "r"
+    meter.flush_request_id = "flush"
+    meter.diagnostics = lagom_decode_perf.DecodeDiagnostics(8, 8, "r")
     meter.starts, meter.ends, meter.done = (
         [Event(), Event()],
         [Event(), Event()],
