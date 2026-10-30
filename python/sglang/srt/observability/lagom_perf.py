@@ -16,6 +16,8 @@ import time
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
+from sglang.srt.observability.lagom_decode_perf import get_meter
+
 
 @functools.lru_cache(maxsize=1)
 def get_trace():
@@ -75,7 +77,10 @@ def verify_step(fn):
     @functools.wraps(fn)
     def wrapped(self, batch, *args, **kwargs):
         trace = get_trace()
-        if trace is None or batch.forward_mode.is_idle():
+        if trace is None:
+            return fn(self, batch, *args, **kwargs)
+        if batch.forward_mode.is_idle():
+            trace.pause()
             return fn(self, batch, *args, **kwargs)
         trace.begin(batch)
         try:
@@ -106,6 +111,15 @@ def note_draft_graph(can_run_graph):
     trace = get_trace()
     if trace is not None and trace.active >= 0:
         trace.records[-1]["draft_cuda_graph"] = bool(can_run_graph)
+    meter = get_meter()
+    if meter is not None and meter.active is not None:
+        meter.records[-1]["draft_cuda_graph"] = bool(can_run_graph)
+
+
+def pause_trace():
+    trace = get_trace()
+    if trace is not None:
+        trace.pause()
 
 
 def union_ns(intervals):
@@ -149,6 +163,7 @@ class StepTrace:
 
     def __init__(self, config):
         import torch
+
         from sglang.srt.observability.lagom_perf_kernels import stamp
 
         self.torch, self.stamp = torch, stamp
@@ -156,6 +171,9 @@ class StepTrace:
         if not 0 < self.steps <= 256 or self.skip < 0:
             raise ValueError("trace steps must be 1..256 and skip nonnegative")
         self.nsys = bool(config.get("nsys", False))
+        self.required_batch_size = config.get("required_batch_size")
+        if self.required_batch_size is not None and self.required_batch_size <= 0:
+            raise ValueError("required_batch_size must be positive")
         self.nsys_running = False
         self.output = Path(config["output_dir"])
         self.output.mkdir(parents=True, exist_ok=True)
@@ -221,6 +239,13 @@ class StepTrace:
 
     def begin(self, batch):
         self.poll()
+        if (
+            self.required_batch_size is not None
+            and len(batch.reqs) != self.required_batch_size
+        ):
+            self.active = -1
+            self.slot.fill_(-1)
+            return
         self.active = self.seen - self.skip
         self.seen += 1
         if not 0 <= self.active < self.steps:
@@ -249,6 +274,13 @@ class StepTrace:
                     ),
                 }
             )
+
+    def pause(self):
+        # Prefill/idle must not overwrite the last decode's per-layer stamps.
+        # Outstanding prefetches use their own stable per-layer slot scalars.
+        self.poll()
+        self.active = -1
+        self.slot.fill_(-1)
 
     def finish(self, result):
         if self.active < 0:

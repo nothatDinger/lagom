@@ -4,6 +4,7 @@ from dataclasses import replace
 from typing import Optional
 
 import torch
+
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
@@ -18,7 +19,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
 )
-from sglang.srt.observability.lagom_perf import verify_step
+from sglang.srt.observability.lagom_decode_perf import measure_decode
+from sglang.srt.observability.lagom_perf import pause_trace, verify_step
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -435,6 +437,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
+    @measure_decode
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -442,6 +445,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            pause_trace()
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
             return self._forward_prefill(batch, on_publish)

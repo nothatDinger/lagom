@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+
 from sglang.srt.observability import lagom_perf
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -206,6 +207,7 @@ def test_verify_step_snapshots_optional_cpu_lengths_without_host_wait(
     trace = object.__new__(lagom_perf.StepTrace)
     trace.written, trace.nsys, trace.nsys_running = False, False, False
     trace.seen, trace.skip, trace.steps, trace.active = 0, 1, 2, -1
+    trace.required_batch_size = None
     trace.output, trace.device = tmp_path, 0
     trace.records, trace.cpu, trace.events = [], [], []
     trace.accepted, trace.prefix_lens_gpu = {}, {}

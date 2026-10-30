@@ -27,7 +27,7 @@ def validate(args):
     if (
         args.w <= 0
         or args.p <= 0
-        or args.requests <= 0
+        or getattr(args, "requests", 1) <= 0
         or args.input_len <= 0
         or args.output_len <= 0
     ):
@@ -51,7 +51,7 @@ def validate(args):
         raise ValueError("timeouts must be positive")
 
 
-def server_command(args, mode, port):
+def server_command(args, mode, port, *, max_running_requests=1):
     command = [
         sys.executable,
         "-m",
@@ -73,7 +73,7 @@ def server_command(args, mode, port):
         "--port",
         str(port),
         "--max-running-requests",
-        "1",
+        str(max_running_requests),
         "--disable-radix-cache",
         "--context-length",
         str(
@@ -87,7 +87,10 @@ def server_command(args, mode, port):
         "--mem-fraction-static",
         str(args.mem_fraction),
         "--cuda-graph-config",
-        '{"decode":{"bs":[1]}}',
+        json.dumps(
+            {"decode": {"bs": sorted({1, max_running_requests})}},
+            separators=(",", ":"),
+        ),
         "--random-seed",
         str(args.seed),
     ]
@@ -167,7 +170,7 @@ def pack_sharegpt(dataset, encode, *, count, length, seed):
     )
 
 
-def prepare(args):
+def prepare(args, *, prompt_count=None):
     from transformers import AutoConfig, AutoTokenizer
 
     config = AutoConfig.from_pretrained(
@@ -194,7 +197,7 @@ def prepare(args):
     rows = pack_sharegpt(
         dataset,
         lambda text: tokenizer.encode(text, add_special_tokens=False),
-        count=args.requests + 1,
+        count=args.requests + 1 if prompt_count is None else prompt_count,
         length=args.input_len,
         seed=args.seed,
     )
@@ -204,7 +207,7 @@ def prepare(args):
     return rows
 
 
-def generate(url, tokens, output_len, timeout):
+def generate(url, tokens, output_len, timeout, *, rid=None):
     payload = {
         "input_ids": tokens,
         "sampling_params": {
@@ -214,6 +217,8 @@ def generate(url, tokens, output_len, timeout):
         },
         "stream": True,
     }
+    if rid is not None:
+        payload["rid"] = rid
     request = urllib.request.Request(
         url + "/generate",
         data=json.dumps(payload).encode(),
@@ -304,6 +309,59 @@ def stop(process):
     process.wait(timeout=10)
 
 
+def validate_traces(directory, tp, steps, mode, *, batch_size=None):
+    traces = [
+        p for p in directory.glob("rank-*.json") if not p.name.endswith(".trace.json")
+    ]
+    if len(traces) != tp:
+        raise RuntimeError(
+            f"expected {tp} rank traces, found {len(traces)}; inspect server.log"
+        )
+    required = {
+        "step",
+        "draft",
+        "draft.model",
+        "target_verify",
+        "target.attention_core",
+        "target.attention_block",
+        "target.mlp",
+    }
+    if mode == "lagom":
+        required.update(
+            {
+                "target.kv_plan",
+                "target.kv_refill",
+                "target.kv_prefetch",
+                "target.prefetch_wait",
+            }
+        )
+    elif mode == "hisparse":
+        required.add("target.kv_refill_fused")
+    for path in traces:
+        data = json.loads(path.read_text())
+        if len(data["records"]) != steps or not all(
+            r["cuda_graph"] and r.get("draft_cuda_graph", False)
+            for r in data["records"]
+        ):
+            raise RuntimeError(
+                f"trace incomplete or draft/target fell back to eager: {path}"
+            )
+        if batch_size is not None and any(
+            r["batch_size"] != batch_size for r in data["records"]
+        ):
+            raise RuntimeError(f"trace contains a non-full running batch: {path}")
+        for step in range(steps):
+            found = {
+                r["name"]
+                for r in data["regions"]
+                if r["step"] == step and r["end_ns"] >= r["start_ns"] > 0
+            }
+            if required - found:
+                raise RuntimeError(
+                    f"missing GPU markers in {path}, step {step}: {sorted(required - found)}"
+                )
+
+
 def run_mode(args, mode, stage, rows):
     folder = args.output / stage / mode
     folder.mkdir(parents=True)
@@ -313,6 +371,7 @@ def run_mode(args, mode, stage, rows):
     env["SGLANG_RAGGED_VERIFY_MODE"] = "static"
     # Never leak diagnostic markers from a parent shell into measured throughput.
     env.pop("SGLANG_LAGOM_PERF_TRACE", None)
+    env.pop("SGLANG_LAGOM_DECODE_PERF", None)
     env.pop("SGLANG_DSPARK_DEBUG_DUMP", None)
     env.pop("SGLANG_OASISKV_TRACE_CONFIG", None)
     if stage == "trace":
@@ -426,56 +485,12 @@ def run_mode(args, mode, stage, rows):
             if remaining <= 0:
                 raise TimeoutError("trace runtime budget exhausted")
             generate(url, rows[0]["input_ids"], 8, min(args.request_timeout, remaining))
-            traces = list((folder / "steps").glob("rank-*.json"))
-            traces = [p for p in traces if not p.name.endswith(".trace.json")]
-            if len(traces) != args.tp:
-                raise RuntimeError(
-                    f"expected {args.tp} rank traces, found {len(traces)}; inspect server.log"
-                )
-            for path in traces:
-                data = json.loads(path.read_text())
-                if len(data["records"]) != args.trace_steps or not all(
-                    r["cuda_graph"] and r.get("draft_cuda_graph", False)
-                    for r in data["records"]
-                ):
-                    raise RuntimeError(
-                        f"trace incomplete or draft/target fell back to eager: {path}"
-                    )
-                required = {
-                    "step",
-                    "draft",
-                    "draft.model",
-                    "target_verify",
-                    "target.attention_core",
-                    "target.attention_block",
-                    "target.mlp",
-                }
-                if mode == "lagom":
-                    required.update(
-                        {
-                            "target.kv_plan",
-                            "target.kv_refill",
-                            "target.kv_prefetch",
-                            "target.prefetch_wait",
-                        }
-                    )
-                elif mode == "hisparse":
-                    required.add("target.kv_refill_fused")
-                for step in range(args.trace_steps):
-                    found = {
-                        r["name"]
-                        for r in data["regions"]
-                        if r["step"] == step and r["end_ns"] >= r["start_ns"] > 0
-                    }
-                    if required - found:
-                        raise RuntimeError(
-                            f"missing GPU markers in {path}, step {step}: {sorted(required - found)}"
-                        )
+            validate_traces(folder / "steps", args.tp, args.trace_steps, mode)
         finally:
             stop(process)
 
 
-def parser():
+def parser(*, high_concurrency=False):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", required=True)
     p.add_argument("--draft", required=True)
@@ -500,14 +515,27 @@ def parser():
     p.add_argument("--top-k", type=int, default=512)
     p.add_argument("--input-len", type=int, default=32000)
     p.add_argument("--output-len", type=int, default=1024)
-    p.add_argument("--requests", type=int, default=2)
+    if not high_concurrency:
+        p.add_argument("--requests", type=int, default=2)
     p.add_argument("--warmup-output", type=int, default=32)
     p.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
-    p.add_argument("--trace-modes", nargs="+", choices=MODES, default=["lagom"])
-    p.add_argument("--phase", choices=("throughput", "trace", "all"), default="all")
+    p.add_argument(
+        "--trace-modes",
+        nargs="+",
+        choices=MODES,
+        default=list(MODES) if high_concurrency else ["lagom"],
+    )
+    p.add_argument(
+        "--phase",
+        choices=("throughput", "trace", "all"),
+        default="throughput" if high_concurrency else "all",
+    )
     p.add_argument("--trace-steps", type=int, default=12)
     p.add_argument("--trace-skip", type=int, default=2)
-    p.add_argument("--trace-output", type=int, default=160)
+    if high_concurrency:
+        p.set_defaults(trace_output=160)
+    else:
+        p.add_argument("--trace-output", type=int, default=160)
     p.add_argument(
         "--nsys",
         action="store_true",
@@ -517,11 +545,13 @@ def parser():
     p.add_argument("--chunked-prefill", type=int, default=4096)
     p.add_argument("--mem-fraction", type=float, default=0.8)
     p.add_argument("--startup-timeout", type=float, default=900)
-    p.add_argument("--request-timeout", type=float, default=180)
+    p.add_argument(
+        "--request-timeout", type=float, default=600 if high_concurrency else 180
+    )
     p.add_argument(
         "--mode-budget",
         type=float,
-        default=600,
+        default=900 if high_concurrency else 600,
         help="seconds after startup, not counting checkpoint load/capture",
     )
     p.add_argument("--server-args-json")
