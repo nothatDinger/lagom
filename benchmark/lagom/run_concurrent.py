@@ -38,6 +38,12 @@ def parser():
         default=8,
         help="client/server concurrency cap; actual decode batches need not reach it",
     )
+    p.add_argument(
+        "--requests",
+        type=int,
+        default=16,
+        help="total benchmark requests per mode per phase, independent of concurrency; excludes warmup/flush",
+    )
     p.add_argument("--measure-steps", type=int, default=32)
     p.add_argument(
         "--decode-warmup",
@@ -235,11 +241,19 @@ def window_diagnostics(directory):
 
 
 def run_cohort(args, url, rows, folder, deadline):
-    barrier = threading.Barrier(args.max_concurrency)
-    pool = ThreadPoolExecutor(max_workers=args.max_concurrency)
+    if len(rows) != args.requests + 1 or args.requests <= 0:
+        raise ValueError(
+            "need one warmup prompt plus exactly --requests benchmark prompts"
+        )
+    clients = min(args.requests, args.max_concurrency)
+    barrier = threading.Barrier(clients)
+    pool = ThreadPoolExecutor(max_workers=clients)
 
     def submit(index, row):
-        barrier.wait(timeout=30)
+        # Align only the initial arrivals. Later requests start as soon as a
+        # worker is free; a barrier on every task would stall non-full tails.
+        if index < clients:
+            barrier.wait(timeout=min(30, max(0.01, deadline - time.monotonic())))
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("mode runtime budget exhausted")
@@ -253,6 +267,7 @@ def run_cohort(args, url, rows, folder, deadline):
             rid=rid,
         )
         result.update(
+            request_index=index,
             rid=rid,
             prompt_sha256=row["token_sha256"],
             submitted_s=submitted_s,
@@ -273,18 +288,28 @@ def run_cohort(args, url, rows, folder, deadline):
     finally:
         # On error the enclosing server finally kills our process group, which
         # closes in-flight requests; do not block cleanup waiting on sockets.
+        barrier.abort()
         pool.shutdown(wait=False, cancel_futures=True)
+    initial = [r for r in results if r["request_index"] < clients]
     (folder / "cohort.json").write_text(
         json.dumps(
             {
                 "requests": len(results),
+                "requested_requests": args.requests,
+                "max_concurrency": args.max_concurrency,
+                "client_concurrency_limit": clients,
+                "load_pattern": "replenish_on_completion",
                 "client_wall_s_including_prefill": time.monotonic() - started,
                 "first_token_spread_s": max(r["first_token_s"] for r in results)
                 - min(r["first_token_s"] for r in results),
-                "all_requests_token_stream_overlap_s": max(
+                "initial_wave_first_token_spread_s": max(
+                    r["first_token_s"] for r in initial
+                )
+                - min(r["first_token_s"] for r in initial),
+                "initial_wave_token_stream_overlap_s": max(
                     0,
-                    min(r["finished_s"] for r in results)
-                    - max(r["first_token_s"] for r in results),
+                    min(r["finished_s"] for r in initial)
+                    - max(r["first_token_s"] for r in initial),
                 ),
             },
             indent=2,
@@ -446,6 +471,8 @@ def run_mode(args, mode, phase, rows):
                 steps=args.measure_steps,
             )
             summary.update(
+                requests=args.requests,
+                client_concurrency_limit=min(args.requests, args.max_concurrency),
                 input_len=args.input_len,
                 requested_output_len=args.output_len,
                 decode_warmup=args.decode_warmup,
@@ -494,7 +521,8 @@ def main():
                 )
             )
         print(
-            f"concurrency cap={args.max_concurrency}; actual batch may be 1..{args.max_concurrency}; "
+            f"requests={args.requests} per mode/phase; concurrency cap={args.max_concurrency}; "
+            f"actual batch may be 1..{min(args.requests, args.max_concurrency)}; "
             f"warmup={args.decode_warmup}, measured decode steps={args.measure_steps}; "
             f"Lagom and DSPARK+HiSparse both use device_buffer_size={args.hot}"
         )
@@ -508,6 +536,9 @@ def main():
     manifest["input_format"] = "packed_sharegpt_token_ids_no_chat_template"
     manifest["measurement"] = "consecutive_decode_cuda_events_with_concurrency_cap"
     manifest["comparison_controls"] = {
+        "requests_per_mode_per_phase": args.requests,
+        "max_concurrency": args.max_concurrency,
+        "load_pattern": "replenish_on_completion",
         "hisparse_device_buffer_size": args.hot,
         "hisparse_host_to_device_ratio": 2,
         "hisparse_force_h2d_each_step": False,
@@ -515,7 +546,7 @@ def main():
         "note": "Both HiSparse modes share these cache settings; plain DSPARK has no HiSparse device buffer.",
     }
     (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    rows = common.prepare(args, prompt_count=args.max_concurrency + 1)
+    rows = common.prepare(args)
     summaries = []
     if args.phase in ("throughput", "all"):
         for mode in args.modes:

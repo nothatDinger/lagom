@@ -6,7 +6,8 @@ DSPARK 的 CUDA GPU、模型依赖及本地 ShareGPT JSON。当前开发环境�
 这些实验尚未实际执行。
 
 并发上限 8/16/32/64、按实际 running batch 统计 decode 性能的测试，见
-[高并发实验说明](CONCURRENCY.md)，入口为 `run_concurrent.py`。
+[高并发实验说明](CONCURRENCY.md)，入口为 `run_concurrent.py`，可用 `--requests`
+独立设置正式请求总数。
 
 ## 三组对比
 

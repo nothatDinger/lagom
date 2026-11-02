@@ -64,6 +64,7 @@ def test_concurrency_cap_commands_keep_all_baselines_comparable(
         args.phase == "throughput"
         and args.input_len == 32000
         and args.output_len == 1024
+        and args.requests == 16
     )
     assert args.trace_modes == list(bench.common.MODES)
     for mode in bench.common.MODES:
@@ -288,38 +289,64 @@ def test_invalid_measurements_fail(bench, case):
         bench.aggregate_decode(data, mode="dspark", max_batch_size=8, steps=2)
 
 
-def test_cohort_is_submitted_concurrently_with_distinct_ids(
-    bench, monkeypatch, tmp_path
+@pytest.mark.parametrize("requests", [3, 8, 19])
+def test_request_count_is_independent_and_clients_replenish_without_wave_barriers(
+    bench, monkeypatch, tmp_path, requests
 ):
-    args = settings(bench)
+    args = settings(bench, "--requests", str(requests), "--max-concurrency", "8")
+    clients = min(requests, 8)
     lock = threading.Lock()
     arrived, active, peak = threading.Event(), 0, 0
+    replenished = threading.Event()
     seen = set()
 
     def generate(url, tokens, output_len, timeout, *, rid):
         nonlocal active, peak
+        index = int(rid.removeprefix(bench.REQUEST_PREFIX))
         with lock:
             seen.add(rid)
             active += 1
             peak = max(peak, active)
-            if active == 8:
+            assert active <= clients
+            if active == clients:
                 arrived.set()
         assert arrived.wait(5), "requests were serialized instead of submitted together"
+        if index >= clients:
+            replenished.set()
+        if index == 0 and requests > clients:
+            assert replenished.wait(
+                5
+            ), "next request waited for the entire initial wave to finish"
         with lock:
             active -= 1
         return {"output_tokens": output_len, "ttft_s": 0.001}
 
     monkeypatch.setattr(bench.common, "generate", generate)
-    rows = [{"input_ids": [i], "token_sha256": str(i)} for i in range(9)]
+    rows = [{"input_ids": [i], "token_sha256": str(i)} for i in range(requests + 1)]
     bench.run_cohort(args, "http://unused", rows, tmp_path, time.monotonic() + 10)
-    assert peak == 8 and len(seen) == 8
+    assert peak == clients and len(seen) == requests
     results = json.loads((tmp_path / "requests.json").read_text())
-    assert len(results) == 8
+    assert len(results) == requests
+    assert sorted(r["request_index"] for r in results) == list(range(requests))
     assert all(r["first_token_s"] == r["submitted_s"] + r["ttft_s"] for r in results)
     cohort = json.loads((tmp_path / "cohort.json").read_text())
+    assert cohort["requests"] == cohort["requested_requests"] == requests
+    assert cohort["max_concurrency"] == 8
+    assert cohort["client_concurrency_limit"] == clients
+    assert cohort["load_pattern"] == "replenish_on_completion"
     assert cohort["first_token_spread_s"] == max(
         r["first_token_s"] for r in results
     ) - min(r["first_token_s"] for r in results)
+    initial = [r for r in results if r["request_index"] < clients]
+    assert cohort["initial_wave_first_token_spread_s"] == max(
+        r["first_token_s"] for r in initial
+    ) - min(r["first_token_s"] for r in initial)
+
+
+@pytest.mark.parametrize("requests", [0, -1])
+def test_request_count_must_be_positive(bench, requests):
+    with pytest.raises(ValueError, match="request count must be positive"):
+        settings(bench, "--requests", str(requests))
 
 
 def test_meter_defers_device_reads_and_discards_prefill_interruption(
