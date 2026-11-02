@@ -1,4 +1,4 @@
-"""Full running-batch selection, TP accounting, and bounded concurrent load."""
+"""Concurrency caps, variable decode batches, TP accounting, and load generation."""
 
 import copy
 import importlib.util
@@ -47,8 +47,18 @@ def settings(bench, *extra):
     return args
 
 
-@pytest.mark.parametrize("size", [8, 16, 32, 64])
-def test_full_concurrency_commands_keep_all_baselines_comparable(bench, size):
+@pytest.mark.parametrize(
+    "size,graph_sizes",
+    [
+        (8, [1, 2, 4, 8]),
+        (16, [1, 2, 4, 8, 16]),
+        (32, [1, 2, 4, 8, 16, 32]),
+        (64, [1, 2, 4, 8, 16, 32, 64]),
+    ],
+)
+def test_concurrency_cap_commands_keep_all_baselines_comparable(
+    bench, size, graph_sizes
+):
     args = settings(bench, "--max-concurrency", str(size))
     assert (
         args.phase == "throughput"
@@ -60,48 +70,73 @@ def test_full_concurrency_commands_keep_all_baselines_comparable(bench, size):
         cmd = bench.common.server_command(args, mode, 30000, max_running_requests=size)
         assert cmd[cmd.index("--max-running-requests") + 1] == str(size)
         assert json.loads(cmd[cmd.index("--cuda-graph-config") + 1]) == {
-            "decode": {"bs": [1, size]}
+            "decode": {"bs": graph_sizes}
         }
         assert cmd[cmd.index("--speculative-num-draft-tokens") + 1] == "8"
         assert ("--enable-hisparse" in cmd) == (mode != "dspark")
 
 
-def test_window_restarts_on_prefill_partial_batch_and_cohort_change():
-    window = lagom_decode_perf.FullBatchWindow(8, steps=2, warmup=1)
+@pytest.mark.parametrize("hot", [7680, 8192])
+def test_hisparse_and_lagom_share_cache_capacity_and_other_cache_controls(bench, hot):
+    args = settings(bench, "--hot", str(hot))
+    configs = {}
+    for mode in ("lagom", "hisparse"):
+        command = bench.common.server_command(args, mode, 30000, max_running_requests=8)
+        configs[mode] = json.loads(command[command.index("--hisparse-config") + 1])
+    lagom = configs["lagom"]
+    assert lagom.pop("prefetcher") == "lagom"
+    assert lagom.pop("prefetcher_config") == {"prediction_steps": 7}
+    assert (
+        lagom
+        == configs["hisparse"]
+        == {
+            "device_buffer_size": hot,
+            "host_to_device_ratio": 2,
+            "force_h2d_each_step": False,
+        }
+    )
+
+
+def test_decode_warmup_retains_old_cli_spelling_as_alias(bench):
+    assert settings(bench, "--decode-warmup", "2").decode_warmup == 2
+    assert settings(bench, "--full-batch-warmup", "2").decode_warmup == 2
+
+
+def test_window_allows_batch_and_cohort_changes_but_restarts_on_prefill():
+    window = lagom_decode_perf.DecodeWindow(8, steps=3, warmup=1)
     ids = list(map(str, range(8)))
-    assert window.select(ids[:7], True) is None  # Graph padding to 8 does not count.
-    assert window.select(ids, True) is None
-    assert window.select(ids, True) == 0
+    assert window.select(ids[:7], True) is None  # Warm up below the cap.
+    assert window.select(ids[:6], True) == 0
     assert window.select(ids, False) is None  # Interleaved prefill discards step 0.
     assert window.discarded == 1
-    assert window.select(ids, True) is None
-    assert window.select(ids, True) == 0
+    assert window.select(ids[:1], True) is None
+    assert window.select(ids[:7], True) == 0
     changed = ids[:-1] + ["replacement"]
-    assert window.select(changed, True) is None
-    assert window.discarded == 2
-    assert window.select(changed, True) == 0
     assert window.select(changed, True) == 1
+    assert window.select(ids[:3], True) == 2
+    assert window.discarded == 1
     window.complete = True
     assert window.select(ids[:2], True) is None
 
 
-def test_diagnostics_distinguish_missing_batch_from_budget_rejection():
+def test_diagnostics_allow_below_cap_and_reject_only_budget_or_invalid_batches():
     diagnostics = lagom_decode_perf.DecodeDiagnostics(8, 8, "r")
     ids = [f"r{i}" for i in range(8)]
-    assert not diagnostics.observe(ids[:7], [900] * 7, True, 1)
+    assert diagnostics.observe(ids[:7], [900] * 7, True, 1)
     assert not diagnostics.observe(ids, [16] + [900] * 7, True, 2)
     assert diagnostics.observe(ids, [17] + [900] * 7, True, 3)
-    assert diagnostics.observe(ids, [17] + [900] * 7, True, 4)
+    assert diagnostics.observe(ids[:6], [17] + [900] * 5, True, 4)
     assert not diagnostics.observe(ids, [900] * 8, False, 5)
     assert diagnostics.observe(ids, [900] * 8, True, 6)
+    assert not diagnostics.observe(ids + ["r8"], [900] * 9, True, 7)
     data = diagnostics.snapshot()
-    assert data["benchmark_decode_batch_histogram"] == {7: 1, 8: 4}
-    assert data["full_decode_forwards_before_budget_filter"] == 4
-    assert data["eligible_full_decode_forwards"] == 3
-    assert data["longest_eligible_full_decode_streak"] == 2
-    assert data["first_full_decode"]["remaining_output_budget_cpu"][0] == 16
+    assert data["benchmark_decode_batch_histogram"] == {7: 1, 8: 3, 6: 1, 9: 1}
+    assert data["at_cap_decode_forwards_before_budget_filter"] == 3
+    assert data["eligible_decode_forwards"] == 4
+    assert data["longest_eligible_decode_streak"] == 2
+    assert data["first_decode_at_cap"]["remaining_output_budget_cpu"][0] == 16
     assert data["rejected_forward_counts"] == {
-        "batch_size_mismatch": 1,
+        "batch_size_out_of_range": 1,
         "output_headroom": 1,
         "not_pure_decode": 1,
     }
@@ -111,7 +146,7 @@ def test_final_status_is_not_throttled_and_counts_batch_before_budget_filter(
     bench, tmp_path
 ):
     meter = object.__new__(lagom_decode_perf.DecodeMeter)
-    meter.window = lagom_decode_perf.FullBatchWindow(8, 32, 4)
+    meter.window = lagom_decode_perf.DecodeWindow(8, 32, 4)
     meter.width, meter.request_prefix, meter.flush_request_id = 8, "r", "flush"
     meter.diagnostics = lagom_decode_perf.DecodeDiagnostics(8, 8, "r")
     meter.poll = Mock()
@@ -141,23 +176,29 @@ def test_final_status_is_not_throttled_and_counts_batch_before_budget_filter(
     data = json.loads(meter.stem.with_suffix(".status.json").read_text())
     assert data["cohort_finished"]
     assert data["observed_max_decode_batch_size"] == 8
-    assert data["full_decode_forwards_before_budget_filter"] == 1
-    assert data["eligible_full_decode_forwards"] == 0
+    assert data["at_cap_decode_forwards_before_budget_filter"] == 1
+    assert data["eligible_decode_forwards"] == 0
     message = bench.window_diagnostics(tmp_path)
-    assert "max_decode_batch=8" in message and "full_before_budget=1" in message
+    assert "max_decode_batch=8" in message and "eligible_decode_forwards=0" in message
 
 
 def reports():
     records = []
     for i, (start, end) in enumerate(((0, 4), (6, 12))):
+        ids = (
+            [f"r{j}" for j in range(7)]
+            if i == 0
+            else [f"r{j}" for j in (0, 1, 2, 3, 4, 7)]
+        )
+        size = len(ids)
         records.append(
             {
                 "step": i,
                 "forward_iter": 10 + i,
-                "batch_size": 8,
-                "request_ids": [f"r{j}" for j in range(8)],
-                "accepted_tokens": [2] * 8,
-                "remaining_output_budget_cpu": [900] * 8,
+                "batch_size": size,
+                "request_ids": ids,
+                "accepted_tokens": [2] * size,
+                "remaining_output_budget_cpu": [900] * size,
                 "cuda_graph": True,
                 "draft_cuda_graph": True,
                 "start_ms": start,
@@ -166,32 +207,54 @@ def reports():
                 "cpu_submit_ms": 1,
             }
         )
-    first = {"records": records, "batch_size": 8, "window_ms": 12, "verify_width": 8}
+    first = {
+        "schema_version": 2,
+        "records": records,
+        "max_batch_size": 8,
+        "window_ms": 12,
+        "verify_width": 8,
+    }
     return [first, copy.deepcopy(first)]
 
 
 def test_tp_tokens_count_once_and_window_includes_scheduler_gaps(bench):
     data = reports()
-    summary, steps = bench.aggregate_decode(data, mode="lagom", batch_size=8, steps=2)
-    assert summary["output_tokens"] == 32
-    assert summary["decode_tokens_per_s"] == pytest.approx(32000 / 12)
-    assert summary["gpu_forward_tokens_per_s"] == 3200
+    summary, steps = bench.aggregate_decode(
+        data, mode="lagom", max_batch_size=8, steps=2
+    )
+    assert summary["output_tokens"] == 26  # Actual batch 7 + 6, never reaches cap 8.
+    assert summary["decode_tokens_per_s"] == pytest.approx(26000 / 12)
+    assert summary["gpu_forward_tokens_per_s"] == 2600
+    assert summary["mean_running_batch_size"] == 6.5
+    assert summary["max_running_batch_size"] == 7
+    assert summary["min_running_batch_size"] == 6
+    assert json.loads(summary["running_batch_histogram"]) == {"6": 1, "7": 1}
+    assert summary["mean_accepted_tokens_per_request_per_step"] == 2
+    assert "mean_per_request_tokens_per_s" not in summary
+    assert [s["running_batch_size"] for s in steps] == [7, 6]
     assert steps[1]["inter_step_gap_ms_max_rank"] == 2
+    by_batch = bench.group_steps_by_batch_size(steps)
+    assert [r["running_batch_size"] for r in by_batch] == [6, 7]
+    assert [r["output_tokens"] for r in by_batch] == [12, 14]
+    assert [r["gpu_forward_tokens_per_s"] for r in by_batch] == [2000, 3500]
 
 
 def test_full_verify_acceptance_is_valid(bench):
     data = reports()
     for report in data:
         for record in report["records"]:
-            record["accepted_tokens"] = [report["verify_width"]] * 8
-    summary, _ = bench.aggregate_decode(data, mode="dspark", batch_size=8, steps=2)
-    assert summary["output_tokens"] == 128
+            record["accepted_tokens"] = [report["verify_width"]] * record["batch_size"]
+    summary, _ = bench.aggregate_decode(data, mode="dspark", max_batch_size=8, steps=2)
+    assert summary["output_tokens"] == 104
 
 
 @pytest.mark.parametrize(
     "case",
     [
-        "partial",
+        "size_mismatch",
+        "above_cap",
+        "empty",
+        "different_cohort",
         "eager",
         "different_step",
         "step_gap",
@@ -199,11 +262,17 @@ def test_full_verify_acceptance_is_valid(bench):
         "output_cap",
     ],
 )
-def test_invalid_measurements_fail_instead_of_reporting_partial_throughput(bench, case):
+def test_invalid_measurements_fail(bench, case):
     data = reports()
     record = data[1]["records"][0]
-    if case == "partial":
-        record["batch_size"] = 7
+    if case == "size_mismatch":
+        record["batch_size"] = 6
+    elif case == "above_cap":
+        record["batch_size"] = 9
+    elif case == "empty":
+        record["batch_size"] = 0
+    elif case == "different_cohort":
+        record["request_ids"][0] = "another-request"
     elif case == "eager":
         record["draft_cuda_graph"] = False
     elif case == "different_step":
@@ -216,7 +285,7 @@ def test_invalid_measurements_fail_instead_of_reporting_partial_throughput(bench
     else:
         record["remaining_output_budget_cpu"][0] = 16
     with pytest.raises(ValueError):
-        bench.aggregate_decode(data, mode="dspark", batch_size=8, steps=2)
+        bench.aggregate_decode(data, mode="dspark", max_batch_size=8, steps=2)
 
 
 def test_cohort_is_submitted_concurrently_with_distinct_ids(
@@ -288,7 +357,7 @@ def test_meter_defers_device_reads_and_discards_prefill_interruption(
             return self.values
 
     meter = object.__new__(lagom_decode_perf.DecodeMeter)
-    meter.window = lagom_decode_perf.FullBatchWindow(8, 2, 1)
+    meter.window = lagom_decode_perf.DecodeWindow(8, 2, 1)
     meter.width, meter.request_prefix = 8, "r"
     meter.flush_request_id = "flush"
     meter.diagnostics = lagom_decode_perf.DecodeDiagnostics(8, 8, "r")
@@ -311,18 +380,19 @@ def test_meter_defers_device_reads_and_discards_prefill_interruption(
     def forward(self, batch):
         lagom_perf.note_draft_graph(True)
         clock[0] += batch.work_ms
+        result.accept_lens = DeviceValues([2] * len(batch.reqs))
         batch.seq_lens.values[:] = [99999] * len(batch.reqs)
         return result
 
     for i, (decode, size, work) in enumerate(
         [
+            (False, 7, 1),
             (True, 7, 1),
-            (True, 8, 1),
-            (True, 8, 4),
+            (True, 7, 4),
             (False, 8, 100),
-            (True, 8, 1),
-            (True, 8, 4),
-            (True, 8, 6),
+            (True, 6, 1),
+            (True, 7, 4),
+            (True, 6, 6),
         ]
     ):
         if i == 6:
@@ -353,15 +423,19 @@ def test_meter_defers_device_reads_and_discards_prefill_interruption(
     assert [r["step_ms"] for r in data["records"]] == [4, 6]
     assert [r["prefix_lens"][0] for r in data["records"]] == [32005, 32006]
     assert all(r["draft_cuda_graph"] for r in data["records"])
+    assert [r["batch_size"] for r in data["records"]] == [7, 6]
+    assert [len(r["accepted_tokens"]) for r in data["records"]] == [7, 6]
 
 
-def test_trace_filters_real_batch_size_and_pauses_during_prefill():
+def test_trace_allows_under_cap_batches_excludes_warmup_and_pauses_prefill():
     trace = object.__new__(lagom_perf.StepTrace)
-    trace.required_batch_size, trace.seen, trace.skip, trace.steps = 8, 0, 1, 2
+    trace.required_batch_size = None
+    trace.max_batch_size, trace.request_prefix = 8, "r"
+    trace.seen, trace.skip, trace.steps = 0, 1, 2
     trace.poll, trace.slot, trace.nsys, trace.records = Mock(), Mock(), False, []
-    for i, size in enumerate([1, 8, 7, 8, 8]):
+    for i, size in enumerate([1, 1, 9, 7, 6]):
         batch = SimpleNamespace(
-            reqs=[SimpleNamespace(rid=str(j)) for j in range(size)],
+            reqs=[SimpleNamespace(rid=f"r{j}" if i else "warmup") for j in range(size)],
             seq_lens_cpu=SimpleNamespace(tolist=lambda size=size: [32000] * size),
             forward_iter=i,
         )
@@ -372,7 +446,70 @@ def test_trace_filters_real_batch_size_and_pauses_during_prefill():
             trace.slot.fill_.assert_called_with(-1)
     assert trace.seen == 3
     assert [r["forward_iter"] for r in trace.records] == [3, 4]
-    assert all(r["batch_size"] == 8 for r in trace.records)
+    assert [r["batch_size"] for r in trace.records] == [7, 6]
+
+
+@pytest.mark.parametrize("mode", ["lagom", "hisparse", "dspark"])
+def test_trace_report_validation_accepts_variable_batches_below_cap(
+    bench, tmp_path, mode
+):
+    records = reports()[0]["records"]
+    for record in records:
+        record["request_ids"] = [
+            bench.REQUEST_PREFIX + rid for rid in record["request_ids"]
+        ]
+    names = [
+        "step",
+        "draft",
+        "draft.model",
+        "target_verify",
+        "target.attention_core",
+        "target.attention_block",
+        "target.mlp",
+    ]
+    if mode == "lagom":
+        names += [
+            "target.kv_plan",
+            "target.kv_refill",
+            "target.kv_prefetch",
+            "target.prefetch_wait",
+        ]
+    elif mode == "hisparse":
+        names += ["target.kv_refill_fused"]
+    data = {
+        "records": records,
+        "regions": [
+            {"step": step, "name": name, "start_ns": 1, "end_ns": 2}
+            for step in range(2)
+            for name in names
+        ],
+    }
+    path = tmp_path / "rank-test.json"
+    path.write_text(json.dumps(data))
+    bench.common.validate_traces(
+        tmp_path,
+        1,
+        2,
+        mode,
+        max_batch_size=8,
+        request_prefix=bench.REQUEST_PREFIX,
+    )
+    records[0]["batch_size"] = 9
+    path.write_text(json.dumps(data))
+    with pytest.raises(RuntimeError, match="outside configured cap"):
+        bench.common.validate_traces(tmp_path, 1, 2, mode, max_batch_size=8)
+    records[0]["batch_size"] = 7
+    records[0]["request_ids"][0] = "lagom-warmup"
+    path.write_text(json.dumps(data))
+    with pytest.raises(RuntimeError, match="outside benchmark cohort"):
+        bench.common.validate_traces(
+            tmp_path,
+            1,
+            2,
+            mode,
+            max_batch_size=8,
+            request_prefix=bench.REQUEST_PREFIX,
+        )
 
 
 def test_decode_event_meter_with_cuda_graph(tmp_path):
@@ -383,7 +520,7 @@ def test_decode_event_meter_with_cuda_graph(tmp_path):
     meter = lagom_decode_perf.DecodeMeter(
         {
             "output_dir": str(tmp_path),
-            "batch_size": 8,
+            "max_batch_size": 8,
             "steps": 2,
             "warmup": 0,
             "verify_width": 8,

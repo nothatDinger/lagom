@@ -1,4 +1,4 @@
-"""Bounded, event-only measurement of consecutive full-batch DSPARK decodes.
+"""Bounded, event-only measurement of consecutive DSPARK decode forwards.
 
 CUDA events surround the worker call, outside captured graphs. All device
 metadata is collected after a completion event; no per-step synchronization.
@@ -38,26 +38,23 @@ def measure_decode(fn):
     return wrapped
 
 
-class FullBatchWindow:
-    """Require the same cohort and consecutive pure decode forwards."""
+class DecodeWindow:
+    """Measure pure decode below a batch-size cap, allowing cohort changes."""
 
-    def __init__(self, batch_size, steps, warmup):
-        if batch_size not in (8, 16, 32, 64) or not 1 <= steps <= 256 or warmup < 0:
-            raise ValueError("require batch size 8/16/32/64, steps 1..256, warmup >=0")
-        self.batch_size, self.steps, self.warmup = batch_size, steps, warmup
-        self.cohort, self.warmed, self.recorded, self.discarded = None, 0, 0, 0
+    def __init__(self, max_batch_size, steps, warmup):
+        if max_batch_size not in (8, 16, 32, 64) or not 1 <= steps <= 256 or warmup < 0:
+            raise ValueError("require batch cap 8/16/32/64, steps 1..256, warmup >=0")
+        self.max_batch_size, self.steps, self.warmup = max_batch_size, steps, warmup
+        self.warmed, self.recorded, self.discarded = 0, 0, 0
         self.complete = False
 
     def select(self, request_ids, eligible):
         if self.complete:
             return None
-        cohort = tuple(sorted(request_ids))
-        if not eligible or len(cohort) != self.batch_size or cohort != self.cohort:
+        if not eligible or not 0 < len(request_ids) <= self.max_batch_size:
             self.discarded += self.recorded
-            self.cohort, self.warmed, self.recorded = None, 0, 0
-        if not eligible or len(cohort) != self.batch_size:
+            self.warmed, self.recorded = 0, 0
             return None
-        self.cohort = cohort
         if self.warmed < self.warmup:
             self.warmed += 1
             return None
@@ -67,18 +64,18 @@ class FullBatchWindow:
 
 
 class DecodeDiagnostics:
-    """CPU-only admission evidence, including full batches rejected at the cap."""
+    """CPU-only admission evidence; reaching the configured cap is optional."""
 
-    def __init__(self, batch_size, width, request_prefix):
-        self.batch_size, self.width, self.request_prefix = (
-            batch_size,
+    def __init__(self, max_batch_size, width, request_prefix):
+        self.max_batch_size, self.width, self.request_prefix = (
+            max_batch_size,
             width,
             request_prefix,
         )
         self.histogram, self.rejections = Counter(), Counter()
         self.seen_requests, self.decoded_requests = set(), set()
-        self.full_steps, self.eligible_steps, self.longest_streak = 0, 0, 0
-        self.cohort, self.streak, self.first_full = None, 0, None
+        self.at_cap_steps, self.eligible_steps, self.longest_streak = 0, 0, 0
+        self.streak, self.first_at_cap = 0, None
 
     def observe(self, ids, remaining, pure_decode, forward_iter):
         test_ids = [rid for rid in ids if rid.startswith(self.request_prefix)]
@@ -88,10 +85,10 @@ class DecodeDiagnostics:
         benchmark_batch = bool(ids) and len(test_ids) == len(ids)
         if benchmark_batch and pure_decode:
             self.histogram[len(ids)] += 1
-            if len(ids) == self.batch_size:
-                self.full_steps += 1
-                if self.first_full is None:
-                    self.first_full = {
+            if len(ids) == self.max_batch_size:
+                self.at_cap_steps += 1
+                if self.first_at_cap is None:
+                    self.first_at_cap = {
                         "forward_iter": int(forward_iter),
                         "request_ids": list(ids),
                         "remaining_output_budget_cpu": list(remaining),
@@ -100,21 +97,18 @@ class DecodeDiagnostics:
             reason = "non_benchmark_request"
         elif not pure_decode:
             reason = "not_pure_decode"
-        elif len(ids) != self.batch_size:
-            reason = "batch_size_mismatch"
+        elif not 0 < len(ids) <= self.max_batch_size:
+            reason = "batch_size_out_of_range"
         elif any(n <= 2 * self.width for n in remaining):
             reason = "output_headroom"
         else:
             reason = None
-        cohort = tuple(sorted(ids))
-        if reason is not None or cohort != self.cohort:
-            self.streak = 0
-        self.cohort = cohort
         if reason is None:
             self.eligible_steps += 1
             self.streak += 1
             self.longest_streak = max(self.longest_streak, self.streak)
         else:
+            self.streak = 0
             self.rejections[reason] += 1
         return reason is None
 
@@ -123,11 +117,11 @@ class DecodeDiagnostics:
             "benchmark_decode_batch_histogram": dict(self.histogram),
             "benchmark_requests_seen": sorted(self.seen_requests),
             "benchmark_requests_seen_in_decode": sorted(self.decoded_requests),
-            "full_decode_forwards_before_budget_filter": self.full_steps,
-            "eligible_full_decode_forwards": self.eligible_steps,
-            "longest_eligible_full_decode_streak": self.longest_streak,
+            "at_cap_decode_forwards_before_budget_filter": self.at_cap_steps,
+            "eligible_decode_forwards": self.eligible_steps,
+            "longest_eligible_decode_streak": self.longest_streak,
             "rejected_forward_counts": dict(self.rejections),
-            "first_full_decode": self.first_full,
+            "first_decode_at_cap": self.first_at_cap,
         }
 
 
@@ -135,14 +129,16 @@ class DecodeMeter:
     def __init__(self, config):
         import torch
 
-        self.window = FullBatchWindow(
-            config["batch_size"], config["steps"], config["warmup"]
+        self.window = DecodeWindow(
+            config.get("max_batch_size", config.get("batch_size")),
+            config["steps"],
+            config["warmup"],
         )
         self.width = int(config["verify_width"])
         self.request_prefix = config["request_prefix"]
         self.flush_request_id = config.get("flush_request_id")
         self.diagnostics = DecodeDiagnostics(
-            self.window.batch_size, self.width, self.request_prefix
+            self.window.max_batch_size, self.width, self.request_prefix
         )
         self.output = Path(config["output_dir"])
         self.output.mkdir(parents=True, exist_ok=True)
@@ -238,10 +234,10 @@ class DecodeMeter:
             json.dumps(
                 {
                     "status": (
-                        "complete" if self.written else "waiting_for_full_decode_window"
+                        "complete" if self.written else "waiting_for_decode_window"
                     ),
                     "cohort_finished": force and not self.written,
-                    "required_batch_size": self.window.batch_size,
+                    "max_batch_size": self.window.max_batch_size,
                     "observed_max_decode_batch_size": self.observed_max_batch,
                     "forwards_observed": self.forwards,
                     "discarded_partial_steps": self.window.discarded,
@@ -262,9 +258,9 @@ class DecodeMeter:
             if record["prefix_lens"] is None:
                 record["prefix_lens"] = self.prefixes[i].cpu().tolist()
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "device": self.device,
-            "batch_size": self.window.batch_size,
+            "max_batch_size": self.window.max_batch_size,
             "steps": self.window.steps,
             "warmup": self.window.warmup,
             "verify_width": self.width,
@@ -273,7 +269,7 @@ class DecodeMeter:
             "discarded_partial_steps": self.window.discarded,
             "diagnostics": self.diagnostics.snapshot(),
             "notes": [
-                "Only consecutive pure decode forwards with the same full cohort are measured.",
+                "Consecutive pure decode forwards are measured at actual batch sizes from 1 to max_batch_size; cohort changes are allowed.",
                 "Window duration includes inter-step scheduler/CPU gaps; step spans are not additive with those gaps.",
                 "CUDA events and device snapshots add small measurement overhead; no layer trace kernels are enabled.",
                 "Accepted counts include bonus tokens, exclude prefill output, and are counted once across TP ranks.",

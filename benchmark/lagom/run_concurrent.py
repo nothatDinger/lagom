@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Compare pure decode at an actual full running batch of 8/16/32/64.
+"""Compare pure decode with a maximum concurrency of 8/16/32/64.
 
-One simultaneous cohort per mode. Throughput uses a bounded window of CUDA
-events, with detailed layer tracing in a separate optional server run.
+Actual decode batches may be smaller or change size. Throughput uses a bounded
+window of CUDA events, with detailed tracing in a separate optional server run.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import pairwise
 
@@ -24,36 +25,48 @@ if __package__:
 else:
     import run as common
 
-REQUEST_PREFIX = "lagom-full-batch-"
+REQUEST_PREFIX = "lagom-concurrent-"
 
 
 def parser():
     p = common.parser(high_concurrency=True)
     p.description = __doc__
-    p.add_argument("--max-concurrency", type=int, choices=(8, 16, 32, 64), default=8)
+    p.add_argument(
+        "--max-concurrency",
+        type=int,
+        choices=(8, 16, 32, 64),
+        default=8,
+        help="client/server concurrency cap; actual decode batches need not reach it",
+    )
     p.add_argument("--measure-steps", type=int, default=32)
-    p.add_argument("--full-batch-warmup", type=int, default=4)
+    p.add_argument(
+        "--decode-warmup",
+        "--full-batch-warmup",
+        dest="decode_warmup",
+        type=int,
+        default=4,
+        help="eligible decode warmup steps; the old --full-batch-warmup spelling is an alias",
+    )
     return p
 
 
 def validate(args):
     common.validate(args)
-    if not 1 <= args.measure_steps <= 256 or args.full_batch_warmup < 0:
-        raise ValueError("measure-steps must be 1..256, full-batch-warmup >=0")
+    if not 1 <= args.measure_steps <= 256 or args.decode_warmup < 0:
+        raise ValueError("measure-steps must be 1..256, decode-warmup >=0")
     if args.nsys and args.phase == "throughput":
         raise ValueError("--nsys requires --phase trace or all")
     steps = (
         args.trace_steps + args.trace_skip
         if args.phase == "trace"
-        else args.measure_steps + args.full_batch_warmup
+        else args.measure_steps + args.decode_warmup
     )
     if args.phase == "all":
         steps = max(steps, args.trace_steps + args.trace_skip)
     minimum = (steps + 3) * (args.w + 1) + 1
     if args.output_len < minimum:
         raise ValueError(
-            f"--output-len must be >= {minimum} to allow the full-batch window and output-cap headroom; "
-            "this lower bound does not cover admission skew or guarantee a full batch"
+            f"--output-len must be >= {minimum} to allow the decode window and output-cap headroom"
         )
 
 
@@ -64,33 +77,42 @@ def percentile(values, q):
     return values[i] + (values[min(i + 1, len(values) - 1)] - values[i]) * (x - i)
 
 
-def aggregate_decode(reports, *, mode, batch_size, steps):
+def aggregate_decode(reports, *, mode, max_batch_size, steps):
     if not reports:
-        raise ValueError("no full-batch decode reports")
+        raise ValueError("no decode reports")
     reference = reports[0]["records"]
     if len(reference) != steps:
         raise ValueError("incomplete decode window")
-    cohort = sorted(reference[0]["request_ids"])
     iters = [r["forward_iter"] for r in reference]
-    if len(set(cohort)) != batch_size or any(b != a + 1 for a, b in pairwise(iters)):
-        raise ValueError("invalid cohort or forward sequence")
+    if any(b != a + 1 for a, b in pairwise(iters)):
+        raise ValueError("invalid forward sequence")
     for report in reports:
         records = report["records"]
         if (
-            report["batch_size"] != batch_size
+            report.get("schema_version") != 2
+            or report.get("max_batch_size") != max_batch_size
             or len(records) != steps
             or report["window_ms"] <= 0
         ):
-            raise ValueError("incomplete full-batch decode window")
+            raise ValueError("incompatible or incomplete decode window")
         if [r["forward_iter"] for r in records] != iters:
             raise ValueError("TP ranks sampled different decode windows")
         for i, record in enumerate(records):
+            batch_size = record["batch_size"]
             if (
-                record["batch_size"] != batch_size
-                or sorted(record["request_ids"]) != cohort
+                not 0 < batch_size <= max_batch_size
+                or len(record["request_ids"]) != batch_size
+                or len(set(record["request_ids"])) != batch_size
                 or len(record["accepted_tokens"]) != batch_size
+                or len(record["remaining_output_budget_cpu"]) != batch_size
             ):
-                raise ValueError("decode sample is not the same full running cohort")
+                raise ValueError(
+                    "invalid actual decode batch or batch size exceeds cap"
+                )
+            if sorted(record["request_ids"]) != sorted(reference[i]["request_ids"]):
+                raise ValueError(
+                    "TP ranks disagree on request cohort for a decode step"
+                )
             if not record["cuda_graph"] or not record.get("draft_cuda_graph", False):
                 raise ValueError("draft/target fell back to eager in measured decode")
             if (
@@ -120,7 +142,7 @@ def aggregate_decode(reports, *, mode, batch_size, steps):
             {
                 "step": i,
                 "forward_iter": record["forward_iter"],
-                "running_batch_size": batch_size,
+                "running_batch_size": record["batch_size"],
                 "output_tokens": sum(record["accepted_tokens"]),
                 "gpu_step_ms_max_rank": max(
                     r["records"][i]["step_ms"] for r in reports
@@ -144,22 +166,51 @@ def aggregate_decode(reports, *, mode, batch_size, steps):
     tokens = sum(row["output_tokens"] for row in rows)
     window_ms = max(r["window_ms"] for r in reports)
     step_times = [row["gpu_step_ms_max_rank"] for row in rows]
+    batch_sizes = [row["running_batch_size"] for row in rows]
     summary = {
         "mode": mode,
-        "running_batch_size": batch_size,
+        "max_concurrency": max_batch_size,
+        "min_running_batch_size": min(batch_sizes),
+        "mean_running_batch_size": sum(batch_sizes) / steps,
+        "max_running_batch_size": max(batch_sizes),
+        "running_batch_histogram": json.dumps(
+            dict(sorted(Counter(batch_sizes).items()))
+        ),
         "measured_steps": steps,
         "output_tokens": tokens,
         "window_ms_max_rank": window_ms,
         "decode_tokens_per_s": tokens * 1000 / window_ms,
-        "mean_per_request_tokens_per_s": tokens * 1000 / window_ms / batch_size,
         "gpu_forward_tokens_per_s": tokens * 1000 / sum(step_times),
         "mean_step_cycle_ms": window_ms / steps,
         "mean_gpu_step_ms": sum(step_times) / steps,
         "p50_gpu_step_ms": percentile(step_times, 0.5),
         "p95_gpu_step_ms": percentile(step_times, 0.95),
-        "mean_accepted_tokens_per_request_per_step": tokens / batch_size / steps,
+        "mean_accepted_tokens_per_request_per_step": tokens / sum(batch_sizes),
     }
     return summary, rows
+
+
+def group_steps_by_batch_size(rows):
+    """GPU forward metrics at each actual batch size; no padding or TP duplication."""
+    grouped = []
+    for size in sorted({r["running_batch_size"] for r in rows}):
+        samples = [r for r in rows if r["running_batch_size"] == size]
+        tokens = sum(r["output_tokens"] for r in samples)
+        gpu_ms = sum(r["gpu_step_ms_max_rank"] for r in samples)
+        grouped.append(
+            {
+                "running_batch_size": size,
+                "measured_steps": len(samples),
+                "output_tokens": tokens,
+                "gpu_forward_ms": gpu_ms,
+                "gpu_forward_tokens_per_s": tokens * 1000 / gpu_ms,
+                "mean_gpu_step_ms": gpu_ms / len(samples),
+                "mean_accepted_tokens_per_request_per_step": tokens
+                / size
+                / len(samples),
+            }
+        )
+    return grouped
 
 
 def write_csv(path, rows):
@@ -176,8 +227,8 @@ def window_diagnostics(directory):
         data = json.loads(path.read_text())
         messages.append(
             f"{path.name}: max_decode_batch={data['observed_max_decode_batch_size']}, "
-            f"full_before_budget={data.get('full_decode_forwards_before_budget_filter', 'unknown')}, "
-            f"longest_eligible_streak={data.get('longest_eligible_full_decode_streak', 'unknown')}, "
+            f"eligible_decode_forwards={data.get('eligible_decode_forwards', 'unknown')}, "
+            f"longest_eligible_streak={data.get('longest_eligible_decode_streak', 'unknown')}, "
             f"rejections={data.get('rejected_forward_counts', {})}"
         )
     return "\n".join(messages)
@@ -261,9 +312,9 @@ def run_mode(args, mode, phase, rows):
     if phase == "throughput":
         config = {
             "output_dir": str(folder / "decode"),
-            "batch_size": args.max_concurrency,
+            "max_batch_size": args.max_concurrency,
             "steps": args.measure_steps,
-            "warmup": args.full_batch_warmup,
+            "warmup": args.decode_warmup,
             "verify_width": args.w + 1,
             "request_prefix": REQUEST_PREFIX,
             "flush_request_id": "lagom-flush",
@@ -272,7 +323,8 @@ def run_mode(args, mode, phase, rows):
     else:
         config = {
             "output_dir": str(folder / "steps"),
-            "required_batch_size": args.max_concurrency,
+            "max_batch_size": args.max_concurrency,
+            "request_prefix": REQUEST_PREFIX,
             "steps": args.trace_steps,
             "skip": args.trace_skip,
             "nsys": args.nsys,
@@ -369,7 +421,8 @@ def run_mode(args, mode, phase, rows):
                     args.tp,
                     args.trace_steps,
                     mode,
-                    batch_size=args.max_concurrency,
+                    max_batch_size=args.max_concurrency,
+                    request_prefix=REQUEST_PREFIX,
                 )
                 return None
             files = [
@@ -379,28 +432,43 @@ def run_mode(args, mode, phase, rows):
             ]
             if len(files) != args.tp:
                 raise RuntimeError(
-                    f"No complete full-batch window on all ranks: expected {args.tp} reports, got {len(files)}. "
-                    f"Need {args.full_batch_warmup}+{args.measure_steps} consecutive decode steps at actual batch "
-                    f"{args.max_concurrency}. Inspect decode/*.status.json and server.log for capacity/retractions; "
+                    f"No complete decode window on all ranks: expected {args.tp} reports, got {len(files)}. "
+                    f"Need {args.decode_warmup}+{args.measure_steps} consecutive pure decode steps with actual batch "
+                    f"in [1,{args.max_concurrency}]. Inspect decode/*.status.json and server.log for interruptions; "
                     "max_decode_batch is counted BEFORE the output-budget filter. "
-                    "No partial-batch throughput is reported.\n"
+                    "Reaching the concurrency cap is NOT required.\n"
                     + window_diagnostics(folder / "decode")
                 )
             summary, steps = aggregate_decode(
                 [json.loads(p.read_text()) for p in sorted(files)],
                 mode=mode,
-                batch_size=args.max_concurrency,
+                max_batch_size=args.max_concurrency,
                 steps=args.measure_steps,
             )
             summary.update(
                 input_len=args.input_len,
                 requested_output_len=args.output_len,
-                full_batch_warmup=args.full_batch_warmup,
+                decode_warmup=args.decode_warmup,
+                device_buffer_size=args.hot if mode != "dspark" else None,
+                host_to_device_ratio=2 if mode != "dspark" else None,
+                force_h2d_each_step=False if mode != "dspark" else None,
+                prediction_steps=args.p if mode == "lagom" else 0,
+                tp_size=args.tp,
+                top_k=args.top_k,
+                mem_fraction=args.mem_fraction,
+                chunked_prefill=args.chunked_prefill,
+                seed=args.seed,
+                cuda_graph_batch_sizes=json.dumps(
+                    common.capture_batch_sizes(args.max_concurrency)
+                ),
                 w=args.w,
                 p=args.p,
             )
             (folder / "summary.json").write_text(json.dumps(summary, indent=2))
             write_csv(folder / "decode_steps.csv", steps)
+            write_csv(
+                folder / "decode_by_batch_size.csv", group_steps_by_batch_size(steps)
+            )
             return summary
         finally:
             common.stop(process)
@@ -426,7 +494,9 @@ def main():
                 )
             )
         print(
-            f"actual full batch={args.max_concurrency}; warmup={args.full_batch_warmup}, measured decode steps={args.measure_steps}"
+            f"concurrency cap={args.max_concurrency}; actual batch may be 1..{args.max_concurrency}; "
+            f"warmup={args.decode_warmup}, measured decode steps={args.measure_steps}; "
+            f"Lagom and DSPARK+HiSparse both use device_buffer_size={args.hot}"
         )
         return
     args.output.mkdir(parents=True, exist_ok=False)
@@ -436,7 +506,14 @@ def main():
         ["git", "rev-parse", "HEAD"], cwd=common.ROOT, text=True
     ).strip()
     manifest["input_format"] = "packed_sharegpt_token_ids_no_chat_template"
-    manifest["measurement"] = "consecutive_actual_full_batch_decode_cuda_events"
+    manifest["measurement"] = "consecutive_decode_cuda_events_with_concurrency_cap"
+    manifest["comparison_controls"] = {
+        "hisparse_device_buffer_size": args.hot,
+        "hisparse_host_to_device_ratio": 2,
+        "hisparse_force_h2d_each_step": False,
+        "cuda_graph_batch_sizes": common.capture_batch_sizes(args.max_concurrency),
+        "note": "Both HiSparse modes share these cache settings; plain DSPARK has no HiSparse device buffer.",
+    }
     (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2))
     rows = common.prepare(args, prompt_count=args.max_concurrency + 1)
     summaries = []

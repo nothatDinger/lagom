@@ -208,6 +208,7 @@ def test_verify_step_snapshots_optional_cpu_lengths_without_host_wait(
     trace.written, trace.nsys, trace.nsys_running = False, False, False
     trace.seen, trace.skip, trace.steps, trace.active = 0, 1, 2, -1
     trace.required_batch_size = None
+    trace.max_batch_size, trace.request_prefix = None, None
     trace.output, trace.device = tmp_path, 0
     trace.records, trace.cpu, trace.events = [], [], []
     trace.accepted, trace.prefix_lens_gpu = {}, {}

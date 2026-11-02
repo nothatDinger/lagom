@@ -51,6 +51,13 @@ def validate(args):
         raise ValueError("timeouts must be positive")
 
 
+def capture_batch_sizes(max_running_requests):
+    return sorted(
+        {max_running_requests}
+        | {1 << i for i in range(max_running_requests.bit_length())}
+    )
+
+
 def server_command(args, mode, port, *, max_running_requests=1):
     command = [
         sys.executable,
@@ -88,7 +95,7 @@ def server_command(args, mode, port, *, max_running_requests=1):
         str(args.mem_fraction),
         "--cuda-graph-config",
         json.dumps(
-            {"decode": {"bs": sorted({1, max_running_requests})}},
+            {"decode": {"bs": capture_batch_sizes(max_running_requests)}},
             separators=(",", ":"),
         ),
         "--random-seed",
@@ -309,7 +316,16 @@ def stop(process):
     process.wait(timeout=10)
 
 
-def validate_traces(directory, tp, steps, mode, *, batch_size=None):
+def validate_traces(
+    directory,
+    tp,
+    steps,
+    mode,
+    *,
+    batch_size=None,
+    max_batch_size=None,
+    request_prefix=None,
+):
     traces = [
         p for p in directory.glob("rank-*.json") if not p.name.endswith(".trace.json")
     ]
@@ -350,6 +366,20 @@ def validate_traces(directory, tp, steps, mode, *, batch_size=None):
             r["batch_size"] != batch_size for r in data["records"]
         ):
             raise RuntimeError(f"trace contains a non-full running batch: {path}")
+        if max_batch_size is not None and any(
+            not 0 < r["batch_size"] <= max_batch_size
+            or len(r["request_ids"]) != r["batch_size"]
+            for r in data["records"]
+        ):
+            raise RuntimeError(f"trace batch size outside configured cap: {path}")
+        if request_prefix is not None and any(
+            not r["request_ids"]
+            or any(not rid.startswith(request_prefix) for rid in r["request_ids"])
+            for r in data["records"]
+        ):
+            raise RuntimeError(
+                f"trace contains requests outside benchmark cohort: {path}"
+            )
         for step in range(steps):
             found = {
                 r["name"]

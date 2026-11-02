@@ -1,14 +1,38 @@
-# 满 running batch 的 decode 性能测试
+# 并发上限下的 decode 性能测试
 
 入口 `benchmark/lagom/run_concurrent.py`，在 `perf/lagom` 分支运行。
-`--max-concurrency` 可选 **8 / 16 / 32 / 64**，每次选择一个值，默认 8。
-比较 `lagom`、`hisparse`（DSPARK+HiSparse）、`dspark` 三组。
+`--max-concurrency` 可选 **8 / 16 / 32 / 64**，默认 8，表示客户端和服务端允许的
+**最大并发**。实际 running batch 可以是 1 到 C，且可以逐轮变化。设置 C=8、实际
+最大 batch=7 是合法结果，不要求必须达到 8，也不要求同一批请求贯穿整个采样窗口。
 
-默认沿用 packed ShareGPT **input=32000、output=1024、W=P=7、hot=8192**，
-PD 融合、单机 TP。每组先跑一个输出 32 token 的预热请求，然后同时提交 C 个
-不同 prompt；三个模式复用相同 input_ids 和 request ID。每组只提交这一批 C 个
-正式请求，避免为维持压力不断补入新 prefill。GPU 是否有容量容纳 32K×C 的 KV，
-仍需实际验证，脚本不会静默降低并发或输入长度。
+默认 packed ShareGPT **input=32000、output=1024、W=P=7、hot=8192**，PD 融合、
+单机 TP。每组先跑一个输出 32 token 的预热请求，然后同时提交 C 个不同 prompt。
+每组只提交这一批正式请求，由服务端根据容量和调度情况决定实际 running batch。
+默认 `--phase throughput`，比较 `lagom`、`hisparse`（DSPARK+HiSparse）、`dspark`
+三组；`--modes` 可限制组别。
+
+## 控制变量
+
+三组复用相同 input_ids、request ID、输入/输出长度、并发上限、TP、W、采样参数、
+随机种子、prefill chunk、显存比例、后端参数和 CUDA Graph 配置。关闭 radix cache，
+设置 `ignore_eos=true`。不同模式的实际接受率和 batch 分布作为测量结果记录。
+
+| 设置 | Lagom | DSPARK+HiSparse | DSPARK |
+|---|---|---|---|
+| `device_buffer_size` | 同一个 `--hot` | **与 Lagom 相同** | 不适用 |
+| `host_to_device_ratio` | 2 | 2 | 不适用 |
+| `force_h2d_each_step` | false | false | 不适用 |
+| 预测窗口 | P 个额外 token | 无 | 无 |
+| 预取 | Lagom | 关闭 | 无 HiSparse |
+
+例如 `--hot 8192` 会同时给两个 HiSparse 组配置 8192，不能因为关闭预取就把基线
+单独降到 4096。脚本禁止通过额外 server arguments 覆盖实验控制的 HiSparse 参数。
+`manifest.json` 的 `comparison_controls`、各组 `launch.json` 和汇总 CSV 都保存
+容量等对照配置。纯 DSPARK 仍使用原生 CSA，没有 HiSparse device buffer。
+
+CUDA Graph 捕获 `[1,2,4,...,C]`，三组一致。实际 batch 使用合适的捕获档位；统计
+始终取真实 `len(batch.reqs)`，padding 不计入并发或接受 token 数。增加捕获档位
+会比旧版只捕获 `[1,C]` 多一些启动时间，但避免所有中间 batch 都 padding 到 C。
 
 ## H100 运行示例
 
@@ -19,135 +43,105 @@ python benchmark/lagom/run_concurrent.py \
   --model /mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-0731 \
   --draft /mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-DSpark \
   --sharegpt /data/ShareGPT_V3_unfiltered_cleaned_split.json \
-  --tp 4 --max-concurrency 16 \
+  --tp 4 --max-concurrency 8 --hot 8192 \
   --moe-runner-backend marlin --speculative-moe-runner-backend marlin \
-  --output ./results/lagom-c16
+  --output ./results/lagom-c8
 ```
 
-输出目录必须不存在。更换 `--max-concurrency 8/32/64` 时使用各自的新输出目录。
-若 draft 权重实际上是 FP8，则单独设置 draft 后端为 `auto`；相关量化说明见
-[单并发实验指导](README.md)。
+输出目录必须不存在。更换并发上限时使用新的输出目录；`--dry-run` 可先检查三组
+启动命令与相同的 buffer 配置。若 draft 权重实际上是 FP8，可将 draft 后端设置为
+`auto`；量化说明见[单并发实验指导](README.md)。
 
-默认 `--phase throughput`，三组各启动一次服务。CUDA Graph 只捕获 `[1,C]` 两个
-batch size，减少启动时间；小于 C 的请求数即使 padding 到 C，也不会计入满 batch
-性能。`--dry-run` 可以先检查命令，`--modes` 可限制要运行的组。
-
-## 满 batch 如何判定
+## 采样规则
 
 服务端 DSPARK worker 在每次 forward 前检查：
 
 1. 本轮是纯 decode，不含 extend/mixed prefill/idle。
-2. **真实 `len(batch.reqs)==C`**，所有请求属于本次正式测试。
-3. 请求集合保持一致，且距离 `max_new_tokens` 仍有余量。考虑 overlap scheduler
-   的 CPU output_ids 可能落后一轮，保留两个完整 verify window 的余量，避免把
-   输出上限处丢弃的 token 计入吞吐。请求同时设置 `ignore_eos=true`。
-4. 连续满 batch 预热 **4 轮**，再连续测量 **32 轮**。
+2. **1 ≤ 真实 `len(batch.reqs)` ≤ C**，所有请求属于本次正式测试。
+3. 每个请求的剩余输出预算大于 `2*(W+1)`。这包含 overlap scheduler 的 CPU
+   output_ids 可能落后一轮的余量，避免将输出上限处丢弃的 token 计入吞吐。
+4. 连续合格 decode 预热 **4 轮**，再连续采样 **32 轮**。
 
-未填满、prefill 插入、请求集合变化或收尾阶段变小，都会使未完成的窗口作废，重新
-等待满 batch。每个 TP rank 必须记录同一组 forward 和接受 token 数；draft/target
-出现 eager fallback 时本次测量报错。没有足够的连续满 batch 样本时，不输出有效
-吞吐结果；检查 `decode/*.status.json` 和 `server.log`，确认实际最大 batch、KV
-容量、retraction 和请求是否过早结束。
+在上述范围内，batch 大小或请求集合变化不会重置窗口。prefill 插入、非正式请求或
+输出余量不足会使未完成窗口作废，重新预热。测量的是第一段符合条件的短 decode
+窗口，不是所有请求生命周期的平均吞吐。只有合格连续轮数不足、TP rank 不一致或
+draft/target graph fallback 等情况才报错；实际 batch 小于上限不会报错。
 
-可以用 `--measure-steps 16 --full-batch-warmup 2` 缩短采样窗口。默认仍让正式请求
-生成 1024 token；`--output-len` 可调整，但必须留出采样和收尾余量。默认每个请求
-上限 600 秒、每组启动后预算 900 秒、服务启动预算 900 秒，可用相应 timeout 参数
-调整。高并发的长输入 prefill 和模型加载可能耗时较长，不计入 decode 性能。
+用 `--measure-steps 16 --decode-warmup 2` 可以缩短采样。
+旧参数 `--full-batch-warmup` 保留为 `--decode-warmup` 的兼容别名，含义同样不要求
+满 batch。默认每个请求上限 600 秒、每组启动后预算 900 秒、启动预算 900 秒。
+加载、prefill 和未进入采样窗口的阶段不计入 decode 性能。
 
-## 满 batch 样本不足时如何排查
-
-`observed_max_decode_batch_size` 在输出预算检查**之前**更新。如果最终值是 7，
-不能解释为“实际 batch=8，但被 remaining_output_budget 排除”。旧版本的 status
-每秒最多写一次，且采样中不写，可能滞后；新版本在正式请求结束后的 flush 请求中
-强制刷新失败诊断，`cohort_finished=true` 表示这份失败状态覆盖了完整测试批次。
-成功测量以最终 rank report 为准，status 同步标为 `complete`。
-
-| 诊断字段 | 判断依据 |
-|---|---|
-| `benchmark_decode_batch_histogram` | 正式请求的真实纯 decode batch 分布，预算筛选前计数 |
-| `full_decode_forwards_before_budget_filter` | 是否实际出现过 C 条请求同时 decode |
-| `eligible_full_decode_forwards`、`longest_eligible_full_decode_streak` | 满 batch 是否满足预算要求，以及是否连续达到 warmup+measure 轮数 |
-| `rejected_forward_counts` | `batch_size_mismatch`、`output_headroom`、`not_pure_decode` 等排除原因；每轮记第一个不满足的条件 |
-| `first_full_decode` | 首次满 batch 的 forward_iter、请求 ID 和各请求剩余输出预算 |
-| `benchmark_requests_seen`、`benchmark_requests_seen_in_decode` | 正式请求是否都到过 worker / decode |
-
-`requests.json` 新增相对整批开始的提交、首 token、结束时间；首 token 时间由提交
-时间加客户端 TTFT 估算。`cohort.json` 汇总首 token 时间跨度与所有请求 token stream
-共同存活的时长。它们用于检查时间错位，**不能替代服务端真实 batch 的判定**。
-单个或平均 TTFT（例如 3.475 秒）不是 TTFT 波动范围，不能单独据此断定根因。
-
-若 `full_decode_forwards_before_budget_filter=0`，先核对 `server_info.json` 中
-`effective_max_running_requests_per_dp`、`server.log` 的 KV 容量 / admission /
-retraction，以及每条请求的生命周期。若已有满 batch，但连续窗口不足，再检查
-prefill 插入、请求集合变化和输出余量。接受长度允许 **1 ≤ accepted_tokens ≤ W+1**，
-包括所有 draft token 接受后的 bonus token，不会排除 `accepted_tokens == W+1`。
-
-`minimum=(warmup+measure+3)*(W+1)+1` 只校验采样和收尾所需输出预算，**没有覆盖
-请求 admission 时间差，也不保证满 batch**。保留默认 32000/1024 作为原始口径；
-需要增加请求共同存活时间时，另建结果目录，三组统一显式改成 32000/2048：
-
-```bash
-python benchmark/lagom/run_concurrent.py \
-  --model /mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-0731 \
-  --draft /mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-DSpark \
-  --sharegpt /data/ShareGPT_V3_unfiltered_cleaned_split.json \
-  --tp 4 --max-concurrency 8 --output-len 2048 \
-  --moe-runner-backend marlin --speculative-moe-runner-backend marlin \
-  --output ./results/lagom-c8-o2048
-```
-
-这组仍测量连续 32 轮满 batch decode。若只是短时排障，可以给三组统一加
-`--measure-steps 16 --full-batch-warmup 2`；不要只修改某一组后与其他组混合比较。
-2048 会延长请求、增加 KV 需求和 context-length，并不保证解决容量或调度限制。
-`manifest.json`、`summary.json` 和 `decode_throughput.csv` 都记录输出长度和采样配置，
-请将 1024 / 2048 的结果分开标注。
+默认输出仍为 1024，无需为了达到并发上限增加到 2048。若要延长负载，可对三组
+统一显式设置 `--output-len 2048`，并使用新目录；该配置会增加请求时间和 KV 需求，
+应与 1024 的结果分开标注。输入长度、输出长度和采样配置写入 manifest 和汇总。
 
 ## 性能指标
 
-性能阶段关闭逐层 trace，只在 worker forward 外围记录 CUDA events，兼容 graph
-replay。接受 token 数和必要的长度快照保留在 GPU，完成采样后再读回，采样轮内不为
-统计增加 D2H 或 synchronize。CUDA events 和快照仍有少量测量开销。
+性能阶段关闭逐层 trace，在 worker forward 外围记录 CUDA events，兼容 graph
+replay。接受 token 数和必要的长度快照完成采样后再读回，采样轮内不为统计增加
+D2H 或 synchronize。CUDA events、快照及 CPU 诊断计数仍有少量测量开销。
 
 | 字段 | 定义 |
 |---|---|
-| `decode_tokens_per_s` | 满 batch 窗口内接受的输出 token / 窗口时长 |
-| `window_ms_max_rank` | 从第一轮开始到最后一轮结束，取 TP 各 rank 的最大时长；包含轮间 scheduler/CPU 提交空洞 |
-| `gpu_forward_tokens_per_s` | 相同 token 数 / 各轮 GPU forward 跨度之和，不包含轮间空洞 |
-| `mean_per_request_tokens_per_s` | 满 batch decode 吞吐 / C |
-| `mean_step_cycle_ms` | 完整窗口时长 / 采样轮数，包含轮间开销 |
-| `mean_gpu_step_ms`、`p50_gpu_step_ms`、`p95_gpu_step_ms` | 各轮 GPU forward 跨度统计，每轮先取 TP rank 最大值 |
-| `mean_accepted_tokens_per_request_per_step` | 每请求、每 verify 轮的平均接受长度，包含 bonus token |
+| `max_concurrency` | 配置的并发上限 C |
+| `min/mean/max_running_batch_size` | 采样轮实际 batch 的最小值、按轮平均值和最大值 |
+| `running_batch_histogram` | 每种实际 batch 的采样轮数 |
+| `decode_tokens_per_s` | 窗口内实际接受的输出 token / 窗口时长 |
+| `window_ms_max_rank` | 首轮开始至末轮结束，取 TP rank 最大时长，包含轮间 scheduler/CPU 空洞 |
+| `gpu_forward_tokens_per_s` | 相同 token 数 / 各轮 GPU forward 跨度之和，排除轮间空洞 |
+| `mean_step_cycle_ms` | 完整窗口时长 / 采样轮数 |
+| `mean/p50/p95_gpu_step_ms` | GPU forward 跨度统计，每轮先取 TP rank 最大值 |
+| `mean_accepted_tokens_per_request_per_step` | 总接受 token / 各轮真实 batch 之和 |
 
-token 数使用实际接受长度，**不使用 C×W 推算，也不在 TP rank 间重复累加**。
-初始 prefill 生成的 token 不计入。这里是服务端 decode 性能，不包括 HTTP/SSE 传输、
-TTFT、ramp-up 和完整请求端到端时间。CPU submit span、GPU step span 与轮间 gap
-不是可直接相加的互斥分解。
+接受长度允许 **1 ≤ accepted_tokens ≤ W+1**，包含 bonus token。token 数不使用
+C×W 推算，不在 TP rank 间重复累加，初始 prefill token 不计入。旧的
+`mean_per_request_tokens_per_s=吞吐/C` 已移除，实际 batch 可变时不能按上限均分。
 
-输出：
+若三组实际 batch 分布不同，应同时查看 `decode_by_batch_size.csv` 中相同 batch
+的 GPU forward 耗时、吞吐和接受长度；没有相同 batch 的样本时，不宣称同 batch
+加速比。分桶指标只累加对应 forward 的 GPU 时间，不把跨 batch 的 scheduler gap
+任意归到某一桶。整体窗口吞吐仍用于比较相同工作负载、相同并发上限下的表现。
 
-- `decode_throughput.csv`：三组满 batch decode 性能对比，每完成一组即保存。
-- `throughput/<mode>/decode_steps.csv`：逐轮真实 batch、接受 token 数、GPU/CPU 时间和轮间 gap。
-- `throughput/<mode>/decode/rank-*.json`：每个 rank 的原始窗口、请求 ID、长度和时间。
-- `decode/rank-*.status.json`：采样前的诊断信息；成功与否以最终 rank report 为准。
-- `requests.json`、`cohort.json`：客户端请求及包含 prefill 的整批耗时，不参与上述 decode 吞吐。
+输出包括：
+
+- `decode_throughput.csv`：三组 decode 对比、实际 batch 分布及 buffer 等配置。
+- `throughput/<mode>/decode_steps.csv`：逐轮真实 batch、接受 token、GPU/CPU 时间和 gap。
+- `throughput/<mode>/decode_by_batch_size.csv`：按实际 batch 分组的 GPU forward 指标。
+- `throughput/<mode>/decode/rank-*.json`：各 rank 原始记录（schema 2，上限为 `max_batch_size`）。
+- `decode/rank-*.status.json`：诊断状态，完成正式请求后的 flush 会强制刷新失败状态。
+- `requests.json`、`cohort.json`：请求提交/首 token/结束时间及包含 prefill 的客户端耗时。
 - `manifest.json`、`prompts.jsonl`、各组 `launch.json`、`server_info.json`、`server.log`。
 
-## 满 batch 的逐层 trace
+客户端首 token 相对时刻由提交时刻加 TTFT 估算，仅辅助检查请求生命周期；实际
+decode batch 及吞吐以服务端记录为准。
 
-需要定位 attention、MLP、refill/prefetch 等瓶颈时，另建输出目录并将上述命令改为：
+`benchmark_decode_batch_histogram` 统计预算筛选前的实际 batch；
+`eligible_decode_forwards` 和 `longest_eligible_decode_streak` 统计合格 decode；
+`rejected_forward_counts` 区分 prefill、输出余量不足、超出并发上限等原因。
+`at_cap_decode_forwards_before_budget_filter=0` 或 `observed_max_decode_batch_size<C`
+本身均不代表失败。旧版要求满 batch 的结果不要与新版混用，保留 manifest 中的 commit。
+
+## 逐层 trace
+
+需要定位 attention、MLP、refill/prefetch 等瓶颈时，另建输出目录，将运行命令加上：
 
 ```bash
 --phase trace --trace-modes lagom hisparse dspark --nsys \
---output ./results/lagom-c16-trace
+--output ./results/lagom-c8-trace
 ```
 
-trace 阶段仍提交 C 个 32000/1024 请求；只采集实际 batch=C 的 decode，跳过最初
-2 个符合条件的 step 后记录 12 个。prefill/idle 和不足 C 的 decode 不写入采样槽位。
-这些诊断 step 可以不连续，通过 `forward_iter` 检查间隔；严格连续窗口的吞吐只取
-性能阶段的 CUDA event report。详细 trace 与 Nsight 会扰动耗时，不能替代性能阶段。
-`--phase all` 会先做三组性能测量，再启动独立服务做 trace，默认 trace 也包含三组。
+三组使用相同并发上限和 buffer 对照配置。Trace 只记录正式请求的实际 batch 在
+1..C 范围内的 decode，跳过最初 2 个符合条件的 step 后记录 12 个；C=1 的服务预热
+请求通过 request ID 排除。Prefill/idle 不采集。诊断 step 可以不连续，通过
+`forward_iter` 检查间隔；逐层 trace/Nsight 耗时不能替代性能阶段。
+`--phase all` 先跑三组性能，再用独立服务采集三组 trace。
 
-当前开发环境无 GPU，真实 H100 上的高并发容量、graph replay 和性能仍需实测。
+32K 输入约有 8000 个 C4 KV，默认 hot=8192 几乎全驻留。测试中未出现预取收益时，
+需结合真实换入量分析；缓存压力实验可另选更长输入或 `--w 3 --p 3 --hot 4096`，
+并对两组 HiSparse 统一调整。
+
+当前开发环境无 GPU，H100 上的容量、graph replay 和性能仍需实测。
 
 ```bash
 python -m pytest -q test/registered/unit/observability/test_lagom_concurrent.py \

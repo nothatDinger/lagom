@@ -174,6 +174,10 @@ class StepTrace:
         self.required_batch_size = config.get("required_batch_size")
         if self.required_batch_size is not None and self.required_batch_size <= 0:
             raise ValueError("required_batch_size must be positive")
+        self.max_batch_size = config.get("max_batch_size")
+        if self.max_batch_size is not None and self.max_batch_size <= 0:
+            raise ValueError("max_batch_size must be positive")
+        self.request_prefix = config.get("request_prefix")
         self.nsys_running = False
         self.output = Path(config["output_dir"])
         self.output.mkdir(parents=True, exist_ok=True)
@@ -240,8 +244,18 @@ class StepTrace:
     def begin(self, batch):
         self.poll()
         if (
-            self.required_batch_size is not None
-            and len(batch.reqs) != self.required_batch_size
+            (
+                self.required_batch_size is not None
+                and len(batch.reqs) != self.required_batch_size
+            )
+            or (
+                self.max_batch_size is not None
+                and not 0 < len(batch.reqs) <= self.max_batch_size
+            )
+            or (
+                self.request_prefix is not None
+                and any(not r.rid.startswith(self.request_prefix) for r in batch.reqs)
+            )
         ):
             self.active = -1
             self.slot.fill_(-1)
