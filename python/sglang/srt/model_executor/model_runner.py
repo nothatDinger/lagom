@@ -785,7 +785,11 @@ class ModelRunner:
     ) -> int:
         """Logits rows per decode batch slot."""
         if self.spec_algorithm.is_speculative():
-            if num_draft_tokens is None and self.server_args.is_lagom:
+            if (
+                num_draft_tokens is None
+                and self.server_args.is_lagom
+                and self.is_draft_worker
+            ):
                 num_draft_tokens = self.server_args.max_speculative_num_draft_tokens
             return resolve_num_tokens_per_req(
                 phase="target_verify",

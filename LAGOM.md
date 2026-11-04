@@ -1,8 +1,11 @@
-# Lagom: DSPARK decoding with CSA KV prefetch
+# Lagom FP: CSA prefetch from frozen first-layer inputs
 
-Lagom extends DeepSeek-V4 DSPARK speculative decoding with a disposable prediction
-suffix. The suffix supplies per-layer CSA Top-K hints for the following verify
-round while the original candidates retain normal speculative acceptance.
+The `lagom_FP` branch extends DeepSeek-V4 DSPARK decoding with a separate
+prediction stream. The draft proposes W acceptance candidates and P prediction
+tokens. Only the anchor and W candidates enter target attention. P tokens retain
+their first-layer input hidden states (target token embeddings, before mHC or
+decoder transformations); every CSA layer uses that same frozen tensor with its
+own query projection and indexer to predict KV needed by the next window.
 
 ## Window conventions
 
@@ -12,12 +15,14 @@ round while the original candidates retain normal speculative acceptance.
 | `P` | Number of additional draft candidates used only for prediction; defaults to `W`. |
 | `--speculative-num-draft-tokens` | `W + 1`, including DSPARK's existing anchor token. |
 | Draft execution width | `W + P`. |
-| Target execution width | `W + P + 1`, including the anchor. |
+| Target attention/FFN width | `W + 1`, including the anchor. |
+| Prediction indexer width | `P`, on a separate CUDA stream. |
 
 For example, `--speculative-num-draft-tokens 8` gives `W=7`. With the default
-prediction window, the draft generates 14 candidates and the target evaluates 15
-rows per request. Only the first seven candidates participate in acceptance.
-The scheduler still receives the original eight-column result layout.
+prediction window, the draft generates 14 candidates. The target decoder evaluates
+8 rows per request, while each CSA indexer separately evaluates 7 prediction
+queries from the frozen first-layer input. Only the first seven draft candidates
+participate in acceptance. The scheduler retains its eight-column result layout.
 
 The split is applied independently to each request. Target logits, proposal
 probabilities, confidence, hidden-state injection, and committed KV lengths all
@@ -59,7 +64,8 @@ defaults to `2 * max(W+1, P) * K`. An explicit size must hold at least
 set to be at most 8192 entries and the hot buffer to be at most 32768 entries.
 The example above assumes the model's usual `K=512`.
 
-Demand loading and prefetch are planned together at the full `W+P+1` width.
+Demand loading and prefetch indices are still planned together at the full
+`W+P+1` width, even though target attention only has `W+1` rows.
 The cache must protect both sets simultaneously because their transfers run
 concurrently. The default buffer size is unchanged, but explicit sizes that
 only held the larger of the two windows are no longer sufficient. Pool sizing
@@ -97,29 +103,30 @@ cannot be combined with Lagom.
 
 ## Execution and stream ordering
 
-1. DSPARK proposes `W+P` candidates. The target executes the anchor followed by
-   all candidates with the normal causal relation.
-2. At each CSA layer, the indexer produces both windows' Top-K selections.
-   A single planner protects their union and assigns distinct destinations to
-   demand misses and prediction-only misses. A miss needed by both windows is
-   classified as demand, so it is loaded only once.
-3. The main stream refills the first `W+1` rows while a side stream prefetches
-   the final `P` rows' misses for the following verify. Prefetch starts as soon
-   as that layer's plan is ready, during the current verify; it does not wait
-   for acceptance or C4 commit. Future hints are restricted to history that
-   was already committed before this verify window.
-4. Prediction attention can use resident history, current demand loads, and
-   transaction scratch. It does not wait for its asynchronous prediction-only
-   transfers: those missing entries are excluded from its attention locations.
-   This provides approximate future hidden states without adding synchronous
-   H2D for the prediction suffix.
-5. Acceptance uses only the original `W` candidates. The C4 transaction commits
-   accepted entries, restores speculative mappings, and rejects the suffix.
-   Offline C128 state for unaccepted rows is cleared. Compressor rings and KV
-   reservation are sized for the full physical execution window.
-6. The next verify waits for the relevant layer's prefetch event before reusing
-   its cache state and transfer plan. Request release drains outstanding
-   transfers before host/device storage can be reused.
+1. DSPARK proposes `W+P` candidates. The target receives only the anchor and W
+   candidates as attention rows. P token IDs travel through a separate
+   request-major input buffer.
+2. The target embeds P once and preserves that first-layer input. At target
+   entry, a prediction stream starts all CSA layers' query projections and
+   indexer Top-K using this unchanged tensor. Prediction positions follow the
+   W window, but searchable indexer keys are restricted to committed history.
+   Prediction never invokes a compressor, attention, FFN, or target KV write.
+3. The real indexer waits for its layer's prediction result, then a single
+   planner protects the union of demand and prediction selections. Shared
+   misses belong to demand; prediction-only misses get distinct destinations.
+   Only demand locations are returned to attention.
+4. The main path refills demand misses while the transfer stream prefetches
+   prediction-only misses for the next window. This starts during the current
+   verify, before acceptance or C4 commit. Predictions affect residency only;
+   the next window's real indexer still determines its own attention selection.
+5. Acceptance and C4 transactions cover only the anchor and W candidates.
+   Rejected real rows are rolled back, and unaccepted C128 state is cleared.
+   P has no target KV or hidden-state outputs to commit. Allocation bounds
+   remain conservative at `W+P+1` to accommodate the draft and union planner.
+6. Each layer waits for its preceding prefetch before cache-plan reuse. Request
+   release drains both prediction readers and outstanding transfers before
+   storage reuse. Error rollback also fences prediction work that may not yet
+   have reached the normal per-layer join.
 
 Demand loading and prefetch share the persistent hash/CLOCK state from
 `swapin_oneshot`. Prediction accuracy affects cache hit rate, not the real
@@ -130,9 +137,14 @@ draft path was accepted.
 
 ## CUDA graphs
 
-CUDA graphs remain enabled by default for both target and draft. Their buffer
-and capture geometry use the physical execution widths: `W+P+1` for target and
-`W+P` for draft. Acceptance and scheduler transport retain `W+1`.
+CUDA graphs remain enabled by default for both target and draft. Target attention,
+logits, and auxiliary hidden states capture `W+1` rows; draft capture keeps
+`W+P`. A separate graph-stable `[batch, P]` input buffer supplies predictions,
+including on pre-planned replay. Its padded request rows are cleared each time.
+
+The prediction indexer work is captured on its own CUDA stream and joins the
+real indexer at the union planner. It uses live device positions and page tables
+on every replay. It shares no writable attention metadata with the real indexer.
 
 The target graph retains stable per-layer transfer plans and records a plan-ready
 event at each CSA layer before demand refill. A separate side-stream transfer
@@ -183,9 +195,10 @@ python -m pytest -q \
   test/registered/unit/mem_cache/test_hisparse_spec_swapin.py
 ```
 
-CPU coverage exercises configuration, request-major window boundaries, cache
-ownership, C4 commit boundaries, split-transfer plans, graph launch, and stream
-dependencies with tensors/mocks. The graph test also includes a CUDA runtime
+CPU coverage exercises configuration, request-major W/P separation, frozen
+prediction inputs, query-only indexer behavior, cache ownership, C4 commit
+boundaries, split-transfer plans, graph inputs, and stream dependencies with
+tensors/mocks. The graph test also includes a CUDA runtime
 case that is skipped without a GPU.
 These checks do not establish full-model GPU correctness, numerical parity, or
 throughput.
@@ -216,6 +229,7 @@ For GPU validation, run the same prompts with graphs enabled and with
 
 Use a CUDA profiler to check that prediction prefetch runs on the side stream
 concurrently with the source verify, including with CUDA Graph enabled, and
-that waits occur at the consuming layer. Measure latency, demand H2D bytes,
+that waits occur at the consuming layer. Check that P has only indexer work on
+the prediction stream and that all target attention/FFN kernels use W+1 rows. Measure latency, demand H2D bytes,
 cache hits, and acceptance separately. This implementation does not include a
 GPU performance or prediction-accuracy claim.

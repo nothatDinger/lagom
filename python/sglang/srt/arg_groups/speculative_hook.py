@@ -213,11 +213,11 @@ def _resolve_lagom_window(server_args: ServerArgs) -> None:
     prefetch_config["prediction_steps"] = prediction_steps
     server_args.hisparse_config = json.dumps(config)
     logger.info(
-        "Lagom enabled: DSPARK W=%d, CSA forecast P=%d, target rows=%d; "
-        "static verify with asynchronous KV prefetch",
+        "Lagom FP enabled: DSPARK W=%d, CSA forecast P=%d, target rows=%d; "
+        "frozen first-layer inputs on the prediction stream",
         width,
         prediction_steps,
-        width + prediction_steps + 1,
+        width + 1,
     )
 
 

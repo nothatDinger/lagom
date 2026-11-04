@@ -109,7 +109,7 @@ def _load_method(filename, class_name, method_name, namespace):
 
 
 @pytest.mark.parametrize("sampling", [False, True])
-def test_target_executes_all_rows_but_returns_only_decode_logits_and_hidden(sampling):
+def test_target_only_executes_decode_rows_and_routes_predictions_separately(sampling):
     seen = {}
     adjustment = Mock()
     forward = _load_method(
@@ -119,11 +119,11 @@ def test_target_executes_all_rows_but_returns_only_decode_logits_and_hidden(samp
         {
             "DFlashVerifyInput": lambda **kwargs: SimpleNamespace(**kwargs),
             "CaptureHiddenMode": SimpleNamespace(FULL=1),
-            "select_decode_rows": select_decode_rows,
+            "decode_window": decode_window,
             "apply_dflash_verify_logits_adjustments": adjustment,
         },
     )
-    expected = torch.arange(20).reshape(10, 2)
+    expected = torch.arange(12).reshape(6, 2)
 
     def target(**kwargs):
         seen.update(kwargs)
@@ -146,17 +146,21 @@ def test_target_executes_all_rows_but_returns_only_decode_logits_and_hidden(samp
         draft_input=None,
         verify_ids_2d=torch.arange(10).view(2, 5),
         verify_window=SimpleNamespace(
-            positions_2d=torch.arange(10).view(2, 5), verify_cache_loc=torch.arange(10)
+            positions_2d=torch.arange(10).view(2, 5),
+            verify_cache_loc=torch.arange(10),
+            verify_cache_loc_2d=torch.arange(10).view(2, 5),
         ),
         sampling_info=object() if sampling else None,
         lagom_decode_width=3,
     )
-    assert seen["verify_input"].draft_token_num == 5
-    assert seen["verify_input"].draft_token.numel() == 10
+    assert seen["verify_input"].draft_token_num == 3
+    assert seen["verify_input"].draft_token.tolist() == [0, 1, 2, 5, 6, 7]
+    assert seen["verify_input"].positions.tolist() == [0, 1, 2, 5, 6, 7]
+    assert batch.out_cache_loc.tolist() == [0, 1, 2, 5, 6, 7]
     assert seen["lagom_decode_width"] == 3
-    rows = torch.tensor([0, 1, 2, 5, 6, 7])
-    torch.testing.assert_close(result.logits_output.next_token_logits, expected[rows])
-    torch.testing.assert_close(result.logits_output.hidden_states, expected[rows] + 100)
+    assert seen["lagom_prediction_tokens"].tolist() == [[3, 4], [8, 9]]
+    torch.testing.assert_close(result.logits_output.next_token_logits, expected)
+    torch.testing.assert_close(result.logits_output.hidden_states, expected + 100)
     assert result.can_run_cuda_graph
     if sampling:
         assert adjustment.call_args.kwargs["draft_token_num"] == 3
@@ -236,7 +240,7 @@ def test_worker_commits_only_decode_prefix_with_prefetch_already_in_verify(
         events.append("inject")
 
     def clear(*args):
-        assert args[-1] == 5
+        assert args[-1] == 3
         assert args[-2].tolist() == ([0, 0] if fail_forward else [1, 3])
         events.append("clear")
 
@@ -325,5 +329,5 @@ def test_worker_commits_only_decode_prefix_with_prefetch_already_in_verify(
             "inject",
         ]
     assert (
-        coordinator.prepare_dspark_verify_window.call_args.kwargs["verify_width"] == 5
+        coordinator.prepare_dspark_verify_window.call_args.kwargs["verify_width"] == 3
     )

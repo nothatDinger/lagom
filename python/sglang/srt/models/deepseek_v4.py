@@ -53,6 +53,10 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.attention.dsv4.lagom import (
+    launch_lagom_prediction,
+    prepare_lagom_prediction,
+)
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
@@ -2817,6 +2821,38 @@ class DeepseekV4Model(nn.Module):
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
 
+        prediction_hidden = None
+        predictions = {}
+        if forward_batch.lagom_prediction_tokens is not None:
+            # The first-layer input is the token embedding (replicated across
+            # mHC streams). Keep it frozen; P never enters the decoder layers.
+            prediction_hidden = self.embed_tokens(
+                forward_batch.lagom_prediction_tokens.reshape(-1)
+            )
+            prediction_backend = get_attn_backend()
+            prediction_stream = (
+                prediction_backend.hisparse_coordinator._lagom_prediction_stream
+            )
+            prediction_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(prediction_stream):
+                prediction_positions, prediction_metadata = prepare_lagom_prediction(
+                    forward_batch, prediction_backend
+                )
+            # All CSA predictions can start from this one input. Enqueue them
+            # before the decoder; each real layer joins only its own result.
+            for i in range(self.start_layer, self.end_layer):
+                attention = self.layers[i].self_attn
+                if attention.indexer is not None:
+                    predictions[i] = launch_lagom_prediction(
+                        attention=attention,
+                        hidden_states=prediction_hidden,
+                        positions=prediction_positions,
+                        metadata=prediction_metadata,
+                        forward_batch=forward_batch,
+                        attn_backend=prediction_backend,
+                        stream=prediction_stream,
+                    )
+
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
                 (get_global_dp_buffer_len(), 1),
@@ -2846,7 +2882,11 @@ class DeepseekV4Model(nn.Module):
         # Auxiliary capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
-        run_tbo = self._can_run_tbo(forward_batch) and not capture_aux
+        run_tbo = (
+            self._can_run_tbo(forward_batch)
+            and not capture_aux
+            and prediction_hidden is None
+        )
         if use_prefill_cp and not run_tbo:
             if cp_v2_active:
                 input_ids = cp_round_robin_input_ids_v2(input_ids, forward_batch)
@@ -2878,6 +2918,11 @@ class DeepseekV4Model(nn.Module):
             for i in range(self.start_layer, self.end_layer):
                 layer = self.layers[i]
                 last_layer = layer
+                if i in predictions:
+                    (
+                        forward_batch.lagom_prediction_indices,
+                        forward_batch.lagom_prediction_ready,
+                    ) = predictions[i]
                 ctx = (
                     nullcontext()
                     if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)

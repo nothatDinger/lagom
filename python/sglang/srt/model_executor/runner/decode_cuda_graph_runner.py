@@ -58,6 +58,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
+    GraphSlot,
+    PaddingPolicy,
     build_decode_registry,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -306,10 +308,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if speculative_num_draft_tokens is None
             else speculative_num_draft_tokens
         )
-        if getattr(get_spec(), "is_lagom", False):
-            # The public width remains W+1 for acceptance/transport. Both
-            # target and draft capture need the full execution window; the
-            # algorithm's draft hook removes its anchor row below.
+        if getattr(get_spec(), "is_lagom", False) and model_runner.is_draft_worker:
+            # Draft attention still proposes W+P candidates. Target attention
+            # captures W+1 rows, with P input IDs in a separate graph buffer.
             self.speculative_num_draft_tokens += get_spec().lagom_prefetch_tokens
 
         # --- capture mode + tokens-per-bs ------------------------------
@@ -467,6 +468,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             dp_size=self.dp_size,
             source=self.buffers,
         )
+
+        if getattr(get_spec(), "is_lagom", False) and not model_runner.is_draft_worker:
+            prediction_width = get_spec().lagom_prefetch_tokens
+            self.buffer_registry.register_slot(
+                GraphSlot(
+                    "lagom_prediction_tokens",
+                    lambda bs, _mt: (bs, prediction_width),
+                    torch.int64,
+                    axis="bs",
+                    padding_policy=PaddingPolicy.ZERO,
+                )
+            )
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
@@ -1044,6 +1057,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.lagom_decode_width = (
                 self.model_runner.server_args.speculative_num_draft_tokens
             )
+            forward_batch.lagom_prediction_tokens = _slot("lagom_prediction_tokens")
             forward_batch.is_lagom_graph_capture = True
 
         if buffers.ngram_embedding_info is not None:
@@ -1510,6 +1524,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            if forward_batch.lagom_prediction_tokens is not None:
+                slot = self.buffer_registry.get_slot("lagom_prediction_tokens")
+                live_bs = forward_batch.batch_size
+                slot.reset_padding(live_bs, self.bs)
+                slot.buffer[:live_bs].copy_(forward_batch.lagom_prediction_tokens)
             if (
                 not is_ragged
                 and self.model_runner.spec_algorithm.is_dflash_family()

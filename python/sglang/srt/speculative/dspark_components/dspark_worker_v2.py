@@ -699,7 +699,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             hisparse_window = hisparse_coordinator.prepare_dspark_verify_window(
                 req_pool_indices=batch.req_pool_indices,
                 prefix_lens=prefix_lens,
-                verify_width=self._execution_width,
+                verify_width=self.verify_num_draft_tokens,
                 req_pool_indices_cpu=batch.req_pool_indices_cpu,
                 prefix_lens_cpu=batch.seq_lens_cpu,
             )
@@ -809,7 +809,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                         batch.req_pool_indices,
                         prefix_lens,
                         accept.commit_lens,
-                        self._execution_width,
+                        self.verify_num_draft_tokens,
                     )
                 # Per-layer prefetch already runs alongside target verify.
                 # Its protected history destinations are disjoint from these
@@ -832,7 +832,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                             batch.req_pool_indices,
                             prefix_lens,
                             torch.zeros_like(prefix_lens),
-                            self._execution_width,
+                            self.verify_num_draft_tokens,
                         )
 
         if on_publish is not None:

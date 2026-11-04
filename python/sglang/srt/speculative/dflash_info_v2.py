@@ -136,8 +136,8 @@ class DFlashDraftInputV2(SpecInput):
         batch_seq_lens_cpu_t = self._prepare_batch_seq_lens_cpu_buf[:bs]
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
 
-        # Reserve the physical execution window. Lagom's forecast suffix is
-        # excluded from acceptance but still writes provisional target/draft KV.
+        # Reserve the draft's full physical window. Lagom's prediction suffix
+        # only writes draft KV; target attention uses the acceptance prefix.
         block_size = int(max_speculative_num_draft_tokens())
         if block_size <= 0:
             raise ValueError(

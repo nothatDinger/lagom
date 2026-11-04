@@ -556,11 +556,11 @@ class DeepseekV4AttnBackend(
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
         self.speculative_num_steps = speculative_num_steps
-        # The backend covers all execution rows; the worker separately bounds
-        # acceptance to W candidates when Lagom adds its P forecast rows.
+        # Only the draft attends over P prediction tokens. Target attention and
+        # compressor metadata cover the anchor plus W acceptance candidates.
         self.speculative_num_draft_tokens: int = (
             model_runner.server_args.max_speculative_num_draft_tokens
-            if model_runner.server_args.is_lagom
+            if model_runner.server_args.is_lagom and model_runner.is_draft_worker
             else get_spec().speculative_num_draft_tokens
         )
         if self.speculative_num_draft_tokens is not None:

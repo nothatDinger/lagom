@@ -617,6 +617,7 @@ class HiSparseCoordinator:
             self._lagom_plans = None
             self._lagom_real_counts = None
             if lagom:
+                self._lagom_prediction_stream = device_module.Stream()
                 self._lagom_graphs = LagomPrefetchGraphs(self._previous_prefetch_stream)
                 occurrences = speculative_verify_width * self.top_k
                 self._lagom_plans = [
@@ -1863,6 +1864,9 @@ class HiSparseCoordinator:
         # Host-page reclamation needs CPU completion, not an enqueued GPU wait.
         # Plans contain absolute host/device addresses and may include any live
         # request. Drain retained layer writers before allocator slot reuse.
+        prediction_stream = getattr(self, "_lagom_prediction_stream", None)
+        if prediction_stream is not None:
+            prediction_stream.synchronize()
         pipeline = getattr(self, "_lagom_graphs", None)
         if pipeline is not None:
             pipeline.synchronize()
@@ -2560,6 +2564,11 @@ class HiSparseCoordinator:
         return torch.where(belongs_to_window, mapped_device_locs, swapped_locs)
 
     def rollback_dspark_verify_window(self, window: HiSparseDSparkWindow) -> None:
+        prediction_stream = getattr(self, "_lagom_prediction_stream", None)
+        if prediction_stream is not None:
+            # A foreground failure can happen before the indexer joins its
+            # prediction. Fence that cache reader before rollback or slot reuse.
+            device_module.current_stream().wait_stream(prediction_stream)
         if window.compressed_locs.numel() == 0:
             return
         self.mem_pool_device.full_to_hisparse_device_index_mapping[

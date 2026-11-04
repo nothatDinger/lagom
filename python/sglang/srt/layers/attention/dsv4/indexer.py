@@ -689,7 +689,14 @@ class C4IndexerBackendMixin:
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
-    ) -> None:
+        prediction_metadata: Optional[PagedIndexerMetadata] = None,
+        prediction_positions: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        prediction_only = prediction_metadata is not None
+        if prediction_only and (
+            not skip_compressor or enable_multi_stream or prediction_positions is None
+        ):
+            raise ValueError("Lagom prediction must be a query-only indexer call")
         if forward_batch.forward_mode.is_idle():
             return
         token_to_kv_pool = self.token_to_kv_pool
@@ -699,12 +706,14 @@ class C4IndexerBackendMixin:
             assert isinstance(self, CompressorBackendMixin)
 
         metadata = self.forward_metadata
-        indexer_metadata = metadata.indexer_metadata
+        indexer_metadata = (
+            prediction_metadata if prediction_only else metadata.indexer_metadata
+        )
         core_metadata = metadata.core_metadata
 
         assert isinstance(indexer_metadata, PagedIndexerMetadata)
 
-        positions = core_metadata.positions
+        positions = prediction_positions if prediction_only else core_metadata.positions
         num_queries = min(x.shape[0], q_lora.shape[0], positions.shape[0])
         if x.shape[0] != num_queries:
             x = x[:num_queries]
@@ -785,8 +794,12 @@ class C4IndexerBackendMixin:
         c4_seq_lens = match_num_queries(indexer_metadata.c4_seq_lens, value=1)
         _c4sl = c4_seq_lens
         page_table = match_num_queries(indexer_metadata.page_table, value=0)
-        c4_sparse_page_indices = match_num_queries(
-            core_metadata.c4_sparse_page_indices, value=-1
+        c4_sparse_page_indices = (
+            torch.empty(
+                (query_rows, c4_indexer.index_topk), dtype=torch.int32, device=x.device
+            )
+            if prediction_only
+            else match_num_queries(core_metadata.c4_sparse_page_indices, value=-1)
         )
         _use_tilelang = (
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
@@ -831,11 +844,12 @@ class C4IndexerBackendMixin:
                 False,
             )
 
-        assert indexer_metadata.page_table is core_metadata.page_table
-        if self.debug_use_external_c4_sparse_indices:
-            return
+        if not prediction_only:
+            assert indexer_metadata.page_table is core_metadata.page_table
+            if self.debug_use_external_c4_sparse_indices:
+                return
 
-        indexer_capturer = get_global_indexer_capturer()
+        indexer_capturer = None if prediction_only else get_global_indexer_capturer()
         capture_enabled = indexer_capturer is not None
 
         hisparse_coordinator = self.hisparse_coordinator
@@ -851,7 +865,7 @@ class C4IndexerBackendMixin:
         )
 
         raw_indices = None
-        if capture_enabled:
+        if prediction_only or capture_enabled:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif hisparse_paired:
             # Paired has 2B rows, larger than the coordinator's decode B buffer.
@@ -904,6 +918,11 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
+        if prediction_only:
+            # Predictions never write compressor state, attention metadata or KV.
+            # The real indexer combines these hints with its own demand set.
+            return raw_indices
+
         prefetch_candidates = None
         if hisparse_decode and hisparse_coordinator.prefetcher is not None:
             assert hisparse_coordinator.indexer_prefetch_candidates_buffer is not None

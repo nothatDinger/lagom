@@ -631,12 +631,15 @@ class BaseRunner(ABC):
             and not mr.is_draft_worker
             and capture_forward_mode == ForwardMode.TARGET_VERIFY
         ):
-            # Autotuning executes the same full W+P+1 shape as target capture.
-            # Keep demand IO at W+1 rows, with a resident-only prediction tail.
-            # Register stable side-copy plans without launching eager transfers;
-            # the independent side graph is captured after target capture.
+            # Match target capture: W+1 attention rows and separate P indexer
+            # inputs. Register side-copy plans with inactive dummy requests.
             forward_batch.lagom_decode_width = (
                 mr.server_args.speculative_num_draft_tokens
+            )
+            forward_batch.lagom_prediction_tokens = torch.zeros(
+                (batch_size, mr.server_args.lagom_prefetch_tokens),
+                dtype=torch.int64,
+                device=forward_batch.input_ids.device,
             )
             forward_batch.is_lagom_graph_capture = True
         mr.attn_backend.init_forward_metadata(forward_batch)

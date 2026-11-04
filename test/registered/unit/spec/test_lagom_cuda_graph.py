@@ -55,9 +55,12 @@ def test_target_autotune_keeps_persistent_cache_dummy_requests_inactive(is_lagom
     """Exercise BaseRunner warmup through the real CSA routing helper."""
     batch, decode_width, prediction_width, topk = 2, 3, 2, 4
     total = decode_width + (prediction_width if is_lagom else 0)
-    physical = torch.full((batch * total, topk), 33, dtype=torch.int32)
+    physical = torch.full((batch * decode_width, topk), 33, dtype=torch.int32)
     coordinator = SimpleNamespace(
-        swap_in_lagom_pages=Mock(return_value=physical),
+        compress_ratio=4,
+        swap_in_lagom_pages=Mock(
+            return_value=torch.full((batch * total, topk), 33, dtype=torch.int32)
+        ),
         num_real_reqs=torch.ones(1, dtype=torch.int32),
         _spec_states=[object()],
     )
@@ -68,18 +71,26 @@ def test_target_autotune_keeps_persistent_cache_dummy_requests_inactive(is_lagom
         assert coordinator.num_real_reqs.item() == 0
         if not is_lagom:
             return
+        assert forward_batch.lagom_prediction_tokens.shape == (batch, prediction_width)
+        forward_batch.lagom_prediction_indices = torch.zeros(
+            batch * prediction_width, topk, dtype=torch.int32
+        )
+        forward_batch.lagom_prediction_ready = None
         resolve_lagom_topk(
             coordinator=coordinator,
             forward_batch=forward_batch,
             layer_id=1,
-            raw_indices=torch.arange(batch * total * topk).reshape(batch * total, topk),
-            compressed_seq_lens=torch.ones(batch * total, dtype=torch.int32),
+            raw_indices=torch.arange(batch * decode_width * topk).reshape(
+                batch * decode_width, topk
+            ),
+            compressed_seq_lens=torch.ones(batch * decode_width, dtype=torch.int32),
             output_buffer=physical,
         )
 
     args = SimpleNamespace(
         is_lagom=is_lagom,
         speculative_num_draft_tokens=decode_width,
+        lagom_prefetch_tokens=prediction_width,
         disaggregation_mode="null",
         enable_lora=False,
         pp_size=1,
@@ -95,7 +106,7 @@ def test_target_autotune_keeps_persistent_cache_dummy_requests_inactive(is_lagom
         is_draft_worker=False,
         is_generation=True,
         spec_algorithm=algo,
-        decode_num_tokens_per_req=lambda: total,
+        decode_num_tokens_per_req=lambda: decode_width,
         model=SimpleNamespace(forward=forward),
         prepare_dummy_forward_batch=lambda fb: fb,
         attn_backend=SimpleNamespace(init_forward_metadata=Mock()),
@@ -151,7 +162,7 @@ def test_target_autotune_keeps_persistent_cache_dummy_requests_inactive(is_lagom
     )
     dummy(SimpleNamespace(model_runner=mr), batch_size=batch, buffers=buffers)
     captured = seen["batch"]
-    assert captured.input_ids.numel() == batch * total
+    assert captured.input_ids.numel() == batch * decode_width
     assert coordinator.num_real_reqs.item() == 0
     if not is_lagom:
         coordinator.swap_in_lagom_pages.assert_not_called()
@@ -166,7 +177,7 @@ def test_target_autotune_keeps_persistent_cache_dummy_requests_inactive(is_lagom
     assert coordinator.num_real_reqs.item() == 0
 
 
-@pytest.mark.parametrize("is_draft,physical_width", [(False, 15), (True, 14)])
+@pytest.mark.parametrize("is_draft,physical_width", [(False, 8), (True, 14)])
 def test_dummy_spec_metadata_uses_physical_lagom_width(
     monkeypatch, is_draft, physical_width
 ):
@@ -500,3 +511,58 @@ def test_independent_transfer_graph_consumes_live_plans_across_replays():
         assert torch.all(real == value + 1)
         assert torch.all(prefetched[:live_count] == value + 10)
         assert torch.all(prefetched[live_count:] == -1)
+
+
+def test_preplanned_graph_replay_refreshes_prediction_ids_and_clears_padding():
+    from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+        CudaGraphBufferRegistry,
+        GraphSlot,
+        PaddingPolicy,
+    )
+
+    registry = CudaGraphBufferRegistry(
+        device=torch.device("cpu"), max_bs=3, max_num_tokens=9, share_pool=False
+    )
+    slot = registry.register_slot(
+        GraphSlot(
+            "lagom_prediction_tokens",
+            lambda bs, _mt: (bs, 2),
+            torch.int64,
+            axis="bs",
+            padding_policy=PaddingPolicy.ZERO,
+        )
+    )
+    runner = SimpleNamespace(
+        ragged_verify_mode=False,
+        deepep_adapter=SimpleNamespace(replay=Mock()),
+        bs=3,
+        raw_num_token=6,
+        captured_req_width=3,
+        _capture_graph_size=lambda **_: 3,
+        buffers=SimpleNamespace(
+            input_ids=torch.zeros(9, dtype=torch.int64),
+            positions=torch.zeros(9, dtype=torch.int64),
+        ),
+        buffer_registry=registry,
+        model_runner=SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_dflash_family=lambda: False)
+        ),
+        _resolve_lora_variant=lambda _: None,
+        _resolve_dsa_variant=lambda _: None,
+        enable_pdmux=False,
+        _make_graph_key=lambda *args: args,
+    )
+    load_batch = _runner_method(
+        "decode_cuda_graph_runner.py", "DecodeCudaGraphRunner", "load_batch"
+    )
+    for ids in ([[4, 5], [14, 15]], [[8, 9], [18, 19]]):
+        slot.buffer.fill_(99)
+        batch = SimpleNamespace(
+            needs_forward_metadata_init=lambda: False,
+            batch_size=2,
+            input_ids=torch.arange(6),
+            positions=torch.arange(6),
+            lagom_prediction_tokens=torch.tensor(ids),
+        )
+        load_batch(runner, batch)
+        assert slot.buffer.tolist() == ids + [[0, 0]]

@@ -541,6 +541,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Lagom keeps the real W+1 rows separate from the disposable P-row suffix.
     # The anchor position supplies the committed prefix on both eager and graph paths.
     lagom_decode_width: int = 0
+    # Request-major [B, P] input IDs. Only the indexer side stream sees these rows.
+    lagom_prediction_tokens: Optional[torch.Tensor] = None
+    lagom_prediction_indices: Optional[torch.Tensor] = None
+    lagom_prediction_ready: Optional[torch.cuda.Event] = None
     is_lagom_graph_capture: bool = False
     # Capture-time batches use fixed all-valid paired rows.  This prevents the
     # indexer from performing data-dependent GPU->CPU masking while recording.

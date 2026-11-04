@@ -145,3 +145,16 @@ def test_c4_commit_crossing_hot_boundary_preserves_historical_slots(
         if device_destination:
             assert not torch.isin(destinations, historical_slots).any()
     assert not c._dspark_scratch_valid_mapping.any()
+
+
+@pytest.mark.parametrize("width", [1, 8])
+def test_rollback_fences_prediction_readers_even_without_complete_c4(monkeypatch, width):
+    c, window, *_ = _transaction(monkeypatch, 0, width=width)
+    foreground = Mock()
+    c._lagom_prediction_stream = Mock()
+    monkeypatch.setattr(
+        "sglang.srt.managers.hisparse_coordinator.device_module",
+        SimpleNamespace(current_stream=lambda: foreground),
+    )
+    c.rollback_dspark_verify_window(window)
+    foreground.wait_stream.assert_called_once_with(c._lagom_prediction_stream)

@@ -152,7 +152,9 @@ def test_layer_plans_and_live_counts_survive_shared_metadata_updates(monkeypatch
 def test_request_release_drains_transfers_before_host_pages_can_be_reused(monkeypatch):
     c = coordinator(monkeypatch)
     run_layer(c)
+    c._lagom_prediction_stream = Mock()
     c._drain_lagom_before_request_release(2)
+    c._lagom_prediction_stream.synchronize.assert_called_once_with()
     c._lagom_graphs.synchronize.assert_called_once_with()
 
 

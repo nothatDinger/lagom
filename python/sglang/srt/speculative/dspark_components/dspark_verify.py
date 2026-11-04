@@ -40,7 +40,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
     apply_logits_adjustments_strided,
 )
-from sglang.srt.speculative.lagom import select_decode_rows
+from sglang.srt.speculative.lagom import decode_window
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
@@ -239,13 +239,16 @@ class TargetVerifyExecutor:
         sampling_info,
         lagom_decode_width: int = 0,
     ) -> TargetVerifyResult:
-        verify_w = (
-            verify_ids_2d.shape[1]
-            if lagom_decode_width
-            else self.verify_num_draft_tokens
-        )
-        if lagom_decode_width and lagom_decode_width != self.verify_num_draft_tokens:
-            raise ValueError("Lagom decode width differs from the acceptance window")
+        verify_w = self.verify_num_draft_tokens
+        lagom_prediction_tokens = None
+        if lagom_decode_width:
+            if lagom_decode_width != verify_w:
+                raise ValueError("Lagom decode width differs from the acceptance window")
+            if verify_ids_2d.shape[1] <= verify_w:
+                raise ValueError("Lagom requires a nonempty prediction window")
+            lagom_prediction_tokens = verify_ids_2d[:, verify_w:].contiguous()
+            verify_ids_2d = verify_ids_2d[:, :verify_w].contiguous()
+            verify_window = decode_window(verify_window, verify_w)
         positions_2d = verify_window.positions_2d
         verify_cache_loc = verify_window.verify_cache_loc
 
@@ -274,26 +277,8 @@ class TargetVerifyExecutor:
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
             lagom_decode_width=lagom_decode_width,
+            lagom_prediction_tokens=lagom_prediction_tokens,
         )
-
-        if lagom_decode_width:
-            # The target evaluated probes to provide per-layer indexer queries;
-            # no probe logit or auxiliary hidden state enters acceptance or the
-            # authoritative draft context. Preserve each request's own prefix.
-            output = result.logits_output
-            for name in ("next_token_logits", "hidden_states"):
-                value = getattr(output, name, None)
-                if value is not None:
-                    setattr(
-                        output,
-                        name,
-                        select_decode_rows(
-                            value,
-                            batch_size=verify_ids_2d.shape[0],
-                            execution_width=verify_w,
-                            decode_width=lagom_decode_width,
-                        ),
-                    )
 
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
@@ -312,6 +297,7 @@ class TargetVerifyExecutor:
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
         lagom_decode_width: int = 0,
+        lagom_prediction_tokens: Optional[torch.Tensor] = None,
     ) -> TargetVerifyResult:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
@@ -320,6 +306,7 @@ class TargetVerifyExecutor:
         batch.seq_lens_sum = seq_lens_sum_backup
         if lagom_decode_width:
             verify_forward_batch.lagom_decode_width = lagom_decode_width
+            verify_forward_batch.lagom_prediction_tokens = lagom_prediction_tokens
 
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
