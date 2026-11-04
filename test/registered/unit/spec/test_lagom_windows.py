@@ -8,6 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+
 from sglang.srt.speculative.lagom import (
     decode_proposal,
     decode_window,
@@ -104,7 +105,9 @@ def _load_method(filename, class_name, method_name, namespace):
         type_ignores=[],
     )
     # Only compile the named method from this repository, never external input.
-    exec(compile(ast.fix_missing_locations(ast_module), str(path), "exec"), namespace)  # noqa: S102
+    exec(
+        compile(ast.fix_missing_locations(ast_module), str(path), "exec"), namespace
+    )  # noqa: S102
     return namespace[method_name]
 
 

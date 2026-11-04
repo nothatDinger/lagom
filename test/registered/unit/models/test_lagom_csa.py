@@ -23,7 +23,9 @@ def make_batch(prediction_width=2):
 
 
 @pytest.mark.parametrize("prediction_width", [1, 2, 4])
-def test_lagom_csa_combines_predictions_but_returns_only_real_locations(prediction_width):
+def test_lagom_csa_combines_predictions_but_returns_only_real_locations(
+    prediction_width,
+):
     batch = make_batch(prediction_width)
     logical_ids = torch.arange(6 * 4).reshape(6, 4) + 100
     full_width = 3 + prediction_width
@@ -54,7 +56,8 @@ def test_lagom_csa_combines_predictions_but_returns_only_real_locations(predicti
     assert swap["decode_width"] == 3
     lengths = swap["compressed_seq_lens"].reshape(2, full_width)
     assert lengths[:, 3:].tolist() == [
-        [256] * prediction_width, [512] * prediction_width
+        [256] * prediction_width,
+        [512] * prediction_width,
     ]
     assert swap["req_pool_indices"] is batch.req_pool_indices
     assert swap["layer_id"] == 7
@@ -102,7 +105,9 @@ def test_graph_capture_uses_live_device_prefix_without_cpu_mirrors():
 
 
 @pytest.mark.parametrize("prediction_width", [1, 2, 4])
-def test_prediction_queries_use_future_positions_and_only_committed_keys(prediction_width):
+def test_prediction_queries_use_future_positions_and_only_committed_keys(
+    prediction_width,
+):
     batch = make_batch(prediction_width)
     pages = torch.tensor([[3, 4]] * 3 + [[8, 9]] * 3)
     for offset in (0, 5):

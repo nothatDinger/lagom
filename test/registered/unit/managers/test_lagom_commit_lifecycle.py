@@ -27,7 +27,7 @@ def _transaction(monkeypatch, prefix, *, hot=8, width=15):
     device_kv[:, canonical[:history]] = torch.arange(history)[None, :]
     host_kv[:, : prefix // 4] = torch.arange(prefix // 4)[None, :]
     scratch = torch.arange(100, 100 + count, dtype=torch.int64)
-    device_kv[:, scratch] = torch.tensor(positions)[None, :]
+    device_kv[:, scratch] = torch.tensor(positions, dtype=torch.int64)[None, :]
     transfers = []
 
     def transfer(*, src_ptrs, dst_ptrs, src_indices, dst_indices):
@@ -148,7 +148,9 @@ def test_c4_commit_crossing_hot_boundary_preserves_historical_slots(
 
 
 @pytest.mark.parametrize("width", [1, 8])
-def test_rollback_fences_prediction_readers_even_without_complete_c4(monkeypatch, width):
+def test_rollback_fences_prediction_readers_even_without_complete_c4(
+    monkeypatch, width
+):
     c, window, *_ = _transaction(monkeypatch, 0, width=width)
     foreground = Mock()
     c._lagom_prediction_stream = Mock()

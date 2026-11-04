@@ -243,7 +243,9 @@ class TargetVerifyExecutor:
         lagom_prediction_tokens = None
         if lagom_decode_width:
             if lagom_decode_width != verify_w:
-                raise ValueError("Lagom decode width differs from the acceptance window")
+                raise ValueError(
+                    "Lagom decode width differs from the acceptance window"
+                )
             if verify_ids_2d.shape[1] <= verify_w:
                 raise ValueError("Lagom requires a nonempty prediction window")
             lagom_prediction_tokens = verify_ids_2d[:, verify_w:].contiguous()
