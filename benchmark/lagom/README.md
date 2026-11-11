@@ -1,5 +1,7 @@
 # Lagom 初步性能实验
 
+8×H100、Mooncake P TP4 / D TP4、LongBench-v2 的 32k/64k/128k × 并发 8–256 overall TPS/TPOT 实验，见 [overall 实验说明](OVERALL.md)，入口为 `run_overall.py`。该方案区分无推测解码的 Hisparse、DHisparse 和 Lagom；当前 Lagom PD 运行时限制及执行环境适配事项也列在该文档中。
+
 在 `perf/lagom` 分支运行，目标是快速判断预取是否带来收益，以及时间花在哪里。
 这是短测方案，不是稳定吞吐结论或生成质量评测。需要能运行 DeepSeek V4 和配套
 DSPARK 的 CUDA GPU、模型依赖及本地 ShareGPT JSON。当前开发环境没有 GPU，
