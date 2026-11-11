@@ -17,11 +17,12 @@ from sglang.kernels.ops.attention.dsv4 import (
 )
 from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.disaggregation.state_layout import dsv4_state_execution_width
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.runtime_context import get_disagg, get_exec, get_spec
 from sglang.srt.utils import ceil_div, is_hip
 
 logger = logging.getLogger(__name__)
@@ -682,13 +683,24 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
     def get_ring_size(self, compress_ratio: int) -> int:
-        is_speculative = get_spec().speculative_algorithm is not None
+        spec = get_spec()
+        is_speculative = spec.speculative_algorithm is not None
         from sglang.srt.runtime_context import max_speculative_num_draft_tokens
 
         return get_compress_state_ring_size(
             compress_ratio,
             is_speculative,
-            (max_speculative_num_draft_tokens() or 0) if get_spec().is_lagom else 0,
+            dsv4_state_execution_width(
+                is_lagom=spec.is_lagom,
+                max_speculative_num_draft_tokens=(
+                    max_speculative_num_draft_tokens() if spec.is_lagom else None
+                ),
+                prefill_execution_width=(
+                    None
+                    if spec.is_lagom
+                    else get_disagg().disaggregation_dsv4_state_execution_width
+                ),
+            ),
         )
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):

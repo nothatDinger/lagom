@@ -145,6 +145,7 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if algo is not None:
         algo.handle_server_args(server_args)
     _resolve_lagom_window(server_args)
+    _validate_dsv4_pd_state_layout(server_args)
 
 
 def _handle_lagom_mode(server_args: ServerArgs) -> None:
@@ -180,8 +181,16 @@ def _handle_lagom_mode(server_args: ServerArgs) -> None:
         raise ValueError(
             "Lagom currently supports tensor parallelism only (PP/DP/CP/DCP sizes must be 1)."
         )
-    if server_args.disaggregation_mode != "null":
-        raise ValueError("Lagom currently requires colocated prefill and decode.")
+    if server_args.disaggregation_mode == "prefill":
+        raise ValueError(
+            "Lagom prefetch runs on the decode server. Use ordinary DSPARK "
+            "prefill with --disaggregation-dsv4-state-execution-width=W+P+1."
+        )
+    if (
+        server_args.disaggregation_mode == "decode"
+        and server_args.disaggregation_transfer_backend != "mooncake"
+    ):
+        raise ValueError("Lagom PD decode currently requires the Mooncake backend.")
     if server_args.speculative_adaptive:
         raise ValueError(
             "Lagom uses a fixed decode window and does not support adaptive speculation."
@@ -218,6 +227,66 @@ def _resolve_lagom_window(server_args: ServerArgs) -> None:
         width,
         prediction_steps,
         width + prediction_steps + 1,
+    )
+
+
+def _validate_dsv4_pd_state_layout(server_args: ServerArgs) -> None:
+    width = getattr(server_args, "disaggregation_dsv4_state_execution_width", None)
+    if width is None:
+        return
+    from sglang.srt.disaggregation.state_layout import dsv4_state_execution_width
+
+    # Keep the validation and allocation bounds in one place.
+    dsv4_state_execution_width(
+        is_lagom=False,
+        max_speculative_num_draft_tokens=None,
+        prefill_execution_width=width,
+    )
+    if server_args.disaggregation_mode != "prefill":
+        raise ValueError(
+            "--disaggregation-dsv4-state-execution-width is for prefill only; "
+            "Lagom decode derives its layout from W and P."
+        )
+    if (server_args.speculative_algorithm or "").upper() != "DSPARK":
+        raise ValueError("DeepSeek-V4 PD state layout requires DSPARK prefill.")
+    if server_args.enable_hisparse:
+        raise ValueError(
+            "DeepSeek-V4 PD state layout requires ordinary prefill without HiSparse."
+        )
+    if server_args.disaggregation_transfer_backend != "mooncake":
+        raise ValueError("DeepSeek-V4 PD state layout requires the Mooncake backend.")
+    from sglang.srt.configs.model_config import is_deepseek_v4
+    from sglang.srt.utils import is_hip
+
+    if (
+        not server_args.device.startswith("cuda")
+        or is_hip()
+        or not is_deepseek_v4(server_args.get_model_config().hf_config)
+    ):
+        raise ValueError("DeepSeek-V4 PD state layout requires CUDA DeepSeek-V4.")
+    if any(
+        size != 1
+        for size in (
+            server_args.pp_size,
+            server_args.dp_size,
+            server_args.attn_cp_size,
+            server_args.dcp_size,
+        )
+    ):
+        raise ValueError(
+            "DeepSeek-V4 PD state layout supports tensor parallelism only."
+        )
+    if server_args.speculative_adaptive:
+        raise ValueError("DeepSeek-V4 PD state layout requires a fixed DSPARK window.")
+    if width < (server_args.speculative_num_draft_tokens or 0):
+        raise ValueError(
+            "PD state execution width must cover the local DSPARK verify window."
+        )
+    logger.info(
+        "DeepSeek-V4 PD prefill state execution width=%d; "
+        "local DSPARK verify width remains %d, prefetch disabled",
+        width,
+        server_args.speculative_num_draft_tokens,
     )
 
 

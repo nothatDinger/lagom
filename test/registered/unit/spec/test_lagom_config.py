@@ -7,6 +7,7 @@ import pytest
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_lagom_mode,
     _resolve_lagom_window,
+    _validate_dsv4_pd_state_layout,
 )
 from sglang.srt.managers.hisparse_prefetcher import create_hisparse_prefetcher
 from sglang.srt.mem_cache.hisparse_spec import validate_pr_fused_config
@@ -27,6 +28,8 @@ def _args(**updates):
         attn_cp_size=1,
         dcp_size=1,
         disaggregation_mode="null",
+        disaggregation_transfer_backend="mooncake",
+        disaggregation_dsv4_state_execution_width=None,
         is_lagom=False,
         lagom_prefetch_tokens=0,
         disable_cuda_graph=False,
@@ -277,3 +280,118 @@ def test_lagom_transfer_plan_budget_matches_tensor_storage():
     assert layout.lagom_plan_bytes(num_layers=layers, num_req_slots=requests) == sum(
         value.untyped_storage().nbytes() for value in tensors
     )
+
+
+@pytest.mark.parametrize("prediction_steps", [1, 2, 4, 7, 8])
+def test_lagom_pd_decode_preserves_local_window_and_graphs(prediction_steps):
+    args = _select(
+        _args(
+            disaggregation_mode="decode",
+            hisparse_config=json.dumps(
+                {
+                    "prefetcher": "lagom",
+                    "prefetcher_config": {"prediction_steps": prediction_steps},
+                }
+            ),
+        )
+    )
+    _validate_dsv4_pd_state_layout(args)
+    assert args.is_lagom
+    assert args.speculative_num_draft_tokens == 8
+    assert args.lagom_prefetch_tokens == prediction_steps
+    assert args.disaggregation_dsv4_state_execution_width is None
+    assert not args.disable_cuda_graph
+
+
+def _prefill_args(**updates):
+    return _args(
+        **(
+            dict(
+                speculative_algorithm="DSPARK",
+                disaggregation_mode="prefill",
+                enable_hisparse=False,
+                hisparse_config=None,
+                disaggregation_dsv4_state_execution_width=12,
+            )
+            | updates
+        )
+    )
+
+
+def _validate_prefill(args):
+    with (
+        patch("sglang.srt.configs.model_config.is_deepseek_v4", return_value=True),
+        patch("sglang.srt.utils.is_hip", return_value=False),
+    ):
+        _validate_dsv4_pd_state_layout(args)
+
+
+@pytest.mark.parametrize("prediction_steps", [1, 2, 4, 7, 8])
+def test_pd_prefill_layout_does_not_enable_prediction_or_change_w(prediction_steps):
+    args = _prefill_args(disaggregation_dsv4_state_execution_width=8 + prediction_steps)
+    _validate_prefill(args)
+    assert args.speculative_num_draft_tokens == 8
+    assert not args.is_lagom
+    assert args.lagom_prefetch_tokens == 0
+    assert not args.enable_hisparse
+    assert not args.disable_cuda_graph
+
+
+@pytest.mark.parametrize("width", [0, -1, True, 1.5, "12", 123])
+def test_pd_prefill_layout_rejects_invalid_width(width):
+    with pytest.raises(ValueError, match="integer"):
+        _validate_prefill(_prefill_args(disaggregation_dsv4_state_execution_width=width))
+
+
+@pytest.mark.parametrize(
+    "update,match",
+    [
+        ({"disaggregation_mode": "decode"}, "prefill only"),
+        ({"disaggregation_mode": "null"}, "prefill only"),
+        ({"speculative_algorithm": None}, "requires DSPARK"),
+        ({"enable_hisparse": True}, "without HiSparse"),
+        ({"device": "cpu"}, "CUDA DeepSeek-V4"),
+        ({"dp_size": 2}, "tensor parallelism"),
+        ({"disaggregation_transfer_backend": "nixl"}, "Mooncake"),
+        ({"speculative_adaptive": True}, "fixed DSPARK"),
+        ({"disaggregation_dsv4_state_execution_width": 7}, "cover the local"),
+    ],
+)
+def test_pd_prefill_layout_rejects_unsupported_modes(update, match):
+    with pytest.raises(ValueError, match=match):
+        _validate_prefill(_prefill_args(**update))
+
+
+@pytest.mark.parametrize("backend", ["nixl", "fake"])
+def test_lagom_pd_rejects_other_transports(backend):
+    with pytest.raises(ValueError, match="Mooncake"):
+        _select(_args(disaggregation_mode="decode", disaggregation_transfer_backend=backend))
+
+
+def test_lagom_prefetch_stays_on_decode_node():
+    with pytest.raises(ValueError, match="prefetch runs on the decode server"):
+        _select(_args(disaggregation_mode="prefill"))
+
+
+@pytest.mark.parametrize("prediction_steps,expected_ring", [(1, 16), (2, 16), (4, 32), (7, 32)])
+def test_pd_prefill_pool_addressing_uses_layout_override_without_widening_execution(
+    prediction_steps, expected_ring
+):
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    override = get_context().override_server_args(
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=8,
+        speculative_adaptive=False,
+        is_lagom=False,
+        lagom_prefetch_tokens=0,
+        disaggregation_mode="prefill",
+        disaggregation_dsv4_state_execution_width=8 + prediction_steps,
+    )
+    override.install()
+    try:
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        assert pool.get_ring_size(4) == expected_ring
+        assert max_speculative_num_draft_tokens() == 8
+    finally:
+        override.restore()
