@@ -64,7 +64,7 @@ def test_three_modes_change_only_prefetch_and_offload():
         if m != "dspark"
     }
     assert configurations["lagom"]["prefetcher"] == "lagom"
-    assert configurations["lagom"]["prefetcher_config"]["prediction_steps"] == 7
+    assert configurations["lagom"]["prefetcher_config"]["prediction_steps"] == settings.p == 4
     assert "prefetcher" not in configurations["hisparse"]
     assert all(
         c["force_h2d_each_step"] is False and c["device_buffer_size"] == 8192

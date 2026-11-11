@@ -3,18 +3,14 @@
 入口：`run_overall.py`。指标为端到端 serving 的 output TPS 和 TPOT。
 本方案与 ShareGPT 短测并存，不改变 `run.py` / `run_concurrent.py` 的模式含义。
 
-**当前代码限制：** 编写脚本时，远端 `perf/lagom` 的
-`python/sglang/srt/arg_groups/speculative_hook.py::_handle_lagom_mode` 仍明确拒绝 PD 分离：
+本分支已加入 Lagom 的 Mooncake PD 状态布局兼容：预填充节点使用普通 DSpark，
+按解码节点的 `W+P+1` 准备 C4 压缩状态环；HiSparse/Lagom 预取只在 D 节点开启。
+默认 **W=7、P=4**，配置里的 `p` 可修改，启动器自动推导预填充端布局宽度。
+Mooncake 在复制前校验两端状态条目的字节步长。
 
-```text
-Lagom currently requires colocated prefill and decode.
-```
-
-当前 checkout 可以生成全部启动计划，但不能直接完成 Lagom 的 PD 实验。
-实际执行包含 Lagom 的矩阵时，脚本在启动任何服务前报出该限制。
-先由执行环境 agent 补齐并验证 PD 支持；**仅删除检查不等于完成支持**。
-本提交只组织实验，不修改保护或推测解码运行时。本环境无 Python/CUDA 执行能力，
-以下 CPU 测试、启动命令及 GPU 性能结果均需在执行环境验证。
+本次修改没有可用执行环境，CPU 测试和 GPU PD/CUDA Graph smoke 均尚未执行。
+正式测量前按文末清单完成本机验证。脚本会检查源码是否包含布局兼容实现，
+并检查服务启动后的实际配置。
 
 ## 实验口径
 
@@ -22,7 +18,7 @@ Lagom currently requires colocated prefill and decode.
 |---|---|---|---|
 | `hisparse` | 普通 target prefill | HiSparse，普通 decode，无 DSpark | 关 |
 | `dhisparse` | target prefill + DSpark context KV 注入 | DSpark + HiSparse，整窗口 oneshot verify | 关 |
-| `lagom` | 与 DHisparse 相同 | DSpark + HiSparse + 预测窗口 | 开 |
+| `lagom` | DSpark prefill，另对齐 D 端压缩状态环 | DSpark + HiSparse + 预测窗口 | 开 |
 
 这里 Hisparse baseline **没有推测解码**。旧短测 `--modes hisparse` 是 DSpark + HiSparse，
 等价于本实验 DHisparse；不要混用结果标签。
@@ -54,7 +50,7 @@ Lagom currently requires colocated prefill and decode.
 
 | 配置 | 值 |
 |---|---|
-| W / P | 7 / 7；Hisparse 无 speculative window |
+| W / P | 7 / 4（可改）；Hisparse 无 speculative window |
 | `device_buffer_size` | **8192，三组相同** |
 | `host_to_device_ratio` | **2，三组相同**，沿用此前实验，需评估主机 RAM |
 | `force_h2d_each_step` | false |
@@ -68,7 +64,7 @@ Lagom currently requires colocated prefill and decode.
 | trace、模拟接受率、跳过 KV IO | 正式测量不使用 |
 
 DHisparse 的 target verify 为 W+1=8 行，包含 bonus token；
-Lagom 增加 P=7 个预测行，逻辑窗口 W+P+1=15 行。K=512 时 union 上界 7680，
+Lagom 增加 P=4 个预测行，逻辑窗口 W+P+1=12 行。K=512 时 union 上界 6144，
 满足 `(W+P+1)*K <= min(hot,8192)`。
 8192 是每请求的 hot C4 KV 槽位，不是原始输入 token 数。32k 点可能接近完整 C4 KV
 常驻，可作为小缺失率对照；64k/128k 更能体现预取的潜在价值。
@@ -83,6 +79,21 @@ host pool、SWA/索引 KV、request slots、DSpark workspace、多 batch graph �
 仍是有效的该并发上限 serving 结果。若启动 OOM 或请求失败，保留 failed 记录，
 不写为 0 TPS 或成功数据。若调 buffer、host ratio、memory fraction，应三组统一修改，
 并用新输出目录重跑；不能只给 Lagom 增大 buffer 或只降低某组并发。
+
+### 修改预测窗口 P
+
+只修改 JSON 配置中的 `p`，例如 4 改成 7；`w` 继续为 7。
+脚本为 Lagom 的 P 节点传入 `w+p+1`，为 D 节点传入 `prediction_steps=p`，
+两端的公开 DSpark verify 宽度仍为 `w+1`。Hisparse/DHisparse 不传布局覆盖参数。
+相应值也会通过两端 `/server_info` 核对，避免忘记同步预填充端。
+
+```bash
+python -m unittest discover -s test/registered/unit/disaggregation \
+  -p test_lagom_pd_state_layout.py
+```
+
+新布局参数只影响 P 端压缩状态及其预算；D 端保持现有 W/P 调度和 graph 路径。
+更改 P 本身会改变 D 端预测计算量。不要将 P=4 或宽度 12 固定写入运行时代码。
 
 ## 精确输入
 
@@ -138,7 +149,7 @@ python benchmark/lagom/run_overall.py \
   --dry-run > /tmp/lagom-overall-plan.json
 ```
 
-执行环境补齐 PD 后，先跑 32k/C=8 三组小矩阵（每组 32 个正式请求，仍输出 1024）：
+完成本机 PD/CUDA Graph 验证后，先跑 32k/C=8 三组小矩阵（每组 32 个正式请求，仍输出 1024）：
 
 ```bash
 python benchmark/lagom/run_overall.py \
@@ -148,8 +159,7 @@ python benchmark/lagom/run_overall.py \
   --input-lens 32768 --concurrencies 8
 ```
 
-当前含 PD guard 的 checkout 可追加 `--methods hisparse dhisparse`，
-先验证两个 baseline；这不构成完整三组实验。
+可追加 `--methods hisparse dhisparse` 单独验证两个 baseline；完整对比仍需三组。
 
 完整矩阵和续跑：
 
@@ -231,12 +241,14 @@ resume 只跳过成功、且协议/代码/数据相同的格；失败项创建�
 
 1. 确认可见 GPU 显存、主机 RAM/NUMA、Mooncake/router 版本，固定依赖和 model revision。
    核对 target/draft 路径、Marlin 和 attention backend。
-2. **补齐 Lagom PD 运行时支持。** P 保持 DSpark context KV 注入，D 开 Lagom。
-   核对 target/draft pool 传输布局、HiSparse host KV 接收、
-   prealloc/transfer → decode 的 speculative state、槽位生命周期。
-   验证 retract/rebootstrap、请求结束及槽位复用，不让旧预取污染新请求。
-3. 验证 DHisparse oneshot dispatch、Lagom W/P 边界和实际预取命中；
-   检查 P/D 预测窗口不同的 draft KV 传输，不能只删 PD guard。
+2. 验证布局兼容：Lagom 的 P 进程应带
+   `--disaggregation-dsv4-state-execution-width W+P+1`，默认值为 12；
+   `speculative-num-draft-tokens` 仍为 8，且 P 不开启 HiSparse/Lagom。
+   检查两端 attention/indexer compressor 环均为 32 槽，改变 P 后重新启动两端。
+   运行故意遗漏 P 端布局参数的负例，确认错误被拒绝而没有继续输出结果。
+3. 验证 target/draft pool 传输、HiSparse host KV 接收、首轮 decode 状态初始化、
+   DHisparse oneshot dispatch 和 Lagom 实际预取命中；覆盖 P=1/2/4/7、
+   环回绕、请求结束/槽位复用和 retract/rebootstrap。
 4. 三组检查 CUDA Graph capture/replay，包括 batch shape 变化、
    prefetch stream/event 依赖、padded request 行。不能关闭 graph 绕开错误。
 5. 运行 CPU tests、dry-run、32k/C=8 smoke，再检查 128k/C=256 资源可行性。

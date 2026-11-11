@@ -3118,6 +3118,14 @@ class ServerArgs:
         ),
         NS("disagg"),
     ] = "mooncake"
+    disaggregation_dsv4_state_execution_width: A[
+        Optional[int],
+        "DeepSeek-V4 DSPARK prefill only: target execution width (W+P+1, including "
+        "the anchor) of the paired Lagom decoder. Sizes attention/indexer "
+        "compressor state for PD transfer without enabling HiSparse/prefetch "
+        "or changing the local draft/verify window. Omit for ordinary PD.",
+        NS("disagg"),
+    ] = None
     disaggregation_bootstrap_port: A[
         int,
         "Bootstrap server port on the prefill server. Default is 8998.",

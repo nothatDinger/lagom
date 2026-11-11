@@ -1,6 +1,6 @@
 # Lagom 初步性能实验
 
-8×H100、Mooncake P TP4 / D TP4、LongBench-v2 的 32k/64k/128k × 并发 8–256 overall TPS/TPOT 实验，见 [overall 实验说明](OVERALL.md)，入口为 `run_overall.py`。该方案区分无推测解码的 Hisparse、DHisparse 和 Lagom；当前 Lagom PD 运行时限制及执行环境适配事项也列在该文档中。
+8×H100、Mooncake P TP4 / D TP4、LongBench-v2 的 32k/64k/128k × 并发 8–256 overall TPS/TPOT 实验，见 [overall 实验说明](OVERALL.md)，入口为 `run_overall.py`。该方案区分无推测解码的 Hisparse、DHisparse 和 Lagom；Lagom PD 状态布局兼容及执行环境验证事项也列在该文档中。
 
 在 `perf/lagom` 分支运行，目标是快速判断预取是否带来收益，以及时间花在哪里。
 这是短测方案，不是稳定吞吐结论或生成质量评测。需要能运行 DeepSeek V4 和配套
@@ -28,7 +28,7 @@ concurrency=1、TP、采样参数、W、prompt 和 CUDA Graph；两个 HiSparse 
 
 - 输入 **32000 token**，输出 **1024 token**；每组 1 个 32-token 输出预热请求，
   然后测量 **2 个完整请求**。可以用 `--requests 1` 做更短 smoke test。
-- 默认 `W=7, P=7, K=512, hot=8192`。并集上界 `(W+P+1)*K=7680`，可以放入
+- 默认 `W=7, P=4, K=512, hot=8192`。并集上界 `(W+P+1)*K=6144`，可以放入
   hot 缓存；两个 HiSparse 组均使用 8192 个 C4 KV 槽位。
 - 32k 输入约有 8000 个 C4 KV，在这一配置下几乎全驻留，实验未出现加速不能
   直接归因于预取无效。需要补充缓存压力实验时，可显式使用 `--w 3 --p 3 --hot 4096`。
@@ -64,14 +64,14 @@ python benchmark/lagom/run.py \
   --model /mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-0731 \
   --draft /mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-DSpark \
   --sharegpt /data/ShareGPT_V3_unfiltered_cleaned_split.json \
-  --tp 4 --w 7 --p 7 --hot 8192 \
+  --tp 4 --w 7 --p 4 --hot 8192 \
   --moe-runner-backend marlin --speculative-moe-runner-backend marlin \
   --output /results/lagom-quick-01
 ```
 
 该 checkpoint 的 `dspark_block_size=5`，这里按实验要求显式覆盖为 W=7；
 接受长度应随结果记录。之前启动命令中的 `num_draft_tokens=6`、block size=5、
-prediction_steps=5 对应 W=P=5，与此次 W=P=7 的配置不同。
+prediction_steps=5 对应 W=P=5，与此次 W=7、P=4 的配置不同。
 
 脚本顺序启动三个未插桩的服务做吞吐测试，再单独启动一个带插桩的 Lagom 服务
 采集 trace，退出后清理自己启动的进程。默认共 4 次模型加载，不同时占用两份模型。

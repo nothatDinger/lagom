@@ -29,6 +29,15 @@ class OverallProtocolTest(unittest.TestCase):
             cmds, _ = overall.commands(self.cfg, cell, Path("/data"), Path("/results"))
             p, d, bench = (cmds[k] for k in ("prefill", "decode", "benchmark"))
             self.assertNotIn("--enable-hisparse", p)
+            state_flag = "--disaggregation-dsv4-state-execution-width"
+            self.assertNotIn(state_flag, d)
+            if method == "lagom":
+                self.assertEqual(
+                    int(p[p.index(state_flag) + 1]),
+                    self.cfg["w"] + self.cfg["p"] + 1,
+                )
+            else:
+                self.assertNotIn(state_flag, p)
             self.assertIn("--enable-hisparse", d)
             self.assertEqual(p[p.index("--base-gpu-id") + 1], "0")
             self.assertEqual(d[d.index("--base-gpu-id") + 1], "4")
@@ -41,7 +50,7 @@ class OverallProtocolTest(unittest.TestCase):
             hs = json.loads(d[d.index("--hisparse-config") + 1])
             configs.append(hs)
             if method == "lagom":
-                self.assertEqual(hs["prefetcher_config"]["prediction_steps"], 7)
+                self.assertEqual(hs["prefetcher_config"]["prediction_steps"], self.cfg["p"])
             else:
                 self.assertNotIn("prefetcher", hs)
             self.assertEqual(bench[bench.index("--max-concurrency") + 1], "8")
@@ -135,7 +144,7 @@ class OverallProtocolTest(unittest.TestCase):
         }
         if method == "lagom":
             info["hisparse_config"].update(
-                prefetcher="lagom", prefetcher_config={"prediction_steps": 7}
+                prefetcher="lagom", prefetcher_config={"prediction_steps": self.cfg["p"]}
             )
         return info
 
@@ -169,14 +178,44 @@ class OverallProtocolTest(unittest.TestCase):
             self.assertEqual(json.loads((folder / "status.json").read_text())["status"], "timeout")
             cleanup.assert_called_once()
 
-    def test_existing_pd_guard_is_reported_not_bypassed(self):
+
+    def test_prediction_window_is_configurable_and_shared_with_prefill_layout(self):
+        self.assertEqual(self.cfg["p"], 4)
+        flag = "--disaggregation-dsv4-state-execution-width"
+        for prediction_steps in (1, 2, 4, 7, 8):
+            cfg = self.cfg | {"p": prediction_steps}
+            cmds, _ = overall.commands(cfg, self.cell, Path("/data"), Path("/out"))
+            p, d = cmds["prefill"], cmds["decode"]
+            self.assertEqual(int(p[p.index(flag) + 1]), cfg["w"] + prediction_steps + 1)
+            self.assertEqual(p[p.index("--speculative-num-draft-tokens") + 1], "8")
+            self.assertEqual(d[d.index("--speculative-num-draft-tokens") + 1], "8")
+            hs = json.loads(d[d.index("--hisparse-config") + 1])
+            self.assertEqual(hs["prefetcher_config"]["prediction_steps"], prediction_steps)
+            self.assertNotIn("--hisparse-config", p)
+            self.assertNotIn(flag, d)
+
+    def test_prefill_resolved_state_width_must_match_the_selected_prediction_window(self):
+        info = self.server_info("lagom") | {
+            "disaggregation_mode": "prefill", "enable_hisparse": False,
+            "hisparse_config": None, "is_lagom": False,
+            "disaggregation_dsv4_state_execution_width": self.cfg["w"] + self.cfg["p"] + 1,
+        }
+        overall.validate_server_info(info, self.cfg, self.cell, "prefill")
+        with self.assertRaisesRegex(ValueError, "state execution width"):
+            overall.validate_server_info(
+                info | {"disaggregation_dsv4_state_execution_width": None},
+                self.cfg, self.cell, "prefill",
+            )
+        with self.assertRaisesRegex(ValueError, "ordinary DSPARK"):
+            overall.validate_server_info(
+                info | {"is_lagom": True}, self.cfg, self.cell, "prefill"
+            )
+
+    def test_pd_compatibility_preflight_finds_all_layout_consumers(self):
         preflight = overall.source_preflight()
         self.assertTrue(preflight["oneshot_source_check_passed"])
-        source = (overall.ROOT / preflight["lagom_pd_guard_file"]).read_text()
-        self.assertEqual(
-            preflight["lagom_pd_explicitly_blocked"],
-            "Lagom currently requires colocated prefill and decode." in source,
-        )
+        self.assertFalse(preflight["lagom_pd_explicitly_blocked"])
+        self.assertTrue(preflight["lagom_pd_layout_ready"])
 
 
 if __name__ == "__main__":

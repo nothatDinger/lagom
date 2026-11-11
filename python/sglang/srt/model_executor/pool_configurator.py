@@ -30,6 +30,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_minimax_sparse,
 )
+from sglang.srt.disaggregation.state_layout import dsv4_state_execution_width
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
@@ -808,10 +809,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self.c4_shrink_factor > 1:
             logger.info(f"HiSparse c4 host-to-device ratio = {self.c4_shrink_factor}")
 
-        execution_width = (
-            kvc.server_args.max_speculative_num_draft_tokens or 0
-            if kvc.server_args.is_lagom
-            else 0
+        execution_width = dsv4_state_execution_width(
+            is_lagom=kvc.server_args.is_lagom,
+            max_speculative_num_draft_tokens=(
+                kvc.server_args.max_speculative_num_draft_tokens
+                if kvc.server_args.is_lagom
+                else None
+            ),
+            prefill_execution_width=getattr(
+                kvc.server_args, "disaggregation_dsv4_state_execution_width", None
+            ),
         )
         self.c4_ring_size = get_compress_state_ring_size(
             4, self.is_speculative, execution_width

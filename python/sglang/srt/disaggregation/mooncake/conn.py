@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
+from sglang.srt.disaggregation.state_layout import validate_state_transfer_layout
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_transfer_entry_pairs,
@@ -669,6 +670,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_data_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_device_data_ptrs: Optional[set[int]] = None,
+        dst_state_item_lens: Optional[list[int]] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -690,6 +692,20 @@ class MooncakeKVManager(CommonKVManager):
                     prefill_data_indices, dst_device_data_indices
                 )
             )
+
+        if dst_state_item_lens is not None:
+            if len(src_data_ptrs) != len(item_lens):
+                raise RuntimeError("PD source state item-size metadata is incomplete")
+            if (
+                self.pp_size in (None, 1)
+                and not src_layer_ids
+                and not dst_layer_ids
+                and len(src_data_ptrs) != len(dst_data_ptrs)
+            ):
+                raise RuntimeError(
+                    f"PD {state_type} state buffer count mismatch: "
+                    f"prefill={len(src_data_ptrs)}, decode={len(dst_data_ptrs)}"
+                )
 
         layers_params = None
 
@@ -750,6 +766,16 @@ class MooncakeKVManager(CommonKVManager):
                 for layer_id in range(layers_current_pp_stage)
             ]
         assert layers_params is not None
+        if dst_state_item_lens is not None:
+            # Validate after PP pairing, before submitting any DMA. C4 state
+            # uses ring-sized items; using the sender's stride with a wider
+            # decoder ring would address the wrong destination state page.
+            validate_state_transfer_layout(
+                layers_params,
+                dst_data_ptrs,
+                dst_state_item_lens,
+                state_type=str(state_type),
+            )
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
@@ -1421,6 +1447,7 @@ class MooncakeKVManager(CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         state_type=st,
+                        dst_state_item_lens=dst_item_lens,
                     )
                     or rc
                 )

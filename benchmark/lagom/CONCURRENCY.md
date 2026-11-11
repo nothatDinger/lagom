@@ -8,7 +8,7 @@
 `--requests` 独立控制**每组、每个阶段的正式请求总数 N**，默认 16；更换并发上限
 不会自动更改 N。预热请求和最后用于导出的 flush 请求不计入 N。
 
-默认 packed ShareGPT **input=32000、output=1024、W=P=7、hot=8192**，PD 融合、
+默认 packed ShareGPT **input=32000、output=1024、W=7、P=4、hot=8192**，PD 融合、
 单机 TP。每组先跑一个输出 32 token 的预热请求，然后提交最多 `min(N,C)` 个正式
 请求。每完成一个请求就补发下一个，直到完成 N 个不同 prompt，末尾不足 C 个也
 正常执行。服务端根据容量和调度情况决定实际 running batch。

@@ -115,6 +115,7 @@ def check_extra(base, extra):
         "--speculative", "--hisparse", "--enable-hisparse",
         "--disable-cuda-graph", "--cuda-graph", "--enable-dp-attention",
         "--dp-size", "--pp-size", "--dcp-size", "--attn-cp-size",
+        "--disaggregation-dsv4-state-execution-width",
     )
     for word in extra:
         flag = word.split("=")[0]
@@ -160,6 +161,13 @@ def commands(cfg, cell, data_dir, folder):
                 "--speculative-num-draft-tokens", str(cfg["w"] + 1),
                 "--speculative-dspark-block-size", str(cfg["w"]),
                 "--speculative-moe-runner-backend", cfg["draft_moe_runner_backend"],
+            ]
+        if role == "prefill" and method == "lagom":
+            # Prepare the decoder's compressor-state layout only. P keeps
+            # ordinary DSPARK, its W+1 public window and no HiSparse/prefetch.
+            argv += [
+                "--disaggregation-dsv4-state-execution-width",
+                str(cfg["w"] + cfg["p"] + 1),
             ]
         if role == "decode":
             hisparse = {
@@ -225,11 +233,29 @@ def source_preflight():
     hook = "python/sglang/srt/arg_groups/speculative_hook.py"
     hook_text = (ROOT / hook).read_text()
     blocked = "Lagom currently requires colocated prefill and decode." in hook_text
+    layout_files = {
+        "server_args": "python/sglang/srt/server_args.py",
+        "pool": "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py",
+        "budget": "python/sglang/srt/model_executor/pool_configurator.py",
+        "transfer": "python/sglang/srt/disaggregation/mooncake/conn.py",
+    }
+    layout_sources = {key: (ROOT / path).read_text() for key, path in layout_files.items()}
+    pd_layout_ready = (
+        not blocked
+        and "disaggregation_dsv4_state_execution_width" in layout_sources["server_args"]
+        and "_validate_dsv4_pd_state_layout(server_args)" in hook_text
+        and "dsv4_state_execution_width(" in layout_sources["pool"]
+        and "dsv4_state_execution_width(" in layout_sources["budget"]
+        and "validate_state_transfer_layout(" in layout_sources["transfer"]
+        and "dst_state_item_lens=dst_item_lens" in layout_sources["transfer"]
+    )
     return {
         "oneshot_source_evidence": evidence,
         "oneshot_source_check_passed": all(v["found"] for v in evidence.values()),
         "lagom_pd_explicitly_blocked": blocked,
         "lagom_pd_guard_file": hook,
+        "lagom_pd_layout_ready": pd_layout_ready,
+        "lagom_pd_layout_files": layout_files,
         "note": "Source inspection only; passing does not establish PD/CUDA Graph correctness.",
     }
 
@@ -245,6 +271,15 @@ def validate_server_info(info, cfg, cell, role):
     for key, value in expected.items():
         if info.get(key) != value:
             raise ValueError(f"{role} resolved {key}={info.get(key)!r}, expected {value!r}")
+    expected_state_width = (
+        cfg["w"] + cfg["p"] + 1
+        if role == "prefill" and cell["method"] == "lagom"
+        else None
+    )
+    if info.get("disaggregation_dsv4_state_execution_width") != expected_state_width:
+        raise ValueError(f"{role} resolved a different PD compressor-state execution width")
+    if role == "prefill" and info.get("is_lagom", False):
+        raise ValueError("Prefill must remain ordinary DSPARK; only its state layout is widened")
     algo = info.get("speculative_algorithm")
     if cell["method"] == "hisparse":
         if algo is not None:
@@ -528,11 +563,11 @@ def main():
             ],
         }, indent=2))
         return
-    if "lagom" in args.methods and preflight["lagom_pd_explicitly_blocked"]:
+    if "lagom" in args.methods and not preflight["lagom_pd_layout_ready"]:
         raise RuntimeError(
-            "This checkout explicitly rejects Lagom + PD in speculative_hook.py. "
-            "Integrate and GPU-validate PD support first; do not merely remove the guard. "
-            "See benchmark/lagom/OVERALL.md. --dry-run is available."
+            "This checkout lacks Lagom PD state-layout compatibility. "
+            "Use matching lagom/perf branches with the prefill state-width option "
+            "and Mooncake layout validation; see benchmark/lagom/OVERALL.md."
         )
     if set(args.methods) & {"dhisparse", "lagom"} and not preflight["oneshot_source_check_passed"]:
         raise RuntimeError("DHisparse oneshot verify source check failed; inspect this checkout")

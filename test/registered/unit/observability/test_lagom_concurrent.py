@@ -86,7 +86,8 @@ def test_hisparse_and_lagom_share_cache_capacity_and_other_cache_controls(bench,
         configs[mode] = json.loads(command[command.index("--hisparse-config") + 1])
     lagom = configs["lagom"]
     assert lagom.pop("prefetcher") == "lagom"
-    assert lagom.pop("prefetcher_config") == {"prediction_steps": 7}
+    assert lagom.pop("prefetcher_config") == {"prediction_steps": args.p}
+    assert args.p == 4
     assert (
         lagom
         == configs["hisparse"]

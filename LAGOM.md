@@ -42,7 +42,7 @@ python -m sglang.launch_server \
   --tp-size 8 \
   --disable-radix-cache \
   --enable-hisparse \
-  --hisparse-config '{"host_to_device_ratio":2,"device_buffer_size":8192,"force_h2d_each_step":false,"prefetcher":"lagom","prefetcher_config":{"prediction_steps":7}}'
+  --hisparse-config '{"host_to_device_ratio":2,"device_buffer_size":8192,"force_h2d_each_step":false,"prefetcher":"lagom","prefetcher_config":{"prediction_steps":4}}'
 ```
 
 Omit `prefetcher_config.prediction_steps` to use `P=W`. It must otherwise be a
@@ -51,7 +51,8 @@ algorithm is omitted; an explicitly different algorithm is rejected. The
 existing bundled-DSPARK draft-path default remains available where the target
 checkpoint provides it.
 
-The example explicitly sets the decode block size to 7. Without that override,
+The example explicitly sets W=7 and P=4. P remains configurable; omitting it
+still selects P=W. Without the decode block-size override,
 DSPARK validates the requested `W` against the draft checkpoint's block size.
 
 `device_buffer_size` counts compressed C4 KV entries, not original tokens. The
@@ -152,10 +153,79 @@ single-width buffers would mix the decoding and prediction boundaries.
 
 Use `--disable-cuda-graph` with the same launch command for an eager comparison.
 
+
+## Mooncake PD disaggregation
+
+Lagom may run on a CUDA DeepSeek-V4 **decode** server with Mooncake. The
+prefill server remains ordinary DSPARK: enable DSPARK on both nodes, enable
+HiSparse/Lagom only on decode, and pass the decoder's execution width to prefill:
+
+```text
+prefill:
+  --disaggregation-mode prefill
+  --speculative-algorithm DSPARK
+  --speculative-num-draft-tokens W+1
+  --speculative-dspark-block-size W
+  --disaggregation-dsv4-state-execution-width W+P+1
+
+decode:
+  --disaggregation-mode decode
+  --speculative-algorithm DSPARK
+  --speculative-num-draft-tokens W+1
+  --speculative-dspark-block-size W
+  --enable-hisparse
+  --hisparse-config ... "prefetcher":"lagom",
+                      "prefetcher_config":{"prediction_steps":P} ...
+```
+
+The expressions above must be replaced by integers in manual launch commands.
+The `perf/lagom` overall launcher computes them automatically from its `w`/`p`
+configuration. With W=7/P=4, the public verify width stays 8, the layout width is
+12 and both nodes use a 32-slot C4 state ring. With P=7, layout width is 15 and
+the ring is also 32; smaller windows can use 16. No runtime rule fixes P to 4.
+
+The prefill-only option changes attention/indexer compressor state sizing,
+memory budgeting and the matching kernel addressing. It does not enable
+HiSparse/prefetch on prefill, change its proposal width, or extend its public
+acceptance window. Decode keeps its existing W/P execution and CUDA Graph
+path. The runtime default remains P=W when prediction_steps is omitted.
+
+Both nodes must use matching target/draft checkpoints, equal TP and matching
+state formats; PP/DP/CP/DCP remain 1 for this path. Use Mooncake on both sides.
+NIXL/fake transfer and enabling Lagom prefetch on the prefill node remain
+unsupported. Changing W/P requires restarting the paired servers so their
+state allocations and CUDA graphs are rebuilt consistently.
+
+Mooncake now checks the selected state buffers' item sizes against the receiver
+metadata before issuing state copies. A missing prefill option or a different
+ring size fails the request with a layout mismatch instead of writing with the
+wrong destination stride. This compares per-item layouts, not whole-pool
+capacities; the two sides can reserve different numbers of pages. Existing
+metadata is sufficient; there is no new wire field or per-verify transfer
+repacking.
+
+CPU regression coverage includes W/P-dependent ring sizing, exported attention
+and indexer state strides, nonzero destination pages, ring wrap, and refusal of
+the old 16-to-32 layout before DMA:
+
+```bash
+python -m unittest discover -s test/registered/unit/disaggregation \
+  -p test_lagom_pd_state_layout.py
+python -m pytest -q test/registered/unit/spec/test_lagom_config.py
+```
+
+This compatibility change was prepared without a usable execution environment;
+the CPU tests and GPU smoke tests have not been run here. Before collecting
+performance results, exercise P=1/2/4/7, prefix lengths around ring/page
+boundaries, mixed batch sizes, request-slot reuse and retract/rebootstrap with
+CUDA Graph enabled. Verify the first decode step after transfer as well as
+subsequent verify/prefetch steps.
+
 ## Supported configuration
 
 The current path targets CUDA DeepSeek-V4, DSPARK, HiSparse, static verify
-windows, and colocated prefill/decode. Lagom selects static verify internally;
+windows, and either colocated prefill/decode or Mooncake PD decode with a
+layout-compatible DSPARK prefill server. Lagom selects static verify internally;
 no `SGLANG_RAGGED_VERIFY_MODE` override is needed. Tensor parallelism is supported;
 PP, DP, attention CP, and DCP sizes must remain 1. Adaptive speculation and the offline
 `SGLANG_OASISKV_TRACE_CONFIG` harness cannot be combined with Lagom. Grammar or

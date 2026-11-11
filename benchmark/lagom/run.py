@@ -540,7 +540,7 @@ def parser(*, high_concurrency=False):
         help="Draft MoE runner; configure separately if its expert format differs",
     )
     p.add_argument("--w", type=int, default=7)
-    p.add_argument("--p", type=int, default=7)
+    p.add_argument("--p", type=int, default=4)
     p.add_argument("--hot", type=int, default=8192)
     p.add_argument("--top-k", type=int, default=512)
     p.add_argument("--input-len", type=int, default=32000)

@@ -12,7 +12,7 @@
   "prefill_nccl_port": 18996,
   "decode_nccl_port": 18997,
   "w": 7,
-  "p": 7,
+  "p": 4,
   "top_k": 512,
   "device_buffer_size": 8192,
   "host_to_device_ratio": 2,
