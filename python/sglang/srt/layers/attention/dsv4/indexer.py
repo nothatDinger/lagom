@@ -846,6 +846,8 @@ class C4IndexerBackendMixin:
             hisparse_coordinator is not None
             and forward_batch.forward_mode.is_target_verify()
         )
+        if hisparse_verify:
+            forward_batch.hisparse_staged_layer_id = None
         hisparse_paired = hisparse_coordinator is not None and getattr(
             forward_batch, "is_oasiskv_paired", False
         )
@@ -1064,39 +1066,61 @@ class C4IndexerBackendMixin:
                             logical_c4_sparse_page_indices
                         ).to(torch.int32)
                     )
-                    if getattr(forward_batch, "lagom_decode_width", 0):
-                        from sglang.srt.layers.attention.dsv4.lagom import (
-                            resolve_lagom_topk,
+                    staging = getattr(hisparse_coordinator, "verification_staging", None)
+                    staged = staging is not None and (
+                        layout is not None or raw_indices.shape[0]
+                        == forward_batch.req_pool_indices.numel() * staging.layout.verify_width
+                    )
+                    if staged:
+                        window_locs = hisparse_coordinator.select_dspark_scratch_locs(
+                            logical_c4_sparse_page_indices,
+                            torch.full_like(speculative_device_locs, -1),
+                            speculative_device_locs,
                         )
-
+                        decode_width = getattr(forward_batch, "lagom_decode_width", 0)
                         if layout is not None:
-                            raise RuntimeError("Lagom requires a static verify window")
-                        swapped_locs = resolve_lagom_topk(
-                            coordinator=hisparse_coordinator,
-                            forward_batch=forward_batch,
-                            layer_id=compress_layer_id,
-                            raw_indices=raw_indices,
-                            compressed_seq_lens=indexer_metadata.c4_seq_lens,
-                            output_buffer=c4_sparse_page_indices,
-                        )
+                            result = hisparse_coordinator.stage_verify_ragged_pages(
+                                req_pool_indices=forward_batch.req_pool_indices,
+                                positions=forward_batch.positions,
+                                compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                                top_k_result=raw_indices, layer_id=compress_layer_id,
+                                verify_lens_cpu=verify_lens_cpu,
+                                output_buffer=c4_sparse_page_indices, window_locs=window_locs,
+                            )
+                        elif decode_width:
+                            from sglang.srt.layers.attention.dsv4.lagom import resolve_lagom_topk
+                            result = resolve_lagom_topk(
+                                coordinator=hisparse_coordinator, forward_batch=forward_batch,
+                                layer_id=compress_layer_id, raw_indices=raw_indices,
+                                compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                                output_buffer=c4_sparse_page_indices, window_locs=window_locs,
+                            )
+                        else:
+                            width = staging.layout.verify_width
+                            result = hisparse_coordinator.stage_verify_pages(
+                                req_pool_indices=forward_batch.req_pool_indices,
+                                compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                                source_prefix_lens=forward_batch.positions.reshape(-1, width)[:, 0],
+                                top_k_result=raw_indices, layer_id=compress_layer_id,
+                                decode_width=width, output_buffer=c4_sparse_page_indices,
+                                window_locs=window_locs,
+                            )
+                        core_metadata.c4_sparse_page_indices = result
+                        forward_batch.hisparse_staged_layer_id = compress_layer_id
                     else:
+                        if getattr(forward_batch, "lagom_decode_width", 0):
+                            raise RuntimeError("Lagom requires fixed verification staging")
                         swapped_locs = hisparse_coordinator.swap_in_selected_pages_spec(
                             req_pool_indices=forward_batch.req_pool_indices,
                             compressed_seq_lens=indexer_metadata.c4_seq_lens,
-                            top_k_result=raw_indices,
-                            layer_id=compress_layer_id,
-                            verify_lens_cpu=verify_lens_cpu,
-                            output_buffer=c4_sparse_page_indices,
+                            top_k_result=raw_indices, layer_id=compress_layer_id,
+                            verify_lens_cpu=verify_lens_cpu, output_buffer=c4_sparse_page_indices,
                         )
-                    # Host misses for current verify C4 rows resolve through the
-                    # transaction's scratch mapping rather than becoming -1.
-                    core_metadata.c4_sparse_page_indices = (
-                        hisparse_coordinator.select_dspark_scratch_locs(
-                            logical_c4_sparse_page_indices,
-                            swapped_locs,
-                            speculative_device_locs,
+                        core_metadata.c4_sparse_page_indices = (
+                            hisparse_coordinator.select_dspark_scratch_locs(
+                                logical_c4_sparse_page_indices, swapped_locs, speculative_device_locs,
+                            )
                         )
-                    )
                 else:
                     core_metadata.c4_sparse_page_indices = (
                         hisparse_coordinator.swap_in_selected_pages(

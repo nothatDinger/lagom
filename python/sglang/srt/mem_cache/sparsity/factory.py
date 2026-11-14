@@ -138,31 +138,25 @@ def resolve_dspark_device_buffer_size(
     verify_width: int,
     effective_top_k: int,
 ) -> SparseConfig:
-    """Size DSPARK's resident C4 set for every row in one verify window.
+    """Size temporal residency independently of verification staging.
 
-    Target verify computes attention for all rows after swap-in planning.  In the
-    worst case their Top-K sets are disjoint, so every returned device location
-    remains stable only when the resident buffer can hold ``verify_width * K``.
-    An omitted device_buffer_size defaults to twice that bound, using the
-    model's effective Top-K. Explicit values are preserved if they can hold
-    one complete window. Force-H2D only invalidates residency; it does not
-    change the configured buffer capacity.
+    The reusable arena materializes the full verify union. An omitted budget
+    uses twice the effective single-query Top-K, independently of W/P.
     """
     if verify_width <= 0 or effective_top_k <= 0:
         raise ValueError(
             "DSPARK HiSparse verify_width and effective_top_k must be positive, "
             f"got verify_width={verify_width}, effective_top_k={effective_top_k}"
         )
-    required = verify_width * effective_top_k
+    required = effective_top_k
     explicit_device_buffer_size = (
         raw_hisparse_config is not None
         and "device_buffer_size" in json.loads(raw_hisparse_config)
     )
     if explicit_device_buffer_size and config.device_buffer_size < required:
         raise ValueError(
-            "HiSparse + DSPARK requires device_buffer_size >= verify_width * "
-            f"effective_top_k ({verify_width} * {effective_top_k} = {required} "
-            f"C4 entries), got {config.device_buffer_size}"
+            "HiSparse + DSPARK requires device_buffer_size >= effective_top_k "
+            f"({required} C4 entries), got {config.device_buffer_size}"
         )
     if not explicit_device_buffer_size:
         config.device_buffer_size = 2 * required

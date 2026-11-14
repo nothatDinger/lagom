@@ -33,7 +33,7 @@ def test_legacy_config_is_unchanged():
 
 @pytest.mark.parametrize("force_h2d", [False, True])
 @pytest.mark.parametrize("verify_width,effective_top_k", [(1, 128), (3, 256), (6, 512)])
-def test_dspark_defaults_device_buffer_to_twice_verify_union(
+def test_dspark_defaults_device_buffer_independently_of_verify_width(
     force_h2d, verify_width, effective_top_k
 ):
     raw = json.dumps(
@@ -46,7 +46,7 @@ def test_dspark_defaults_device_buffer_to_twice_verify_union(
         verify_width=verify_width,
         effective_top_k=effective_top_k,
     )
-    assert config.device_buffer_size == 2 * verify_width * effective_top_k
+    assert config.device_buffer_size == 2 * effective_top_k
 
 
 @pytest.mark.parametrize("force_h2d", [False, True])
@@ -70,18 +70,15 @@ def test_dspark_preserves_sufficient_explicit_device_buffer(force_h2d, buffer_si
 
 
 @pytest.mark.parametrize("force_h2d", [False, True])
-def test_dspark_rejects_insufficient_explicit_device_buffer(force_h2d):
+def test_dspark_accepts_cache_smaller_than_verification_union(force_h2d):
     raw = json.dumps(
         {"top_k": 512, "device_buffer_size": 2048, "force_h2d_each_step": force_h2d}
     )
     config = _config(raw)
-    with pytest.raises(ValueError, match=r"6 \* 512 = 3072"):
-        resolve_dspark_device_buffer_size(
-            config,
-            raw_hisparse_config=raw,
-            verify_width=6,
-            effective_top_k=512,
-        )
+    resolve_dspark_device_buffer_size(
+        config, raw_hisparse_config=raw, verify_width=6, effective_top_k=512,
+    )
+    assert config.device_buffer_size == 2048
 
 
 def test_previous_default_size():
@@ -351,7 +348,7 @@ def test_dspark_defaults_without_explicit_hisparse_config():
         verify_width=6,
         effective_top_k=512,
     )
-    assert config.device_buffer_size == 6144
+    assert config.device_buffer_size == 1024
 
 
 def test_force_h2d_invalidation_preserves_hot_buffer_allocation():
@@ -376,3 +373,20 @@ def test_force_h2d_invalidation_preserves_hot_buffer_allocation():
         coordinator._lru_init.expand(2, -1),
     )
     assert torch.all(physical_hot_buffer == 7)
+
+
+@pytest.mark.parametrize("slots", [0, -1, True, 1.5, "21"])
+def test_lagom_buffer_slots_requires_a_positive_integer(slots):
+    with pytest.raises(ValueError, match="buffer_slots"):
+        create_hisparse_prefetcher(
+            "lagom", {"prediction_steps": 4, "buffer_slots": slots},
+            effective_top_k=512, device_buffer_size=512,
+        )
+
+
+def test_lagom_buffer_slots_is_configurable_without_changing_p():
+    result = create_hisparse_prefetcher(
+        "lagom", {"prediction_steps": 4, "buffer_slots": 21},
+        effective_top_k=512, device_buffer_size=512,
+    )
+    assert result.prediction_steps == 4 and result.buffer_slots == 21

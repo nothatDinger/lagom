@@ -45,7 +45,6 @@ def test_request_tail_keeps_canonical_and_provisional_slots_fixed(force_h2d):
         ("speculative", False),
         ("skip_io", True),
         ("width", 0),
-        ("hot", 2560),
         ("page_size", 3),
         ("prefetcher", "previous"),
         ("width", 17),
