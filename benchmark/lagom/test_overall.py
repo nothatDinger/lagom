@@ -51,6 +51,7 @@ class OverallProtocolTest(unittest.TestCase):
             configs.append(hs)
             if method == "lagom":
                 self.assertEqual(hs["prefetcher_config"]["prediction_steps"], self.cfg["p"])
+                self.assertEqual(hs["prefetcher_config"]["buffer_slots"], self.cfg["prefetch_slots"])
             else:
                 self.assertNotIn("prefetcher", hs)
             self.assertEqual(bench[bench.index("--max-concurrency") + 1], "8")
@@ -144,7 +145,9 @@ class OverallProtocolTest(unittest.TestCase):
         }
         if method == "lagom":
             info["hisparse_config"].update(
-                prefetcher="lagom", prefetcher_config={"prediction_steps": self.cfg["p"]}
+                prefetcher="lagom", prefetcher_config={
+                    "prediction_steps": self.cfg["p"], "buffer_slots": self.cfg["prefetch_slots"],
+                }
             )
         return info
 

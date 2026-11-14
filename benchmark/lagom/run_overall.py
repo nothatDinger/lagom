@@ -66,7 +66,7 @@ def load_config(path):
         cfg["python"] = str((ROOT / cfg["python"]).resolve())
     cfg["tokenizer"] = cfg["tokenizer"] or cfg["model"]
     positive = (
-        "w", "p", "top_k", "device_buffer_size", "chunked_prefill_size",
+        "w", "p", "prefetch_slots", "top_k", "device_buffer_size", "chunked_prefill_size",
         "page_size", "startup_timeout_seconds", "cell_timeout_seconds", "host_to_device_ratio",
     )
     if any(type(cfg[k]) is not int or cfg[k] <= 0 for k in positive):
@@ -78,8 +78,10 @@ def load_config(path):
     hot = cfg["device_buffer_size"]
     if hot % 64 or not 64 <= hot <= 32768:
         raise ValueError("device_buffer_size must be a multiple of 64 in [64,32768]")
-    if (cfg["w"] + cfg["p"] + 1) * cfg["top_k"] > min(hot, 8192):
-        raise ValueError("Require (W+P+1)*index_topk <= min(device_buffer_size,8192)")
+    if (cfg["w"] + cfg["p"] + 1) * cfg["top_k"] > 8192:
+        raise ValueError("Require (W+P+1)*index_topk <= verification staging capacity 8192")
+    if hot < cfg["top_k"]:
+        raise ValueError("device_buffer_size must hold at least index_topk entries")
     if cfg["decode_extra_slots"] < 0:
         raise ValueError("decode_extra_slots must be nonnegative")
     gpu_sets = [set(range(cfg[k], cfg[k] + 4)) for k in ("prefill_base_gpu", "decode_base_gpu")]
@@ -171,13 +173,16 @@ def commands(cfg, cell, data_dir, folder):
             ]
         if role == "decode":
             hisparse = {
+                "top_k": cfg["top_k"],
                 "device_buffer_size": cfg["device_buffer_size"],
                 "host_to_device_ratio": cfg["host_to_device_ratio"],
                 "force_h2d_each_step": False,
             }
             if method == "lagom":
                 hisparse.update(
-                    prefetcher="lagom", prefetcher_config={"prediction_steps": cfg["p"]}
+                    prefetcher="lagom", prefetcher_config={
+                        "prediction_steps": cfg["p"], "buffer_slots": cfg["prefetch_slots"],
+                    }
                 )
             argv += [
                 "--enable-hisparse", "--hisparse-config", canonical(hisparse),
@@ -217,8 +222,8 @@ def source_preflight():
     tree = ast.parse(text)
     evidence = {}
     for name, callee in (
-        ("swap_in_selected_pages_spec", "_run_swap_in_verify_window"),
-        ("_run_swap_in_verify_window", "load_cache_to_device_buffer_spec_mla"),
+        ("stage_verify_pages", "resolve"),
+        ("stage_verify_ragged_pages", "stage_verify_pages"),
     ):
         matches = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name]
         ok = any(
@@ -317,6 +322,8 @@ def validate_server_info(info, cfg, cell, role):
         if cell["method"] == "lagom":
             if hs.get("prefetcher") != "lagom" or hs.get("prefetcher_config", {}).get("prediction_steps") != cfg["p"]:
                 raise ValueError("Lagom prefetch did not resolve with the requested P")
+            if hs.get("prefetcher_config", {}).get("buffer_slots") != cfg["prefetch_slots"]:
+                raise ValueError("Lagom prefetch did not resolve with the requested N")
         elif hs.get("prefetcher"):
             raise ValueError("A baseline unexpectedly enabled prefetch")
 

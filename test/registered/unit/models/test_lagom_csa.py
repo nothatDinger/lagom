@@ -40,6 +40,7 @@ def test_lagom_csa_passes_both_windows_and_device_prefix_to_split_planner():
     assert swap["req_pool_indices"] is batch.req_pool_indices
     assert swap["layer_id"] == 7
     assert not swap["capturing"]
+    assert "window_locs" in swap
 
 
 @pytest.mark.parametrize("width,rows,positions", [(5, 10, 10), (3, 9, 10), (3, 10, 9)])

@@ -117,7 +117,7 @@ def validate_hisparse_prefetcher(
     algorithm_fields = (
         {"alpha", "beta", "gamma"}
         if normalized == "ema"
-        else {"prediction_steps"}
+        else {"prediction_steps", "buffer_slots"}
         if normalized == "lagom"
         else set()
     )
@@ -131,7 +131,7 @@ def validate_hisparse_prefetcher(
     if size <= 0:
         raise ValueError("prefetcher_config.size must be positive")
     logical_entries = size
-    if logical_entries > device_buffer_size:
+    if normalized != "lagom" and logical_entries > device_buffer_size:
         raise ValueError(
             f"prefetcher_config.size ({size} logical entries) exceeds device "
             f"buffer capacity ({device_buffer_size} logical entries)"
@@ -146,6 +146,11 @@ def validate_hisparse_prefetcher(
                 "Lagom prefetcher_config.size must not exceed the model Top-K"
             )
         algorithm_config["prediction_steps"] = prediction_steps
+        if "buffer_slots" in config:
+            slots = _require_int(config, "buffer_slots", 1)
+            if slots <= 0:
+                raise ValueError("prefetcher_config.buffer_slots must be positive")
+            algorithm_config["buffer_slots"] = slots
     for key, default in (("alpha", 0.6), ("beta", 0.2), ("gamma", 0.25)):
         if key not in algorithm_fields:
             continue
@@ -199,9 +204,10 @@ class OasisKVPrefetcher(HiSparsePrefetcher):
 class LagomPrefetcher(OasisKVPrefetcher):
     """Per-probe CSA candidates; the coordinator owns union and async transfer."""
 
-    def __init__(self, logical_entries, size=None, prediction_steps=1):
+    def __init__(self, logical_entries, size=None, prediction_steps=1, buffer_slots=None):
         super().__init__(logical_entries, size)
         self.prediction_steps = prediction_steps
+        self.buffer_slots = buffer_slots
 
 
 @register_hisparse_prefetcher("ema")

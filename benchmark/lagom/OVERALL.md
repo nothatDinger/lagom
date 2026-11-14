@@ -52,6 +52,7 @@ Mooncake 在复制前校验两端状态条目的字节步长。
 |---|---|
 | W / P | 7 / 4（可改）；Hisparse 无 speculative window |
 | `device_buffer_size` | **8192，三组相同** |
+| Lagom `prefetch_slots` | **21**，覆盖全部 CSA 层、提前一轮预取 |
 | `host_to_device_ratio` | **2，三组相同**，沿用此前实验，需评估主机 RAM |
 | `force_h2d_each_step` | false |
 | target / draft MoE backend | marlin / marlin |
@@ -65,7 +66,7 @@ Mooncake 在复制前校验两端状态条目的字节步长。
 
 DHisparse 的 target verify 为 W+1=8 行，包含 bonus token；
 Lagom 增加 P=4 个预测行，逻辑窗口 W+P+1=12 行。K=512 时 union 上界 6144，
-满足 `(W+P+1)*K <= min(hot,8192)`。
+满足验证 arena 的 `(W+P+1)*K <= 8192`；arena 不占用 hot cache。
 8192 是每请求的 hot C4 KV 槽位，不是原始输入 token 数。32k 点可能接近完整 C4 KV
 常驻，可作为小缺失率对照；64k/128k 更能体现预取的潜在价值。
 
@@ -188,17 +189,18 @@ resume 只跳过成功、且协议/代码/数据相同的格；失败项创建�
 
 ## DHisparse oneshot verify 核对
 
-当前分支的 `python/sglang/srt/managers/hisparse_coordinator.py`：
+当前 indexer 将每个请求的全部 verify 查询一起交给 stage_verify_pages；
+ragged 窗口先按请求补齐到固定宽度。共享验证 arena 承载完整去重并集，
+包含 hot/prefetch/writer 命中的 D2D 与剩余真实缺页的 H2D。attention 后才允许
+历史行晋升并复用 arena。DHisparse 使用同一路径，关闭预测后缀与 prefetch buffer。
+oneshot 表示整窗口统一解析，而不是逐 draft token 调 Python swap-in。
 
-- `swap_in_selected_pages_spec` 调用 `_run_swap_in_verify_window`。
-- 后者将 top-k 组织为 `[num_reqs,verify_width,top_k]`，
-  一次调用 `load_cache_to_device_buffer_spec_mla`。
-- 因此静态 DSpark verify 是整窗口 gather/commit，不是每个 draft token 单独调 Python swap-in。
+脚本通过 AST 核对 staging 调用，读取 P/D server_info 验证配置；仍需 GPU trace
+确认实际 dispatch、capture/replay 与复制时序。
 
-脚本通过 AST 检查两个调用并记录位置。启动后读取 P/D `/server_info`，
-核对算法、窗口、TP、buffer、预取、MoE backend 和 decode graph 开关。
-这是源码/配置核对，不能替代 GPU trace 对实际 dispatch、capture/replay 的验证。
-不添加新的 oneshot 开关，也不将 DHisparse 改为 Lagom planner。
+N=21 时，W=7/P=4/K=512 的预取 payload 约 24 MiB/请求/GPU，256 请求约 6 GiB，
+另计对齐、元数据及共享验证 arena。启动预算包含这些固定分配。先完成此配置的
+正确性 smoke，再跑 overall；本次没有执行 GPU 测试。
 
 ## 指标和产物
 

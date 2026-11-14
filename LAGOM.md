@@ -4,9 +4,6 @@ Lagom extends DeepSeek-V4 DSPARK speculative decoding with a disposable predicti
 suffix. The suffix supplies per-layer CSA Top-K hints for the following verify
 round while the original candidates retain normal speculative acceptance.
 
-For a short, reproducible three-mode throughput comparison and CUDA Graph
-per-step timing, see [the performance experiment guide](benchmark/lagom/README.md).
-
 ## Window conventions
 
 | Quantity | Meaning |
@@ -40,9 +37,10 @@ python -m sglang.launch_server \
   --speculative-num-draft-tokens 8 \
   --speculative-dspark-block-size 7 \
   --tp-size 8 \
+  --max-running-requests 8 \
   --disable-radix-cache \
   --enable-hisparse \
-  --hisparse-config '{"host_to_device_ratio":2,"device_buffer_size":8192,"force_h2d_each_step":false,"prefetcher":"lagom","prefetcher_config":{"prediction_steps":4}}'
+  --hisparse-config '{"host_to_device_ratio":2,"device_buffer_size":8192,"force_h2d_each_step":false,"prefetcher":"lagom","prefetcher_config":{"prediction_steps":4,"buffer_slots":21}}'
 ```
 
 Omit `prefetcher_config.prediction_steps` to use `P=W`. It must otherwise be a
@@ -55,20 +53,33 @@ The example explicitly sets W=7 and P=4. P remains configurable; omitting it
 still selects P=W. Without the decode block-size override,
 DSPARK validates the requested `W` against the draft checkpoint's block size.
 
-`device_buffer_size` counts compressed C4 KV entries, not original tokens. The
-model's `index_topk` supplies `K`; the legacy HiSparse `top_k` field does not
-override the DeepSeek-V4 indexer. If the device buffer size is omitted, it
-defaults to `2 * max(W+1, P) * K`. An explicit size must hold at least
-`(W+P+1) * K` entries. The fused planner additionally requires this working
-set to be at most 8192 entries and the hot buffer to be at most 32768 entries.
-The example above assumes the model's usual `K=512`.
+KV storage has three distinct lifetimes:
 
-Demand loading and prefetch are planned together at the full `W+P+1` width.
-The cache must protect both sets simultaneously because their transfers run
-concurrently. The default buffer size is unchanged, but explicit sizes that
-only held the larger of the two windows are no longer sufficient. Pool sizing
-also reserves the persistent per-layer split-transfer plans and live-request
-counts used by CUDA Graph replay.
+- The persistent **hot cache** holds committed history for temporal locality.
+  Its budget B is independent of W/P. DSPARK defaults to 2*K entries when B is
+  omitted; explicit B must be at least the model's effective Top-K.
+- One **verification arena** is shared by serial CSA layers. It materializes
+  W+P+1 query selections and stays live through attention and promotion.
+  Its union may exceed B; the kernel bound (W+P+1)*K <= 8192 remains.
+- A dedicated **circular prefetch buffer** holds N forecasts of at most P*K
+  C4 rows per request per slot. It never aliases the hot cache or verification arena.
+
+prefetcher_config.buffer_slots configures N. Omitting it uses the CSA layer
+count, which is 21 for this Flash checkpoint. Full-step mode requires N >= that
+count: every layer's forecast stays live until the next verify consumes it.
+A smaller ring needs rolling scheduling and is rejected in this implementation.
+Slot mapping uses the CSA ordinal modulo N, not the transformer's absolute layer ID.
+
+At W=7/P=4/K=512, the shared verification capacity is 6144 rows. N=21 adds about
+24 MiB of forecast payload per request per GPU, or 6 GiB at 256 requests, before
+padding and metadata. The startup memory budget includes the shared arena,
+all N payload slots, indices and per-layer forecast descriptors.
+
+B counts compressed C4 KV rows, not original tokens. The model's index_topk
+determines K. The example keeps B=8192 for comparison with existing runs; B
+does not need to contain the verification union. If configuring B below the
+legacy top_k default, also set top_k to the model's actual index_topk so the
+generic configuration validator uses the intended minimum.
 
 Optional `prefetcher_config.size` limits the number of selected C4 entries from
 each prediction row. It defaults to `K` and must be between 1 and `K`. Reducing
@@ -76,7 +87,7 @@ it changes the hints, not the Top-K used by real attention. Duplicate entries
 across prediction rows are resolved by the fused cache planner.
 
 Keep `force_h2d_each_step` false: invalidating residency on every step would
-discard the prefetched working set and is rejected in Lagom mode.
+discard historical residency and is rejected in Lagom mode.
 
 ## Run DSPARK + HiSparse without Lagom
 
@@ -101,36 +112,36 @@ cannot be combined with Lagom.
 
 ## Execution and stream ordering
 
-1. DSPARK proposes `W+P` candidates. The target executes the anchor followed by
-   all candidates with the normal causal relation.
-2. At each CSA layer, the indexer produces both windows' Top-K selections.
-   A single planner protects their union and assigns distinct destinations to
-   demand misses and prediction-only misses. A miss needed by both windows is
-   classified as demand, so it is loaded only once.
-3. The main stream refills the first `W+1` rows while a side stream prefetches
-   the final `P` rows' misses for the following verify. Prefetch starts as soon
-   as that layer's plan is ready, during the current verify; it does not wait
-   for acceptance or C4 commit. Future hints are restricted to history that
-   was already committed before this verify window.
-4. Prediction attention can use resident history, current demand loads, and
-   transaction scratch. It does not wait for its asynchronous prediction-only
-   transfers: those missing entries are excluded from its attention locations.
-   This provides approximate future hidden states without adding synchronous
-   H2D for the prediction suffix.
-5. Acceptance uses only the original `W` candidates. The C4 transaction commits
-   accepted entries, restores speculative mappings, and rejects the suffix.
-   Offline C128 state for unaccepted rows is cleared. Compressor rings and KV
-   reservation are sized for the full physical execution window.
-6. The next verify waits for the relevant layer's prefetch event before reusing
-   its cache state and transfer plan. Request release drains outstanding
-   transfers before host/device storage can be reused.
+1. DSPARK proposes W+P candidates. The target executes the anchor plus all
+   candidates; acceptance still considers only the first W.
+2. Each CSA layer waits for its previous forecast transfer, then the indexer
+   produces current and future Top-K selections.
+3. The resolver deduplicates the query union into one shared verification arena.
+   Hot/forecast hits and tentative C4 writer rows use D2D copies; unresolved
+   real demand uses H2D. Forecast-only host misses are omitted from this round's
+   approximate prediction attention.
+4. Attention reads the materialized arena. Newly generated speculative C4s
+   remain in independent writer scratch until acceptance/rollback.
+5. After attention, selected committed historical rows may be copied back to
+   stable hot-cache addresses. Prediction-only rows and tentative new C4s
+   cannot populate the hot cache. The verification arena is now reusable.
+6. Attention completion and promotion release this layer's forecast slot.
+   Only then does the side stream replace its consumed bytes with next-round
+   predicted KV. Existing hot hits need no forecast H2D.
+7. These copies overlap later layers and the following draft run. The next
+   verify waits at each consuming layer. Request release drains writers before
+   host pages or request slots can be reclaimed.
 
-Demand loading and prefetch share the persistent hash/CLOCK state from
-`swapin_oneshot`. Prediction accuracy affects cache hit rate, not the real
-attention selection: the next real indexer still chooses its own Top-K, and
-missing entries use ordinary demand loading. Hints remain useful when the
-actual accepted length differs from `W`; they do not assume that the complete
-draft path was accepted.
+The full-step mode retains forecasts across the verify boundary in N independent
+payload slots. Acceptance and C4 commit/rollback retain the original W boundary.
+The design follows the separation of hot residency and reusable verification
+staging in [DHiSparse, sections 3.3/3.4](https://arxiv.org/pdf/2610.13708v1).
+
+To preserve FlashMLA's single C4-cache-base interface, this implementation
+materializes hot and forecast hits into the shared arena with D2D copies.
+Their cost and the post-attention copy-back should be measured separately from
+demand H2D; byte correctness and a lower HBM requirement do not establish a
+performance improvement.
 
 ## CUDA graphs
 
@@ -138,18 +149,15 @@ CUDA graphs remain enabled by default for both target and draft. Their buffer
 and capture geometry use the physical execution widths: `W+P+1` for target and
 `W+P` for draft. Acceptance and scheduler transport retain `W+1`.
 
-The target graph retains stable per-layer transfer plans and records a plan-ready
-event at each CSA layer before demand refill. A separate side-stream transfer
-graph is launched immediately after the target graph is enqueued. Each transfer
-waits on its layer's readiness event, allowing H2D to run while the target graph
-is still executing that verify. Live-request counts exclude padded graph rows;
-committed source lengths are derived from graph-updated device inputs.
+The target graph captures planning, materialization, attention, historical
+promotion and each layer's external slot-release event. The side transfer graph
+is enqueued immediately after target launch and waits for these release events.
+There is no target-entry global prefetch wait or foreground graph-tail join.
 
-Persistent external CUDA events provide per-layer wait nodes inside the target
-graph. Side-stream prefetch records those events for the following replay;
-there is no global prefetch wait at target entry or foreground graph-tail join.
-The fused acceptance/commit epilogue is not used for Lagom because its original
-single-width buffers would mix the decoding and prediction boundaries.
+The verification arena/plan and per-layer forecast descriptors/live counts have
+fixed addresses. Each layer waits for its prior forecast copy before reading or
+overwriting its descriptors. Padded requests cannot mutate payloads or indices.
+Changing W/P/N requires restarting so allocations and captures are rebuilt.
 
 Use `--disable-cuda-graph` with the same launch command for an eager comparison.
 
@@ -175,7 +183,7 @@ decode:
   --speculative-dspark-block-size W
   --enable-hisparse
   --hisparse-config ... "prefetcher":"lagom",
-                      "prefetcher_config":{"prediction_steps":P} ...
+                      "prefetcher_config":{"prediction_steps":P,"buffer_slots":21} ...
 ```
 
 The expressions above must be replaced by integers in manual launch commands.
@@ -253,7 +261,8 @@ python -m pytest -q \
   test/registered/unit/spec/test_lagom_cuda_graph.py \
   test/registered/unit/spec/test_lagom_graph_startup.py \
   test/registered/unit/managers/test_hisparse_dspark.py \
-  test/registered/unit/mem_cache/test_hisparse_spec_swapin.py
+  test/registered/unit/mem_cache/test_hisparse_spec_swapin.py \
+  test/registered/unit/mem_cache/test_hisparse_staging_layout.py
 ```
 
 CPU coverage exercises configuration, request-major window boundaries, cache
@@ -268,7 +277,8 @@ concurrent attention reads, resident lookup, and repeated graph/side-stream
 cache updates against reference KV bytes:
 
 ```bash
-python -m pytest -q test/registered/kernels/ops/kvcache/test_hisparse_spec.py -k lagom
+python -m pytest -q test/registered/kernels/ops/kvcache/test_hisparse_staging.py
+python -m pytest -q test/registered/kernels/ops/kvcache/test_hisparse_spec.py
 ```
 
 For GPU validation, run the same prompts with graphs enabled and with
@@ -292,3 +302,19 @@ concurrently with the source verify, including with CUDA Graph enabled, and
 that waits occur at the consuming layer. Measure latency, demand H2D bytes,
 cache hits, and acceptance separately. This implementation does not include a
 GPU performance or prediction-accuracy claim.
+
+
+The staging regressions cover P=1/2/4/7, unions larger than B, packed values and
+quantization scales, all 21 independent forecast slots across successive graph
+replays, and request-slot reuse. Run the plain-Python allocation-accounting test:
+
+~~~bash
+python -m unittest discover -s test/registered/unit/mem_cache -p test_hisparse_staging_layout.py
+~~~
+
+This change was authored without a usable execution environment. These tests
+have not been run here; validate them and the model/PD smoke cases before using
+the new implementation for performance conclusions.
+
+For a short, reproducible three-mode throughput comparison and CUDA Graph
+per-step timing, see [the performance experiment guide](benchmark/lagom/README.md).

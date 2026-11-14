@@ -28,8 +28,8 @@ concurrency=1、TP、采样参数、W、prompt 和 CUDA Graph；两个 HiSparse 
 
 - 输入 **32000 token**，输出 **1024 token**；每组 1 个 32-token 输出预热请求，
   然后测量 **2 个完整请求**。可以用 `--requests 1` 做更短 smoke test。
-- 默认 `W=7, P=4, K=512, hot=8192`。并集上界 `(W+P+1)*K=6144`，可以放入
-  hot 缓存；两个 HiSparse 组均使用 8192 个 C4 KV 槽位。
+- 默认 `W=7, P=4, N=21, K=512, hot=8192`。验证 arena 容量为 6144 行，
+  与 hot cache 独立；两个 HiSparse 组均使用相同的 8192 个 hot C4 槽位。
 - 32k 输入约有 8000 个 C4 KV，在这一配置下几乎全驻留，实验未出现加速不能
   直接归因于预取无效。需要补充缓存压力实验时，可显式使用 `--w 3 --p 3 --hot 4096`。
 - Decode Graph 只 capture batch size 1，减少启动时间，使用 static verify。
@@ -100,7 +100,7 @@ python benchmark/lagom/run.py --model /models/DeepSeek-V4 \
 限制在采样窗口附近，避免把整个模型加载写进 report；rank 0 控制采集范围。
 所有 rank 的轻量 GPU trace 都会独立导出。默认未开启 Nsight。
 
-其他参数：`--w`、`--p`、`--hot`、`--top-k`、`--trace-steps`、`--trace-skip`、
+其他参数：`--w`、`--p`、`--prefetch-slots`、`--hot`、`--top-k`、`--trace-steps`、`--trace-skip`、
 `--mem-fraction`、`--chunked-prefill`、各 timeout。`--dry-run` 只显示启动命令，
 不读取模型、不启动服务。额外相同的模型参数可通过 `--server-args-json file.json`
 提供字符串数组；不能覆盖脚本控制的实验开关。模型 K 会从配置读取并与 `--top-k`
@@ -148,9 +148,11 @@ GPU 标记在 graph 内使用 `%globaltimer` 写固定的 `[region,step,edge]` �
 | `draft_ms` | draft proposal 全过程，包括模型执行和候选处理 |
 | `draft.model_ms` | draft 模型 forward 本身（不含外部候选采样） |
 | `target_verify_ms` | target verify 全过程 |
-| `target.kv_plan_ms` | Lagom 的并集槽位规划 |
-| `target.kv_refill_ms` | Lagom 当前窗口的主流缺页搬运 |
-| `target.kv_refill_fused_ms` | 非 Lagom HiSparse 的融合 gather/commit，包含规划与搬运，不能称为纯 copy 时间 |
+| `target.kv_plan_ms` | 两个 HiSparse 组的整窗口 staging 去重与寻址 |
+| `target.kv_refill_ms` | 两个 HiSparse 组剩余真实缺页的主流 H2D |
+| `target.kv_stage_copy_ms` | hot / prefetch / writer 命中汇入共享验证 arena 的 D2D |
+| `target.kv_promote_ms` | attention 后已提交历史行的 hot-cache 晋升 D2D |
+| `target.kv_refill_fused_ms` | 旧 swap-in fallback 的融合区间；当前 DSPARK staging 路径不使用 |
 | `target.kv_prefetch_ms` | 本轮产生的侧流预取工时，按层求并集 |
 | `target.prefetch_wait_ms` | 当前主流等待上一轮同层预取完成的暴露时间，属于消费轮 |
 | `target.attention_core_ms` | V4 attention backend 执行，含相关 KV store 与 attention kernel |
@@ -202,3 +204,9 @@ GPU 等待；不要跨 TP rank 求和。纯 DSPARK 没有 HiSparse commit 区间
 ```bash
 python -m pytest -q test/registered/unit/observability/test_lagom_perf.py
 ```
+
+
+当前先测试 N=21 的整步预取。prefetch 在本层 attention 和晋升结束、槽位释放后发起；
+下一轮到该层时等待完成。W=7/P=4/K=512 时预取 payload 约 24 MiB/请求/GPU。
+--prefetch-slots 可配置，但本阶段必须覆盖全部 CSA 层；N<层数的滚动调度尚未实现。
+各组保留相同 hot 配置，并把 staging D2D / 晋升计入总成本；新路径尚需 GPU 验证。

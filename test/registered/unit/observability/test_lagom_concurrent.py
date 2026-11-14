@@ -86,12 +86,15 @@ def test_hisparse_and_lagom_share_cache_capacity_and_other_cache_controls(bench,
         configs[mode] = json.loads(command[command.index("--hisparse-config") + 1])
     lagom = configs["lagom"]
     assert lagom.pop("prefetcher") == "lagom"
-    assert lagom.pop("prefetcher_config") == {"prediction_steps": args.p}
+    assert lagom.pop("prefetcher_config") == {
+        "prediction_steps": args.p, "buffer_slots": args.prefetch_slots,
+    }
     assert args.p == 4
     assert (
         lagom
         == configs["hisparse"]
         == {
+            "top_k": args.top_k,
             "device_buffer_size": hot,
             "host_to_device_ratio": 2,
             "force_h2d_each_step": False,
@@ -503,7 +506,7 @@ def test_trace_report_validation_accepts_variable_batches_below_cap(
             "target.prefetch_wait",
         ]
     elif mode == "hisparse":
-        names += ["target.kv_refill_fused"]
+        names += ["target.kv_plan", "target.kv_refill"]
     data = {
         "records": records,
         "regions": [

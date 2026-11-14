@@ -1,9 +1,9 @@
-"""Independent transfers released by each layer of a Lagom target graph.
+"""Forecast copies released after the consuming attention completes.
 
-The target records external readiness events after producing disjoint demand
-and prefetch copy plans. A separately launched graph waits for those events on
-the transfer stream. It can therefore copy future KV while the target is still
-refilling and evaluating its current window, without a foreground graph join.
+The main graph consumes the previous forecast, evaluates attention, promotes
+committed history, then records a slot-release event. The independent side
+graph may overwrite that slot only after this release; the following verify
+waits for its copy completion at the consuming layer.
 """
 
 from dataclasses import dataclass
@@ -64,7 +64,7 @@ class LagomPrefetchGraphs:
     def consume_layer(self, layer_id: int) -> None:
         self.check_healthy()
         # Unconditional during capture: the next target must not overwrite a
-        # prior transfer's plan or read a resident slot whose H2D is unfinished.
+        # prior forecast descriptor or read an unfinished forecast slot.
         with phase("prefetch_wait", layer=layer_id):
             self._layer(layer_id).done.wait(torch.cuda.current_stream())
 

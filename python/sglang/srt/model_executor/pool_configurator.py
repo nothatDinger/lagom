@@ -756,6 +756,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
         self.hisparse_spec_layout = None
         self.hisparse_lagom_plan = False
+        self.hisparse_staging_options = None
+        self.hisparse_staging_page_size = (getattr(kvc.server_args, "page_size", None) or 256) // 4
         if kvc.server_args.enable_hisparse and not kvc.is_draft_worker:
             from sglang.srt.mem_cache.hisparse_spec import (
                 HiSparseSpecLayout,
@@ -803,6 +805,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                     hisparse_cfg.device_buffer_size, verify_width, top_k
                 )
                 self.hisparse_lagom_plan = kvc.server_args.is_lagom
+                self.hisparse_staging_options = dict(
+                    prediction_steps=kvc.server_args.lagom_prefetch_tokens if kvc.server_args.is_lagom else 0,
+                    prefetch_slots=hisparse_cfg.prefetcher_config.get("buffer_slots") if kvc.server_args.is_lagom else None,
+                )
         else:
             self.c4_shrink_factor = 1
         assert self.c4_shrink_factor >= 1
@@ -1007,10 +1013,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             num_layers=self.num_layers_ca4,
             num_req_slots=num_req_slots,
         )
-        if getattr(self, "hisparse_lagom_plan", False):
-            fixed += layout.lagom_plan_bytes(
-                num_layers=self.num_layers_ca4, num_req_slots=num_req_slots
+        options = getattr(self, "hisparse_staging_options", None)
+        if options is not None:
+            from sglang.srt.mem_cache.hisparse_staging import HiSparseStagingLayout
+            staging = HiSparseStagingLayout(
+                request_slots=num_req_slots, verify_width=layout.verify_width,
+                top_k=layout.top_k, sparse_layers=self.num_layers_ca4,
+                page_size=self.hisparse_staging_page_size, **options,
             )
+            row_bytes = self.qk_nope_head_dim + 2 * self.qk_rope_head_dim + 8
+            page_bytes = ceil_div(staging.page_size * row_bytes, 576) * 576
+            fixed += staging.payload_bytes(page_bytes) + staging.workspace_bytes()
         return fixed
 
     def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Mapping, NamedTuple, Optional, Tuple, Union
 
 import torch
+
 from sglang.kernels.ops.kvcache.hisparse import (
     copy_cache_planned_mla,
     load_cache_to_device_buffer_dsv4_mla,
@@ -12,12 +13,9 @@ from sglang.kernels.ops.kvcache.hisparse import (
     transfer_cache_dsv4_mla,
 )
 from sglang.kernels.ops.kvcache.hisparse_spec import (
-    LagomCachePlan,
     allocate_hisparse_spec_states,
-    copy_lagom_cache_plan,
     initialize_hisparse_spec_state,
     load_cache_to_device_buffer_spec_mla,
-    plan_lagom_cache,
 )
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
@@ -26,6 +24,8 @@ from sglang.srt.managers.hisparse_prefetcher import (
     validate_hisparse_prefetcher,
 )
 from sglang.srt.managers.lagom_graph import LagomPrefetchGraphs
+from sglang.kernels.ops.kvcache.hisparse_staging import HiSparseVerificationStaging
+from sglang.srt.mem_cache.hisparse_staging import HiSparseStagingLayout
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -41,7 +41,7 @@ from sglang.srt.mem_cache.hisparse_spec import (
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.observability.lagom_perf import phase, prefetch_slot, timed
+from sglang.srt.observability.lagom_perf import phase, timed
 from sglang.srt.utils import get_device_module, is_hip
 
 device_module = get_device_module()
@@ -342,7 +342,7 @@ class HiSparseCoordinator:
                 prediction_steps=self._lagom_prediction_steps,
             )
             logger.info(
-                "HiSparse speculative swap-in uses pr_fused: %s", self._pr_verify_layout
+                "HiSparse speculative swap-in uses verification staging: %s", self._pr_verify_layout
             )
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
@@ -467,6 +467,7 @@ class HiSparseCoordinator:
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
         self._speculative_verify_width = speculative_verify_width
         self._spec_states = None
+        self.verification_staging = None
         if self._pr_verify_layout is not None:
             self._spec_states = allocate_hisparse_spec_states(
                 HiSparseSpecLayout(
@@ -618,36 +619,6 @@ class HiSparseCoordinator:
             self._lagom_real_counts = None
             if lagom:
                 self._lagom_graphs = LagomPrefetchGraphs(self._previous_prefetch_stream)
-                occurrences = speculative_verify_width * self.top_k
-                self._lagom_plans = [
-                    LagomCachePlan(
-                        miss_src=torch.zeros(
-                            (max_num_req_slots, occurrences),
-                            dtype=torch.int64,
-                            device=device,
-                        ),
-                        miss_dst=torch.zeros(
-                            (max_num_req_slots, occurrences),
-                            dtype=torch.int32,
-                            device=device,
-                        ),
-                        miss_count=torch.zeros(
-                            max_num_req_slots, dtype=torch.int32, device=device
-                        ),
-                        is_demand=torch.zeros(
-                            (max_num_req_slots, occurrences),
-                            dtype=torch.int32,
-                            device=device,
-                        ),
-                    )
-                    for _ in range(layer_num)
-                ]
-                # The next batch may overwrite the scheduler's shared scalar
-                # before the previous side graph has reached its later layers.
-                self._lagom_real_counts = [
-                    torch.zeros(1, dtype=torch.int32, device=device)
-                    for _ in range(layer_num)
-                ]
             self._previous_prefetch_event = device_module.Event()
             self._previous_prefetch_target_layer = None
             self._previous_prefetch_num_reqs = 0
@@ -737,6 +708,25 @@ class HiSparseCoordinator:
                 self.prefetcher_name,
                 self.prefetcher.size,
                 self.top_k,
+            )
+
+        if self._pr_verify_layout is not None:
+            layout = HiSparseStagingLayout(
+                request_slots=max_num_req_slots,
+                verify_width=speculative_verify_width,
+                top_k=self.top_k,
+                sparse_layers=layer_num,
+                prediction_steps=self._lagom_prediction_steps,
+                prefetch_slots=(prefetcher_config or {}).get("buffer_slots") if lagom else None,
+                page_size=self.page_size,
+            )
+            self.verification_staging = HiSparseVerificationStaging(
+                layout=layout, pool=self.mem_pool_device, hot_slots=self.device_buffer_size,
+            )
+            logger.info(
+                "HiSparse verification arena=%d selections/request; "
+                "Lagom slots=%d, forecast capacity=%d/request/slot",
+                layout.verify_capacity, layout.slot_count, layout.forecast_capacity,
             )
 
     def _init_shared_index_prefetch(
@@ -982,6 +972,8 @@ class HiSparseCoordinator:
         self._initialize_spec_request(req.req_pool_idx)
 
     def _initialize_spec_request(self, req_pool_idx: int) -> None:
+        if getattr(self, "verification_staging", None) is not None:
+            self.verification_staging.reset_request(req_pool_idx)
         states = getattr(self, "_spec_states", None)
         if states is None:
             return
@@ -1481,6 +1473,8 @@ class HiSparseCoordinator:
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
         self.req_to_device_buffer[req.req_pool_idx, :] = 0
         self.req_device_buffer_size[req.req_pool_idx] = 0
+        if getattr(self, "verification_staging", None) is not None:
+            self.verification_staging.reset_request(req.req_pool_idx)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
@@ -1867,115 +1861,98 @@ class HiSparseCoordinator:
         if pipeline is not None:
             pipeline.synchronize()
 
-    def swap_in_lagom_pages(
-        self,
-        *,
-        req_pool_indices: torch.Tensor,
-        compressed_seq_lens: torch.Tensor,
-        source_prefix_lens: torch.Tensor,
-        top_k_result: torch.Tensor,
-        layer_id: int,
-        decode_width: int,
-        capturing: bool = False,
-        output_buffer: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Plan one protected union, then refill and prefetch on separate streams.
-
-        The planner mutates hash/CLOCK metadata once and pins the union of real
-        and forecast selections. Its two transfer subsets have disjoint physical
-        destinations: current attention never reads a future-only miss while the
-        side stream writes it. Shared misses belong to the real window.
-        """
-        batch = req_pool_indices.numel()
-        width = decode_width + self._lagom_prediction_steps
-        if width != self._speculative_verify_width or top_k_result.shape != (
-            batch * width,
-            self.top_k,
-        ):
-            raise ValueError("Lagom indexer rows must contain the fixed full window")
-        if source_prefix_lens.shape != (batch,):
-            raise ValueError("Lagom needs one committed device prefix per request")
-        self.consume_lagom_prefetch(layer_id)
-        raw = top_k_result.reshape(batch, width, self.top_k)
-        tokens = raw.clone()
-        history = (source_prefix_lens // self.compress_ratio).to(torch.int32)
-        probes = tokens[:, decode_width:]
-        probes.masked_fill_((probes < 0) | (probes >= history[:, None, None]), -1)
-        lengths = compressed_seq_lens.reshape(batch, -1)
-        if lengths.shape[1] == 1:
-            lengths = lengths.expand(batch, width)
-        if lengths.shape[1] != width:
-            raise ValueError("Lagom needs one compressed length per request or query")
-        lengths = lengths.to(torch.int32).contiguous().clone()
-        lengths[:, decode_width:] = history[:, None]
-        if output_buffer is None:
-            output_buffer = torch.empty_like(top_k_result, dtype=torch.int32)
-        persistent = self._lagom_plans[layer_id]
-        plan = LagomCachePlan(*(tensor[:batch] for tensor in persistent))
-        real_count = self._lagom_real_counts[layer_id]
-        real_count.copy_(self.num_real_reqs)
+    def stage_verify_pages(
+        self, *, req_pool_indices, compressed_seq_lens, source_prefix_lens,
+        top_k_result, layer_id, decode_width, window_locs, output_buffer,
+    ):
+        staging = self.verification_staging
+        if staging is None:
+            raise RuntimeError("DeepSeek-V4 verification staging is unavailable")
+        if self.prefetcher_name == "lagom":
+            self.consume_lagom_prefetch(layer_id)
+        self._invalidate_hot_buffer_residency(req_pool_indices, layer_id)
         active = self._pr_verify_layout["active_slots"]
-        try:
-            with phase("kv_plan", layer=layer_id):
-                plan_lagom_cache(
-                    top_k_tokens=tokens,
-                    device_buffer_tokens=self.req_device_buffer_tokens[
-                        layer_id, :, :active
-                    ],
-                    host_cache_locs=self.req_to_host_pool,
-                    device_buffer_locs=self.req_device_buffer_token_locs[
-                        layer_id, :, :active
-                    ],
-                    host_cache=self.mem_pool_host.kv_buffer[layer_id],
-                    device_buffer=self.mem_pool_device.kv_buffer[layer_id],
-                    top_k_device_locs=output_buffer.view(batch, width, self.top_k),
-                    req_pool_indices=req_pool_indices.to(torch.int64),
-                    seq_lens=lengths.view(-1),
-                    state=self._spec_states[layer_id],
-                    num_real_reqs=real_count,
-                    decode_width=decode_width,
-                    prefetch_top_k=self.prefetcher.logical_entries,
-                    plan=plan,
-                    transfer_kind="dsv4_paged",
-                    item_size_bytes=self.item_size_bytes,
-                )
-            trace_slot = prefetch_slot(layer_id)
+        return staging.resolve(
+            layer_id=layer_id, req_pool_indices=req_pool_indices,
+            source_prefix_lens=source_prefix_lens,
+            compressed_seq_lens=compressed_seq_lens,
+            top_k_result=top_k_result, window_locs=window_locs,
+            output_buffer=output_buffer, num_real_reqs=self.num_real_reqs,
+            decode_width=decode_width, host_locs=self.req_to_host_pool,
+            host_cache=self.mem_pool_host.kv_buffer[layer_id],
+            device_cache=self.mem_pool_device.kv_buffer[layer_id],
+            hot_tokens=self.req_device_buffer_tokens[layer_id, :, :active],
+            hot_locs=self.req_device_buffer_token_locs[layer_id, :, :active],
+            state=self._spec_states[layer_id],
+            prefetch_top_k=self.prefetcher.logical_entries if self.prefetcher_name == "lagom" else None,
+        )
 
-            def transfer():
-                with phase("kv_prefetch", layer=layer_id, slot=trace_slot):
-                    copy_lagom_cache_plan(
-                        plan,
-                        demand=False,
-                        num_real_reqs=real_count,
-                        host_cache=self.mem_pool_host.kv_buffer[layer_id],
-                        device_buffer=self.mem_pool_device.kv_buffer[layer_id],
-                        transfer_kind="dsv4_paged",
-                        item_size_bytes=self.item_size_bytes,
-                    )
-
-            # Record readiness BEFORE demand IO. Eager launches immediately; graph
-            # mode captures a separate transfer graph and launches it immediately
-            # after the foreground graph enqueue, released by each layer's event.
-            self._lagom_graphs.plan_ready(
-                layer_id, batch, transfer, capturing=capturing
-            )
-            with phase("kv_refill", layer=layer_id):
-                copy_lagom_cache_plan(
-                    plan,
-                    demand=True,
-                    num_real_reqs=real_count,
-                    host_cache=self.mem_pool_host.kv_buffer[layer_id],
-                    device_buffer=self.mem_pool_device.kv_buffer[layer_id],
-                    transfer_kind="dsv4_paged",
-                    item_size_bytes=self.item_size_bytes,
-                )
-        except Exception as error:
-            # Planning publishes residency before IO. A launch failure cannot
-            # be retried against that state: a partial copy would look like a
-            # hit. Keep completion events drainable, but require a fresh cache.
-            self._lagom_graphs.fail(error)
-            raise
+    def stage_verify_ragged_pages(
+        self, *, req_pool_indices, positions, compressed_seq_lens,
+        top_k_result, layer_id, verify_lens_cpu, window_locs, output_buffer,
+    ):
+        """Pad variable DSPARK blocks into the same reusable arena."""
+        if self._lagom_prediction_steps:
+            raise ValueError("Lagom requires static verification staging")
+        width = self.verification_staging.layout.verify_width
+        batch = req_pool_indices.numel()
+        counts = [int(value) for value in verify_lens_cpu]
+        if len(counts) != batch or any(value <= 0 or value > width for value in counts):
+            raise ValueError("invalid request-local verification lengths")
+        if sum(counts) != top_k_result.shape[0]:
+            raise ValueError("ragged verification row count mismatch")
+        raw = torch.full((batch, width, self.top_k), -1, dtype=torch.int32, device=self.device)
+        writer = torch.full_like(raw, -1)
+        lengths = torch.zeros((batch, width), dtype=torch.int32, device=self.device)
+        prefixes = torch.empty(batch, dtype=positions.dtype, device=self.device)
+        flat_lengths = compressed_seq_lens.reshape(-1)
+        offset = 0
+        for bid, count in enumerate(counts):
+            raw[bid, :count].copy_(top_k_result[offset:offset + count])
+            writer[bid, :count].copy_(window_locs[offset:offset + count])
+            if flat_lengths.numel() == batch:
+                lengths[bid, :count].copy_(flat_lengths[bid].expand(count))
+            else:
+                lengths[bid, :count].copy_(flat_lengths[offset:offset + count])
+            prefixes[bid].copy_(positions[offset])
+            offset += count
+        padded_output = torch.empty_like(raw)
+        self.stage_verify_pages(
+            req_pool_indices=req_pool_indices, compressed_seq_lens=lengths,
+            source_prefix_lens=prefixes, top_k_result=raw, layer_id=layer_id,
+            decode_width=width, window_locs=writer, output_buffer=padded_output,
+        )
+        offset = 0
+        for bid, count in enumerate(counts):
+            output_buffer[offset:offset + count].copy_(padded_output[bid, :count])
+            offset += count
         return output_buffer
+
+    def swap_in_lagom_pages(
+        self, *, req_pool_indices, compressed_seq_lens, source_prefix_lens,
+        top_k_result, layer_id, decode_width, capturing=False,
+        output_buffer=None, window_locs=None,
+    ):
+        if window_locs is None:
+            raise ValueError("Lagom staging requires current C4 writer locations")
+        return self.stage_verify_pages(
+            req_pool_indices=req_pool_indices, compressed_seq_lens=compressed_seq_lens,
+            source_prefix_lens=source_prefix_lens, top_k_result=top_k_result,
+            layer_id=layer_id, decode_width=decode_width,
+            window_locs=window_locs, output_buffer=output_buffer,
+        )
+
+    def finish_staged_attention(self, layer_id: int, *, capturing: bool) -> None:
+        try:
+            batch, transfer = self.verification_staging.attention_finished(layer_id)
+            if transfer is not None:
+                # Only attention completion and promotion release this slot.
+                self._lagom_graphs.plan_ready(layer_id, batch, transfer, capturing=capturing)
+        except Exception as error:
+            pipeline = getattr(self, "_lagom_graphs", None)
+            if pipeline is not None:
+                pipeline.fail(error)
+            raise
 
     def consume_ema_prefetch(self) -> None:
         """Publish prior work stats; per-layer graph nodes provide ordering."""

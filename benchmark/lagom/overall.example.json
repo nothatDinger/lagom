@@ -31,5 +31,6 @@
   },
   "prefill_extra_args": [],
   "decode_extra_args": [],
-  "router_extra_args": []
+  "router_extra_args": [],
+  "prefetch_slots": 21
 }

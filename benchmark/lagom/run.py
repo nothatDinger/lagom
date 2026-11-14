@@ -32,10 +32,12 @@ def validate(args):
         or args.output_len <= 0
     ):
         raise ValueError("window, lengths and request count must be positive")
-    if args.top_k <= 0 or (args.w + args.p + 1) * args.top_k > min(args.hot, 8192):
+    if args.top_k <= 0 or (args.w + args.p + 1) * args.top_k > 8192:
         raise ValueError(
-            "need (W+P+1)*K <= min(hot,8192); increase --hot or reduce W/P"
+            "need (W+P+1)*K <= staging capacity 8192; reduce W/P"
         )
+    if args.hot < args.top_k or getattr(args, "prefetch_slots", 21) <= 0:
+        raise ValueError("hot must hold K entries and --prefetch-slots must be positive")
     if not 1 < args.hot <= 32768 or args.hot % 64:
         raise ValueError("--hot must be a multiple of 64 in [64,32768]")
     if not 0 < args.trace_steps <= 256 or args.trace_skip < 0:
@@ -104,12 +106,16 @@ def server_command(args, mode, port, *, max_running_requests=1):
     if mode != "dspark":
         config = {
             "host_to_device_ratio": 2,
+            "top_k": args.top_k,
             "device_buffer_size": args.hot,
             "force_h2d_each_step": False,
         }
         if mode == "lagom":
             config.update(
-                prefetcher="lagom", prefetcher_config={"prediction_steps": args.p}
+                prefetcher="lagom", prefetcher_config={
+                    "prediction_steps": args.p,
+                    "buffer_slots": getattr(args, "prefetch_slots", 21),
+                }
             )
         command += ["--enable-hisparse", "--hisparse-config", json.dumps(config)]
     if args.trust_remote_code:
@@ -352,7 +358,7 @@ def validate_traces(
             }
         )
     elif mode == "hisparse":
-        required.add("target.kv_refill_fused")
+        required.update({"target.kv_plan", "target.kv_refill"})
     for path in traces:
         data = json.loads(path.read_text())
         if len(data["records"]) != steps or not all(
@@ -541,6 +547,7 @@ def parser(*, high_concurrency=False):
     )
     p.add_argument("--w", type=int, default=7)
     p.add_argument("--p", type=int, default=4)
+    p.add_argument("--prefetch-slots", type=int, default=21, help="Full-step slots; must cover all CSA layers")
     p.add_argument("--hot", type=int, default=8192)
     p.add_argument("--top-k", type=int, default=512)
     p.add_argument("--input-len", type=int, default=32000)

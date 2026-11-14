@@ -13,14 +13,12 @@ def resolve_lagom_topk(
     raw_indices: torch.Tensor,
     compressed_seq_lens: torch.Tensor,
     output_buffer: torch.Tensor,
+    window_locs: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Refill real rows while future-row misses transfer on the side stream.
+    """Materialize real queries and retain disposable next-round forecasts.
 
-    The indexer has evaluated the target's per-layer hidden states for all
-    W+P+1 rows. Forecast attention may use resident history and C4 transaction
-    scratch, but must not wait for their own prefetch misses. The coordinator
-    protects the whole current read set and assigns disjoint refill/prefetch
-    destinations before launching either transfer.
+    Forecast-only host misses are excluded from prediction attention. The
+    dedicated forecast slot cannot be overwritten before attention finishes.
     """
     batch_size = forward_batch.req_pool_indices.numel()
     decode_width = forward_batch.lagom_decode_width
@@ -44,4 +42,5 @@ def resolve_lagom_topk(
         output_buffer=output_buffer,
         source_prefix_lens=prefix_lens,
         capturing=capturing,
+        window_locs=window_locs,
     )

@@ -65,6 +65,7 @@ def test_three_modes_change_only_prefetch_and_offload():
     }
     assert configurations["lagom"]["prefetcher"] == "lagom"
     assert configurations["lagom"]["prefetcher_config"]["prediction_steps"] == settings.p == 4
+    assert configurations["lagom"]["prefetcher_config"]["buffer_slots"] == settings.prefetch_slots == 21
     assert "prefetcher" not in configurations["hisparse"]
     assert all(
         c["force_h2d_each_step"] is False and c["device_buffer_size"] == 8192
@@ -75,8 +76,9 @@ def test_three_modes_change_only_prefetch_and_offload():
 
 
 def test_capacity_and_trace_length_follow_physical_window():
-    with pytest.raises(ValueError, match="W\\+P\\+1"):
-        args("--hot", "4096")
+    with pytest.raises(ValueError, match="hot must hold K"):
+        args("--hot", "256")
+    assert args("--hot", "512").hot == 512
     value = args("--w", "7", "--p", "7", "--hot", "8192", "--trace-output", "16")
     assert value.trace_output > (value.trace_skip + value.trace_steps) * (value.w + 1)
     assert value.input_len == 32000 and value.output_len == 1024

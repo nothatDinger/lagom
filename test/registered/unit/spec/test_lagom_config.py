@@ -180,11 +180,9 @@ def test_lagom_capacity_protects_real_and_prediction_union(
         prediction_steps=prediction_steps,
     )
     validate_pr_fused_config(**config)
-    # The previous sequential implementation could accept only the larger
-    # window's capacity. Concurrent transfers need the complete protected union.
-    config["hot"] = max(decode_width, prediction_steps) * top_k
-    with pytest.raises(ValueError, match="full verify union"):
-        validate_pr_fused_config(**config)
+    # Staging holds the union independently of the persistent hot budget.
+    config["hot"] = top_k
+    validate_pr_fused_config(**config)
 
 
 def test_lagom_combined_window_respects_kernel_occurrence_limit():
@@ -252,14 +250,18 @@ def test_lagom_pool_budget_uses_complete_planning_union(monkeypatch, device_buff
         pool = DSV4PoolConfigurator(kvc)
     assert pool.hisparse_spec_layout.verify_width == 15
     assert pool.hisparse_spec_layout.occurrences == 15 * 512
-    # Retain the previous 2 * max(W+1, P) * K default while protecting the
-    # entire W+P+1 union in the planner and memory estimate.
-    assert pool.hisparse_spec_layout.hot_slots == 8192
+    assert pool.hisparse_spec_layout.hot_slots == (
+        1024 if device_buffer_size is None else device_buffer_size
+    )
     # The request pool reserves a padding slot in addition to the four live
     # requests. Include all stable per-layer transfer tensors in the budget.
     layout = pool.hisparse_spec_layout
     expected = layout.fixed_state_bytes(num_layers=1, num_req_slots=5)
-    expected += layout.lagom_plan_bytes(num_layers=1, num_req_slots=5)
+    from sglang.srt.mem_cache.hisparse_staging import HiSparseStagingLayout
+    staging = HiSparseStagingLayout(5, 15, 512, 1, 7)
+    row_bytes = model_config.qk_nope_head_dim + 2 * model_config.qk_rope_head_dim + 8
+    page_bytes = ((64 * row_bytes + 575) // 576) * 576
+    expected += staging.payload_bytes(page_bytes) + staging.workspace_bytes()
     assert pool._get_spec_swapin_fixed_bytes_for_token_capacity(65536) == expected
 
 

@@ -19,11 +19,11 @@ class HiSparseSpecLayout:
             1 < self.hot_slots <= 32768
             and self.verify_width > 0
             and self.top_k > 0
-            and self.occurrences <= min(self.hot_slots, 8192)
+            and self.occurrences <= 8192
         ):
             raise ValueError(
-                "Fused HiSparse requires 0 < verify_width * top_k <= "
-                f"min(hot_slots, 8192), with 1 < hot_slots <= 32768, got {self}."
+                "Fused HiSparse requires 0 < verify_width * top_k <= 8192, "
+                f"with 1 < hot_slots <= 32768, got {self}."
             )
 
     @property
@@ -96,13 +96,11 @@ def validate_pr_fused_config(
         )
     if prefetcher and not lagom:
         raise ValueError("pr_fused experiment does not support a named prefetcher")
-    # Lagom plans the real and prediction windows as one protected union.
-    # Their H2D transfers can then run on different streams without either
-    # evicting a location that the other transfer or current attention uses.
-    if width * top_k > min(hot, 8192):
+    # Verification staging, not persistent hot residency, holds the union.
+    if width * top_k > 8192:
         raise ValueError(
-            "pr_fused full verify union must fit hot slots and PR capacity "
-            "(verify_width * top_k <= min(hot_slots, 8192))"
+            "pr_fused full verify union must fit staging capacity "
+            "(verify_width * top_k <= 8192)"
         )
     # Canonical and unused E placeholders stay fixed; only the remaining tail
     # slots rotate with hot. They belong to the request's existing allocation,
