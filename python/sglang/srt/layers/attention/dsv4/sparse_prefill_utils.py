@@ -58,25 +58,35 @@ from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import (
 class SparsePrefillWorkspace:
     """Backend-owned scratch storage for sparse prefill KV dequantization.
 
-    The workspace contents are fully overwritten before every attention call,
-    so token buckets and compression ratios can safely share one buffer. Sparse
-    prefill executes eagerly and serially on the supported paths, which makes it
-    safe to replace the scratch allocation when a larger extent is needed.
+    Contents are overwritten before each attention call; callers must order
+    reuse of the current allocation. Returning from an eager launch does not
+    imply GPU completion, so keep superseded allocations alive for the lifetime
+    of this workspace rather than relying on allocator stream tracking.
+
+    Geometric growth bounds all retired capacity below the current capacity,
+    avoiding cumulative retention on every chunk's small increase in extent.
     """
 
     def __init__(self, device: torch.device):
         self.device = device
         self._buffer: Optional[torch.Tensor] = None
+        self._retired: list[torch.Tensor] = []
 
     def get(self, num_tokens: int) -> torch.Tensor:
         assert num_tokens > 0
         current_capacity = self._buffer.shape[0] if self._buffer is not None else 0
         if num_tokens > current_capacity:
-            self._buffer = torch.empty(
-                (num_tokens, 1, WORKSPACE_DIM),
+            capacity = max(num_tokens, 2 * current_capacity)
+            new_buffer = torch.empty(
+                (capacity, 1, WORKSPACE_DIM),
                 dtype=torch.bfloat16,
                 device=self.device,
             )
+            # Previously enqueued dequantization/attention may still hold raw
+            # pointers into the old allocation. Do not release it on growth.
+            if self._buffer is not None:
+                self._retired.append(self._buffer)
+            self._buffer = new_buffer
         return self._buffer[:num_tokens]
 
 
