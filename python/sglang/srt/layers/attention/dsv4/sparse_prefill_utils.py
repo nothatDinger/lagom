@@ -445,36 +445,78 @@ class SparsePrefillChunkCache:
         self,
         page_table: torch.Tensor,
         c4_page_size: int,
+        *,
+        logical_to_device: Optional[torch.Tensor] = None,
+        physical_num_pages: Optional[int] = None,
     ) -> None:
-        """Populate c4-side fields from the per-query page table.
+        """Resolve complete C4 prefix rows into the payload's address domain.
 
-        ``page_table`` is (num_qo_tokens, max_blocks); rows within a request
-        are duplicates. The combine output is per-layer (depends on the
-        layer's remapped topk_indices), so we only cache the gather-side
-        scaffolding plus compressed/swa bases.
+        The indexer's page table addresses the logical pool. HiSparse writes C4
+        payload through a separate logical-to-device mapping into a smaller pool;
+        reads must apply that same mapping. Ordinary prefill keeps the complete
+        prefix resident until admission into HiSparse decoding.
+
+        Mask each request's unused tail before any mapping lookup: req_to_token
+        can retain old page IDs beyond a reused request slot's live extent.
+        Asynchronous device checks validate live mappings without host waits.
         """
         if self.c4_flat_token_ids is not None:
             return
+        assert c4_page_size > 0
         device = self.seq_lens.device
         c4_max = max(self.max_seq_len // 4, 1)
-        c4_capacity = page_table.shape[-1] * c4_page_size
-        assert (
-            c4_max <= c4_capacity
-        ), f"live c4 extent {c4_max} exceeds metadata capacity {c4_capacity}"
+        metadata_capacity = page_table.shape[-1] * c4_page_size
+        assert c4_max <= metadata_capacity, (
+            f"live c4 extent {c4_max} exceeds metadata capacity {metadata_capacity}"
+        )
         first_q_per_req = self.query_start_loc[:-1].long()
         num_blocks = (c4_max + c4_page_size - 1) // c4_page_size
-        assert num_blocks <= page_table.shape[1]
         per_req_page_table = page_table.narrow(1, 0, num_blocks).index_select(
             0, first_q_per_req
         )
+        positions = torch.arange(c4_max, dtype=torch.int64, device=device)
+        block_idx = positions // c4_page_size
+        in_page = positions % c4_page_size
+        logical_ids = (
+            per_req_page_table.index_select(1, block_idx).to(torch.int64)
+            * c4_page_size
+            + in_page
+        )
+        live = positions[None, :] < (self.seq_lens[:, None] // 4)
+        logical_ids = torch.where(live, logical_ids, 0).reshape(-1)
+        live = live.reshape(-1)
 
-        k_arange = torch.arange(c4_max, dtype=torch.int32, device=device)
-        block_idx = (k_arange // c4_page_size).long()
-        in_page = (k_arange % c4_page_size).to(torch.int32)
-        c4_token_ids_2d = (
-            per_req_page_table.index_select(1, block_idx) * c4_page_size + in_page
-        ).to(torch.int32)
-        flat_c4_ids = c4_token_ids_2d.reshape(-1).clamp_min(0)
+        if logical_to_device is not None:
+            mapping_capacity = logical_to_device.numel()
+            assert mapping_capacity > 0
+            torch._assert_async(
+                ((logical_ids >= 0) & (logical_ids < mapping_capacity)).all(),
+                "DSV4 sparse-prefill C4 logical ID exceeds the HiSparse mapping",
+            )
+            # Guard the lookup itself even if an invalid live ID is detected.
+            # The async assertion reports the error; clamping is not a fallback
+            # for serving an unmapped or offloaded prefix.
+            mapped_ids = logical_to_device.index_select(
+                0, logical_ids.clamp(0, mapping_capacity - 1)
+            ).to(torch.int64)
+            torch._assert_async(
+                ((~live) | (mapped_ids > 0)).all(),
+                "DSV4 sparse-prefill live C4 prefix has no resident HiSparse "
+                "mapping; offloaded history requires the HiSparse swap-in path",
+            )
+        else:
+            mapped_ids = logical_ids
+
+        mapped_ids = torch.where(live, mapped_ids, 0)
+        if physical_num_pages is not None:
+            assert physical_num_pages > 0
+            physical_capacity = physical_num_pages * c4_page_size
+            torch._assert_async(
+                ((mapped_ids >= 0) & (mapped_ids < physical_capacity)).all(),
+                f"DSV4 sparse-prefill C4 ID exceeds physical payload capacity "
+                f"({physical_num_pages} pages, {physical_capacity} token slots)",
+            )
+        flat_c4_ids = mapped_ids.to(torch.int32)
         total_compressed = self.num_reqs * c4_max
         compressed_base = (
             torch.arange(self.num_reqs, dtype=torch.int32, device=device) * c4_max

@@ -1830,7 +1830,16 @@ class DeepseekV4AttnBackend(
                     "sparse-prefill c4 path requires c4_sparse_raw_indices "
                     "(allocated in init_flashmla_related when is_prefill=True)"
                 )
-                cache.ensure_c4(core_attn_metadata.page_table, extra_page_size)
+                cache.ensure_c4(
+                    core_attn_metadata.page_table,
+                    extra_page_size,
+                    logical_to_device=getattr(
+                        token_to_kv_pool.c4_kv_pool,
+                        "full_to_hisparse_device_index_mapping",
+                        None,
+                    ),
+                    physical_num_pages=extra_k_cache.shape[0],
+                )
                 flat_token_ids = cache.c4_flat_token_ids
                 combined_indices, combined_lens = cache.combine_c4_layer(
                     c4_sparse_raw_indices=core_attn_metadata.c4_sparse_raw_indices[

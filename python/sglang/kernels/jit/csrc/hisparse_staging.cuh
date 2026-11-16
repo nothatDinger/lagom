@@ -320,6 +320,7 @@ template <bool HostOnly>
 void copy_verify(
     ST_V(table), ST_V(sources), ST_V(kinds), ST_V(demand), ST_V(tokens), ST_V(counts),
     ST_V(reqs), ST_V(live), ST_V(host), ST_V(pool), ST_V(forecast), ST_V(arena)) {
+  using namespace host;
   const auto device = LaunchKernel::resolve_device(sources.device());
   LaunchKernel(transfer_blocks(reqs.shape()[0]), 256, device)(
       copy_kernel<HostOnly>, make_plan(table, sources, kinds, demand, tokens, counts),
@@ -330,6 +331,7 @@ void promote(
     ST_V(table), ST_V(sources), ST_V(kinds), ST_V(demand), ST_V(tokens), ST_V(counts),
     ST_V(reqs), ST_V(live), ST_V(history), ST_V(hot_tokens), ST_V(hot_locs),
     ST_V(cache_index), ST_V(cache_policy), ST_V(cache_flags), ST_V(arena), ST_V(pool)) {
+  using namespace host;
   const auto device = LaunchKernel::resolve_device(sources.device());
   LaunchKernel(static_cast<uint32_t>(reqs.shape()[0]), 256, device)(
       promote_kernel<HotSlots>, make_plan(table, sources, kinds, demand, tokens, counts),
@@ -343,6 +345,7 @@ void prefetch(
     ST_V(forecast), ST_V(reqs), ST_V(live), ST_V(host_locs), ST_V(index),
     ST_V(sources), ST_V(counts), ST_V(host), ST_V(arena),
     ST_V(hot_tokens), ST_V(cache_index), ST_V(cache_policy), ST_V(cache_flags)) {
+  using namespace host;
   const auto device = LaunchKernel::resolve_device(forecast.device());
   const uint32_t batch = static_cast<uint32_t>(reqs.shape()[0]);
   LaunchKernel(batch, 256, device)(
