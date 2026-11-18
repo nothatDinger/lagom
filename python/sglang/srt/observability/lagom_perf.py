@@ -135,19 +135,29 @@ def union_ns(intervals):
 def summarize(regions, steps):
     """Intervals are inclusive stream spans, never an additive GPU breakdown."""
     rows = []
+    kinds = sorted({r["name"] for r in regions})
+    transfer_kinds = sorted({r["name"] for r in regions if "kv_entries" in r})
     for step in range(steps):
         row = {"step": step}
-        for kind in sorted({r["name"] for r in regions}):
+        step_regions = [r for r in regions if r["step"] == step]
+        for kind in kinds:
             intervals = [
                 (r["start_ns"], r["end_ns"])
-                for r in regions
-                if r["step"] == step and r["name"] == kind
+                for r in step_regions
+                if r["name"] == kind
             ]
             row[kind + "_ms"] = union_ns(intervals) / 1e6
+        for kind in transfer_kinds:
+            entries = [
+                r["kv_entries"]
+                for r in step_regions
+                if r["name"] == kind and "kv_entries" in r
+            ]
+            row[kind + "_entries"] = sum(entries) if entries else None
         # Without CUPTI activity, a stream timestamp gap cannot distinguish
         # host starvation, D2H, launch latency, NCCL or uninstrumented kernels.
         row["gpu_wait_cpu_ms"] = None
-        current = [r for r in regions if r["step"] == step and r["name"] == "step"]
+        current = [r for r in step_regions if r["name"] == "step"]
         previous = [r for r in regions if r["step"] == step - 1 and r["name"] == "step"]
         row["inter_step_gap_ms"] = (
             max(0, current[0]["start_ns"] - previous[0]["end_ns"]) / 1e6
@@ -164,9 +174,15 @@ class StepTrace:
     def __init__(self, config):
         import torch
 
-        from sglang.srt.observability.lagom_perf_kernels import stamp
+        from sglang.srt.observability.lagom_perf_kernels import (
+            count_forecast_copies,
+            count_verify_copies,
+            stamp,
+        )
 
         self.torch, self.stamp = torch, stamp
+        self.count_verify_copies = count_verify_copies
+        self.count_forecast_copies = count_forecast_copies
         self.steps, self.skip = int(config.get("steps", 12)), int(config.get("skip", 2))
         if not 0 < self.steps <= 256 or self.skip < 0:
             raise ValueError("trace steps must be 1..256 and skip nonnegative")
@@ -186,6 +202,10 @@ class StepTrace:
         self.stamps = torch.zeros(
             (self.MAX_REGIONS, self.steps, 2), dtype=torch.int64, device="cuda"
         )
+        self.kv_entries = torch.zeros(
+            (self.MAX_REGIONS, self.steps), dtype=torch.int32, device="cuda"
+        )
+        self.kv_entry_regions = set()
         self.names, self.side_slots, self.records, self.cpu = {}, {}, [], []
         self.accepted, self.prefix_lens_gpu, self.events = {}, {}, []
         self.role, self.seen, self.active, self.written = "target", 0, -1, False
@@ -226,7 +246,7 @@ class StepTrace:
                 f"lagom/{full_name}/step={self.active}/layer={layer}"
             )
         try:
-            yield
+            yield self
         finally:
             self.stamp[(1,)](self.stamps, target_slot, self.steps, region, 1)
             if live:
@@ -240,6 +260,41 @@ class StepTrace:
                         "end_ns": time.perf_counter_ns(),
                     }
                 )
+
+    def _kv_region(self, name, layer):
+        index = self.names[(f"{self.role}.{name}", layer)]
+        self.kv_entry_regions.add(index)
+        return index
+
+    def record_verify_copies(self, layer, plan, live, batch):
+        capacity = plan.kinds.shape[1]
+        self.count_verify_copies[(batch,)](
+            self.kv_entries,
+            self.slot,
+            plan.kinds,
+            plan.demand,
+            plan.counts,
+            live,
+            self.steps,
+            self._kv_region("kv_refill", layer),
+            self._kv_region("kv_stage_copy", layer),
+            capacity,
+            1 << (capacity - 1).bit_length(),
+        )
+
+    def record_forecast_copies(self, layer, slot, counts, reqs, live):
+        batch = reqs.numel()
+        self.count_forecast_copies[(1,)](
+            self.kv_entries,
+            slot,
+            counts,
+            reqs,
+            live,
+            self.steps,
+            self._kv_region("kv_prefetch", layer),
+            batch,
+            1 << (batch - 1).bit_length(),
+        )
 
     def begin(self, batch):
         self.poll()
@@ -320,19 +375,21 @@ class StepTrace:
             self.torch.cuda.cudart().cudaProfilerStop()
             self.nsys_running = False
         values = self.stamps.cpu().tolist()
+        kv_entries = self.kv_entries.cpu().tolist() if self.kv_entry_regions else None
         regions = []
         for (name, layer), index in self.names.items():
             for step, (start, end) in enumerate(values[index]):
                 if start > 0 and end >= start:
-                    regions.append(
-                        {
-                            "name": name,
-                            "layer": layer,
-                            "step": step,
-                            "start_ns": start,
-                            "end_ns": end,
-                        }
-                    )
+                    region = {
+                        "name": name,
+                        "layer": layer,
+                        "step": step,
+                        "start_ns": start,
+                        "end_ns": end,
+                    }
+                    if index in self.kv_entry_regions:
+                        region["kv_entries"] = kv_entries[index][step]
+                    regions.append(region)
         for record in self.records:
             if record["prefix_lens"] is None:
                 record["prefix_lens"] = (
@@ -354,6 +411,7 @@ class StepTrace:
                 "CPU and GPU clocks use independent origins in Chrome export; use Nsight for precise correlation.",
                 "gpu_wait_cpu_ms is unknown without CUPTI; cpu_dependency_commit is an upper-bound dependency span.",
                 "prefetch_wait belongs to the consuming step; kv_prefetch belongs to the producing step.",
+                "kv_entries counts copied C4 rows per rank; each row carries 584 payload bytes.",
             ],
         }
         stem.with_suffix(".json").write_text(json.dumps(payload, indent=2))
@@ -401,7 +459,14 @@ class StepTrace:
                         "tid": tracks[track],
                         "ts": (r["start_ns"] - zero) / 1000,
                         "dur": (r["end_ns"] - r["start_ns"]) / 1000,
-                        "args": {"step": r["step"]},
+                        "args": {
+                            "step": r["step"],
+                            **(
+                                {"kv_entries": r["kv_entries"]}
+                                if "kv_entries" in r
+                                else {}
+                            ),
+                        },
                     }
                 )
         stem.with_suffix(".trace.json").write_text(json.dumps({"traceEvents": events}))

@@ -162,6 +162,16 @@ GPU 标记在 graph 内使用 `%globaltimer` 写固定的 `[region,step,edge]` �
 | `gpu_wait_cpu_ms` | 默认未知/null；没有 CUPTI 证据时不把剩余时间当作 CPU 阻塞 |
 | `inter_step_gap_ms` | 上一轮主流结束到本轮开始的间隔；包含 scheduler 等未归因开销，不直接等同 CPU 阻塞 |
 
+GPU region 的 `kv_entries` 记录当前 rank 实际搬运的 C4 行数，分为主流 H2D
+`target.kv_refill`、主流 D2D `target.kv_stage_copy` 和侧流 H2D
+`target.kv_prefetch`。计数基于去重后的搬运计划，排除无效条目和 graph padding。
+侧流计数归到发起预取的 step。每行包含 576 字节的 KV 数据和 8 字节的量化
+scale，故 payload 字节数为 `kv_entries * 584`。JSON 的 summary 和
+`.steps.csv` 按 step 对各层计数求和，分别输出 `target.kv_refill_entries`、
+`target.kv_stage_copy_entries` 和 `target.kv_prefetch_entries`。Chrome trace
+在对应 GPU 区间的 args 中显示 `kv_entries`。执行了搬运阶段但没有数据可搬时，
+计数为 0；没有对应采样区间时，CSV 留空。
+
 区间是 inclusive span，可能包含嵌套和跨流重叠，**不能直接相加当成总延迟**。
 Graph replay 的内部 Python 不会重新执行，内部 GPU 标记仍会执行。CPU 轨迹与
 GPU 轨迹在轻量 Chrome 导出中采用独立零点；不能用这两个时钟直接判断因果。

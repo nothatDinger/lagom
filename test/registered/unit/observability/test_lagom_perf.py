@@ -1,5 +1,6 @@
 """Workload identity, fair baseline commands, trace accounting and graph markers."""
 
+import csv
 import importlib.util
 import json
 import sqlite3
@@ -153,13 +154,21 @@ def test_summary_keeps_inclusive_spans_and_unknown_cpu_wait_separate():
     regions = [
         {"step": 0, "name": "step", "start_ns": 100, "end_ns": 1100},
         {"step": 0, "name": "target.attention_core", "start_ns": 200, "end_ns": 600},
-        {"step": 0, "name": "target.kv_prefetch", "start_ns": 300, "end_ns": 800},
-        {"step": 0, "name": "target.kv_prefetch", "start_ns": 700, "end_ns": 1000},
+        {
+            "step": 0, "name": "target.kv_prefetch", "start_ns": 300,
+            "end_ns": 800, "kv_entries": 7,
+        },
+        {
+            "step": 0, "name": "target.kv_prefetch", "start_ns": 700,
+            "end_ns": 1000, "kv_entries": 3,
+        },
         {"step": 1, "name": "step", "start_ns": 1300, "end_ns": 2000},
     ]
     summary = lagom_perf.summarize(regions, 2)
     assert summary[0]["step_ms"] == 0.001
     assert summary[0]["target.kv_prefetch_ms"] == 0.0007
+    assert summary[0]["target.kv_prefetch_entries"] == 10
+    assert summary[1]["target.kv_prefetch_entries"] is None
     assert summary[0]["gpu_wait_cpu_ms"] is None
     assert summary[1]["inter_step_gap_ms"] == 0.0002
 
@@ -217,6 +226,7 @@ def test_verify_step_snapshots_optional_cpu_lengths_without_host_wait(
     trace.slot = torch.tensor([-1])
     trace.stamps = torch.tensor([[[100, 200], [300, 400]]])
     trace.names = {("step", None): 0}
+    trace.kv_entry_regions = set()
     event = Mock(query=lambda: ready)
     trace.torch = SimpleNamespace(cuda=SimpleNamespace(Event=lambda: event))
     # Exercise the real decorator/begin/finish/export; only CUDA timers are mocked.
@@ -297,6 +307,9 @@ def test_export_waits_for_transfer_completion_and_writes_valid_tracks(tmp_path):
     trace.events = [Mock(query=Mock(side_effect=[False, True]))]
     trace.stamps = torch.tensor([[[100, 200]], [[120, 220]]])
     trace.names = {("step", None): 0, ("target.kv_prefetch", 2): 1}
+    trace.kv_entry_regions = {1}
+    trace.kv_entries = Mock()
+    trace.kv_entries.cpu.return_value = torch.tensor([[0], [0]])
     trace.records = [
         {
             "step": 0,
@@ -312,7 +325,9 @@ def test_export_waits_for_transfer_completion_and_writes_valid_tracks(tmp_path):
     ]
     trace.poll()
     assert not trace.written and not list(tmp_path.iterdir())
+    trace.kv_entries.cpu.assert_not_called()
     trace.poll()
+    trace.kv_entries.cpu.assert_called_once()
     assert trace.written
     chrome = json.loads(next(tmp_path.glob("*.trace.json")).read_text())
     assert all(
@@ -322,7 +337,13 @@ def test_export_waits_for_transfer_completion_and_writes_valid_tracks(tmp_path):
     spans = [e for e in chrome["traceEvents"] if e["ph"] == "X"]
     assert len(spans) == 3
     assert {e["cat"] for e in spans} == {"GPU", "CPU (separate clock)"}
-    assert next(tmp_path.glob("*.steps.csv")).read_text().count("\n") == 2
+    event = next(e for e in spans if e["name"] == "target.kv_prefetch")
+    assert event["args"] == {"step": 0, "kv_entries": 0}
+    csv_path = next(tmp_path.glob("*.steps.csv"))
+    with csv_path.open() as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1
+    assert rows[0]["target.kv_prefetch_entries"] == "0"
 
 
 def test_timestamp_ring_survives_independent_graph_replays(tmp_path):
@@ -349,9 +370,34 @@ def test_timestamp_ring_survives_independent_graph_replays(tmp_path):
     ready.record()
     done.record()
 
+    # Graph batch 2 contains one live request. Its plan includes a host-only
+    # prediction, an invalid source, and a stale tail past the actual count.
+    plan = SimpleNamespace(
+        kinds=torch.tensor(
+            [[1, 2, 3, 1, 0, 1], [1, 1, 1, 1, 1, 1]],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        demand=torch.tensor(
+            [[1, 0, 0, 0, 1, 1], [1, 1, 1, 1, 1, 1]],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        counts=torch.tensor([5, 6], dtype=torch.int32, device="cuda"),
+    )
+    live = torch.tensor([1], dtype=torch.int32, device="cuda")
+    reqs = torch.tensor([2, 0], dtype=torch.int64, device="cuda")
+    forecast_counts = torch.tensor([19, 0, 7], dtype=torch.int32, device="cuda")
+
     def target():
         done.wait()
         with trace.region("step"):
+            with trace.region("kv_stage_copy", layer=0):
+                pass
+            with trace.region("kv_refill", layer=0):
+                pass
+            trace.record_verify_copies(0, plan, live, 2)
+            forecast_counts[2:3].copy_(trace.slot + 7)
             side_slot.copy_(trace.slot)
             ready.record()
 
@@ -359,6 +405,7 @@ def test_timestamp_ring_survives_independent_graph_replays(tmp_path):
         ready.wait()
         with trace.region("kv_prefetch", layer=0, slot=side_slot):
             torch.empty(8, device="cuda").fill_(2)
+        trace.record_forecast_copies(0, side_slot, forecast_counts, reqs, live)
         done.record()
 
     target()
@@ -373,6 +420,7 @@ def test_timestamp_ring_survives_independent_graph_replays(tmp_path):
     for step in (0, 1):
         batch.forward_iter = step
         trace.begin(batch)
+        plan.demand[0, 3] = step
         main_graph.replay()
         with torch.cuda.stream(side):
             side_graph.replay()
@@ -388,7 +436,8 @@ def test_timestamp_ring_survives_independent_graph_replays(tmp_path):
     report = next(
         p for p in tmp_path.glob("rank-*.json") if not p.name.endswith(".trace.json")
     )
-    assert [r["prefix_lens"] for r in json.loads(report.read_text())["records"]] == [
-        [32000],
-        [32001],
-    ]
+    data = json.loads(report.read_text())
+    assert [r["prefix_lens"] for r in data["records"]] == [[32000], [32001]]
+    assert [s["target.kv_refill_entries"] for s in data["summary"]] == [1, 2]
+    assert [s["target.kv_stage_copy_entries"] for s in data["summary"]] == [2, 2]
+    assert [s["target.kv_prefetch_entries"] for s in data["summary"]] == [7, 8]

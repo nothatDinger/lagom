@@ -121,10 +121,12 @@ class HiSparseVerificationStaging:
             self.module.copy_verify_device(
                 *self.plan, reqs, self.live, host_cache, device_cache, forecast, self.arena,
             )
-        with phase("kv_refill", layer=layer_id):
+        with phase("kv_refill", layer=layer_id) as trace:
             self.module.copy_verify_host(
                 *self.plan, reqs, self.live, host_cache, device_cache, forecast, self.arena,
             )
+        if trace is not None:
+            trace.record_verify_copies(layer_id, self.plan, self.live, batch)
         if layout.prediction_steps:
             if decode_width + layout.prediction_steps != layout.verify_width:
                 raise ValueError("Lagom real/forecast windows differ from staging")
@@ -162,13 +164,22 @@ class HiSparseVerificationStaging:
         trace_slot = prefetch_slot(layer_id)
 
         def transfer():
-            with phase("kv_prefetch", layer=layer_id, slot=trace_slot):
+            with phase("kv_prefetch", layer=layer_id, slot=trace_slot) as trace:
                 self.module.prefetch(
                     self.forecast_tokens[layer_id][:batch],
                     self.forecast_reqs[layer_id][:batch], self.forecast_live[layer_id],
                     host_locs, self.forecast_indices[slot], self.forecast_sources[slot],
                     self.forecast_counts[slot], host_cache, self.forecasts[slot],
                     hot_tokens, state.cache_index, state.cache_policy, state.scratch_state,
+                )
+
+            if trace is not None:
+                trace.record_forecast_copies(
+                    layer_id,
+                    trace_slot,
+                    self.forecast_counts[slot],
+                    self.forecast_reqs[layer_id][:batch],
+                    self.forecast_live[layer_id],
                 )
 
         return batch, transfer
