@@ -324,11 +324,15 @@ def validate_traces(
             }
         )
     elif mode == "hisparse":
-        required.update(
-            {"target.swap_in_gather", "target.swap_in_reread", "target.swap_in_commit"}
-        )
+        required.update({"target.swap_in_gather", "target.swap_in_commit"})
     for path in traces:
         data = json.loads(path.read_text())
+        required_here = required
+        if mode == "hisparse" and data.get("swap_in") != {
+            "implementation": "adaptive",
+            "force_h2d_each_step": False,
+        }:
+            required_here = required | {"target.swap_in_reread"}
         if len(data["records"]) != steps or not all(
             r["cuda_graph"] and r.get("draft_cuda_graph", False)
             for r in data["records"]
@@ -360,9 +364,9 @@ def validate_traces(
                 for r in data["regions"]
                 if r["step"] == step and r["end_ns"] >= r["start_ns"] > 0
             }
-            if required - found:
+            if required_here - found:
                 raise RuntimeError(
-                    f"missing GPU markers in {path}, step {step}: {sorted(required - found)}"
+                    f"missing GPU markers in {path}, step {step}: {sorted(required_here - found)}"
                 )
 
 

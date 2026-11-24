@@ -219,6 +219,7 @@ def test_verify_step_snapshots_optional_cpu_lengths_without_host_wait(
     trace.written, trace.nsys = False, False
     trace.seen, trace.skip, trace.steps, trace.active = 0, 1, 2, -1
     trace.required_batch_size = None
+    trace.min_output_tokens = 1023
     trace.max_batch_size, trace.request_prefix = None, None
     trace.output, trace.device = tmp_path, 0
     trace.records, trace.cpu, trace.events = [], [], []
@@ -235,11 +236,18 @@ def test_verify_step_snapshots_optional_cpu_lengths_without_host_wait(
     batch = SimpleNamespace(
         seq_lens=DeviceValues([32000]),
         seq_lens_cpu=torch.tensor([32000]) if cpu_lengths else None,
-        reqs=[SimpleNamespace(rid="baseline")],
+        reqs=[
+            SimpleNamespace(
+                rid="baseline", sampling_params=SimpleNamespace(max_new_tokens=32)
+            )
+        ],
         forward_iter=0,
         forward_mode=SimpleNamespace(is_idle=lambda: False),
     )
     result = SimpleNamespace(can_run_cuda_graph=True, accept_lens=DeviceValues([1]))
+    trace.begin(batch)
+    assert trace.seen == 0 and trace.active == -1  # Serving warmup is excluded.
+    batch.reqs[0].sampling_params.max_new_tokens = 1023 if cpu_lengths else 1024
 
     @lagom_perf.verify_step
     def decode(self, batch):
@@ -346,6 +354,51 @@ def test_export_waits_for_transfer_completion_and_writes_valid_tracks(tmp_path):
     assert rows[0]["target.kv_prefetch_entries"] == "0"
 
 
+def test_swap_in_export_preserves_independent_counts_without_timestamps(tmp_path):
+    import torch
+
+    interpreter = pytest.importorskip("triton.runtime.interpreter")
+    from sglang.srt.observability.lagom_perf_kernels import store_swap_in_counts
+
+    trace = object.__new__(lagom_perf.StepTrace)
+    trace.steps, trace.output, trace.device = 2, tmp_path, 0
+    trace.role, trace.swap_in = "target", None
+    trace.events, trace.written, trace.cpu = [Mock(query=lambda: True)], False, []
+    trace.kv_entry_regions, trace.cache_work_regions = set(), {}
+    trace.store_swap_in_counts = interpreter.InterpretedFunction(
+        store_swap_in_counts.fn
+    )
+    trace.slot = torch.tensor([0], dtype=torch.int32)
+    names = ("swap_in_gather", "swap_in_reread", "swap_in_commit")
+    trace.names = {
+        ("target." + name, layer): 3 * layer + col
+        for layer in range(2)
+        for col, name in enumerate(names)
+    }
+    trace.stamps = torch.tensor([100, 200]).repeat(6, trace.steps, 1)
+    trace.stamps[1, 0] = 0  # Missing a timing marker in one layer.
+    trace.kv_entries = torch.zeros((6, trace.steps), dtype=torch.int32)
+    trace.cache_work = torch.full_like(trace.kv_entries, -1)
+    trace.records = [{"step": i, "prefix_lens": [10]} for i in range(trace.steps)]
+    trace.accepted = {i: torch.tensor([1]) for i in range(trace.steps)}
+    for step, layer, eligible, copied in [(0, 0, 2, 1), (0, 1, 1, 2), (1, 0, 0, 0)]:
+        trace.slot.fill_(step)
+        counts = torch.tensor([0, eligible, 0, 0, copied], dtype=torch.int32)
+        trace.record_swap_in(layer, names, counts, True, implementation="adaptive")
+    trace.poll()
+    (path,) = (
+        p for p in tmp_path.glob("rank-*.json") if not p.name.endswith(".trace.json")
+    )
+    data = json.loads(path.read_text())
+    first, second = data["summary"]
+    key = "target.swap_in_reread"
+    assert first[key + "_ms"] is None
+    assert first[key + "_entries"] == first[key + "_resident_hits"] == 3
+    assert first[key + "_mismatched_layers"] == 2  # Totals alone agree.
+    assert second[key + "_entries"] is None  # No counter writer for layer 1.
+    assert second[key + "_resident_hits"] is None
+
+
 def test_timestamp_ring_survives_independent_graph_replays(tmp_path):
     import torch
 
@@ -443,10 +496,11 @@ def test_timestamp_ring_survives_independent_graph_replays(tmp_path):
     assert [s["target.kv_prefetch_entries"] for s in data["summary"]] == [7, 8]
 
 
-def test_compare_matched_fused_steps_counts_payload_and_committed_tokens(tmp_path):
+@pytest.fixture
+def h2d_windows(tmp_path):
     analysis = module("h2d_trace")
     gather, reread, commit = analysis.PHASES
-    reports = []
+    windows = []
     for force in (False, True):
         folder = tmp_path / str(force)
         (folder / "steps").mkdir(parents=True)
@@ -479,17 +533,40 @@ def test_compare_matched_fused_steps_counts_payload_and_committed_tokens(tmp_pat
                     reread + "_entries": 7 if force else 0,
                     commit + "_entries": 2,
                     reread + "_resident_hits": 7,
+                    reread + "_mismatched_layers": 0,
                     commit + "_admissions": 6,
                 }
                 for i in range(2)
             ]
             (folder / "steps" / f"rank-{rank}.json").write_text(
-                json.dumps(dict(rank=rank, records=records, summary=rows))
+                json.dumps(
+                    dict(
+                        rank=rank,
+                        records=records,
+                        summary=rows,
+                        schema_version=2,
+                        swap_in={
+                            "implementation": "adaptive",
+                            "force_h2d_each_step": force,
+                        },
+                    )
+                )
             )
-        reports.append(analysis.read_cell(folder, cell))
+        windows.append((folder, cell))
+    return windows
+
+
+def test_compare_matched_fused_steps_counts_payload_and_committed_tokens(h2d_windows):
+    analysis = module("h2d_trace")
+    reports = [analysis.read_cell(*window) for window in h2d_windows]
+    folder, cell = h2d_windows[1]
     assert reports[0]["ranks"]["0"]["decode_tpot_ms"] == 8
+    assert reports[0]["ranks"]["0"]["reread_ms"] == 0
+    assert reports[0]["ranks"]["0"]["reread_span_ms"] == 1
     result = analysis.compare_cells(*reports)
     assert result["passed"]
+    assert result["ranks"]["0"]["delta"]["reread_ms"] == 4
+    assert result["ranks"]["0"]["reread_reference"] == "empty_markers"
     assert result["ranks"]["0"]["delta"]["h2d_payload_bytes_per_step"] == 7 * 584
     reports[1]["ranks"]["1"].update(step_ms=19, admissions=1)
     assert not analysis.compare_cells(*reports)["passed"]
@@ -516,6 +593,119 @@ def test_compare_matched_fused_steps_counts_payload_and_committed_tokens(tmp_pat
     previous.unlink()
     with pytest.raises(ValueError, match="four complete"):
         analysis.read_cell(folder, cell | {"nsys": True})
+
+
+@pytest.mark.parametrize("stamp", [None, 0, "missing"])
+def test_adaptive_control_accepts_an_empty_span_with_independent_counters(
+    h2d_windows, stamp
+):
+    analysis = module("h2d_trace")
+    folder, cell = h2d_windows[0]
+    path = folder / "steps/rank-0.json"
+    data = json.loads(path.read_text())
+    for row in data["summary"]:
+        key = "target.swap_in_reread_ms"
+        if stamp == "missing":
+            del row[key]
+        else:
+            row[key] = stamp
+    path.write_text(json.dumps(data))
+    base = analysis.read_cell(folder, cell)
+    assert base["ranks"]["0"]["reread_ms"] == 0
+    assert base["ranks"]["0"]["reread_rows"] == 0
+    result = analysis.compare_cells(base, analysis.read_cell(*h2d_windows[1]))
+    assert result["passed"]
+    rank = result["ranks"]["0"]
+    assert rank["reread_reference"] == (
+        "empty_markers" if stamp == 0 else "uncorrected_force_span"
+    )
+    assert rank["delta"]["reread_ms"] == 5
+
+
+@pytest.mark.parametrize(
+    ("force", "field", "value", "error"),
+    [
+        (True, "ms", None, "span"),
+        (True, "ms", 0, "span"),
+        (False, "ms", float("nan"), "span"),
+        (False, "ms", -1, "span"),
+        (True, "entries", 6, "copy count mismatch"),
+        (False, "entries", 1, "copy count mismatch"),
+        (True, "mismatched_layers", 2, "copy count mismatch"),
+        (False, "resident_hits", None, "counter"),
+    ],
+)
+def test_read_cell_rejects_invalid_span_or_copy_evidence(
+    h2d_windows, force, field, value, error
+):
+    analysis = module("h2d_trace")
+    folder, cell = h2d_windows[int(force)]
+    path = folder / "steps/rank-0.json"
+    data = json.loads(path.read_text())
+    data["summary"][0]["target.swap_in_reread_" + field] = value
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match=error):
+        analysis.read_cell(folder, cell)
+
+
+def test_old_counters_and_missing_legacy_scan_cannot_pass(h2d_windows):
+    analysis = module("h2d_trace")
+    folder, cell = h2d_windows[0]
+    path = folder / "steps/rank-0.json"
+    data = json.loads(path.read_text())
+    path.write_text(json.dumps(data | {"schema_version": 1}))
+    with pytest.raises(ValueError, match="Independent reread copy counters"):
+        analysis.read_cell(folder, cell)
+    for path in (folder / "steps").glob("*.json"):
+        data = json.loads(path.read_text())
+        data["schema_version"] = 2
+        data["swap_in"]["implementation"] = "legacy"
+        path.write_text(json.dumps(data))
+    legacy = analysis.read_cell(folder, cell)
+    assert legacy["ranks"]["0"]["reread_ms"] == 1
+    with pytest.raises(ValueError, match="Expected the adaptive"):
+        analysis.read_cell(folder, cell | {"method": "dhisparse"})
+    with pytest.raises(ValueError, match="same independently traced"):
+        analysis.compare_cells(legacy, analysis.read_cell(*h2d_windows[1]))
+    path = folder / "steps/rank-0.json"
+    data = json.loads(path.read_text())
+    del data["summary"][0]["target.swap_in_reread_ms"]
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="span"):
+        analysis.read_cell(folder, cell)
+
+
+def test_step_variation_comes_from_both_executed_windows(h2d_windows):
+    analysis = module("h2d_trace")
+    reports = []
+    for force, (folder, cell) in enumerate(h2d_windows):
+        path = folder / "steps/rank-0.json"
+        data = json.loads(path.read_text())
+        # The same means and reread durations as the passing fixture, but
+        # the central halves of the real step distributions overlap.
+        times = [10, 30] if not force else [14, 34]
+        for row, ms in zip(data["summary"], times):
+            row["step_ms"] = ms
+        path.write_text(json.dumps(data))
+        reports.append(analysis.read_cell(folder, cell))
+    result = analysis.compare_cells(*reports)
+    assert not result["passed"]
+    checks = result["ranks"]["0"]["checks"]
+    assert checks["step_tracks_reread"] and not checks["step_iqr_separated"]
+    single_steps = []
+    for folder, cell in h2d_windows:
+        for path in (folder / "steps").glob("*.json"):
+            data = json.loads(path.read_text())
+            path.write_text(
+                json.dumps(
+                    data
+                    | {"records": data["records"][:1], "summary": data["summary"][:1]}
+                )
+            )
+        single_steps.append(analysis.read_cell(folder, cell | {"trace_steps": 1}))
+    result = analysis.compare_cells(*single_steps)
+    assert not result["passed"]
+    assert result["ranks"]["0"]["checks"]["step_iqr_separated"] is None
 
 
 def test_nsys_step_uses_gpu_edges_and_keeps_api_and_overlaps_separate(tmp_path):

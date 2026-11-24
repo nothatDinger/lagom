@@ -18,6 +18,8 @@ from pathlib import Path
 
 from sglang.srt.observability.lagom_decode_perf import get_meter
 
+SWAP_IN_COUNTERS = 5  # SwapInCounts in hisparse_spec_transfer.cuh
+
 
 @functools.lru_cache(maxsize=1)
 def get_trace():
@@ -221,8 +223,10 @@ class StepTrace:
         self.kv_entries = torch.zeros(
             (self.MAX_REGIONS, self.steps), dtype=torch.int32, device="cuda"
         )
-        self.cache_work = torch.zeros_like(self.kv_entries)
+        # Distinguish an unexecuted counter writer from a measured zero.
+        self.cache_work = torch.full_like(self.kv_entries, -1)
         self.cache_work_regions = {}
+        self.swap_in = None
         self.kv_entry_regions = set()
         self.names, self.side_slots, self.records, self.cpu = {}, {}, [], []
         self.accepted, self.prefix_lens_gpu, self.events = {}, {}, []
@@ -311,7 +315,11 @@ class StepTrace:
             1 << (capacity - 1).bit_length(),
         )
 
-    def record_swap_in(self, layer, names, counts, force):
+    def record_swap_in(self, layer, names, counts, force, *, implementation):
+        mode = {"implementation": implementation, "force_h2d_each_step": force}
+        if self.swap_in is not None and self.swap_in != mode:
+            raise ValueError("Mixed swap-in implementations or arms in one trace")
+        self.swap_in = mode
         gather, reread, commit = (self._kv_region(name, layer) for name in names)
         self.cache_work_regions[reread] = "resident_hits"
         self.cache_work_regions[commit] = "admissions"
@@ -324,7 +332,6 @@ class StepTrace:
             gather,
             reread,
             commit,
-            force,
         )
 
     def record_forecast_copies(self, layer, slot, counts, reqs, live):
@@ -470,8 +477,42 @@ class StepTrace:
         self.written = True
         pid = os.getpid()
         stem = self.output / f"rank-device{self.device}-pid{pid}"
+        summary = summarize(regions, self.steps)
+        swap_in = getattr(self, "swap_in", None)
+        if swap_in is not None:
+            # Copy counters are written after promotion even when an empty
+            # control span has no usable timestamps. Check every traced layer.
+            indices = [
+                i
+                for (name, _), i in self.names.items()
+                if name == "target.swap_in_reread"
+            ]
+            markers_only = (
+                swap_in["implementation"] == "adaptive"
+                and not swap_in["force_h2d_each_step"]
+            )
+            for step, row in enumerate(summary):
+                hits = [cache_work[i][step] for i in indices]
+                copies = [kv_entries[i][step] for i in indices]
+                complete = bool(indices) and min(hits) >= 0
+                row["target.swap_in_reread_resident_hits"] = (
+                    sum(hits) if complete else None
+                )
+                row["target.swap_in_reread_entries"] = sum(copies) if complete else None
+                row["target.swap_in_reread_mismatched_layers"] = (
+                    sum(
+                        c != (h if swap_in["force_h2d_each_step"] else 0)
+                        for h, c in zip(hits, copies)
+                    )
+                    if complete
+                    else None
+                )
+                spans = (values[i][step] for i in indices)
+                if not all(start > 0 and (end >= start if markers_only else end > start) for start, end in spans):
+                    row["target.swap_in_reread_ms"] = None
         payload = {
-            "schema_version": 1,
+            "schema_version": 2 if swap_in is not None else 1,
+            **({"swap_in": swap_in} if swap_in is not None else {}),
             "device": self.device,
             "pid": pid,
             "nsys": getattr(self, "nsys", False),
@@ -479,7 +520,7 @@ class StepTrace:
             "records": self.records,
             "regions": regions,
             "cpu_regions": self.cpu,
-            "summary": summarize(regions, self.steps),
+            "summary": summary,
             "notes": [
                 "GPU spans include queue gaps and nested regions; do not sum inclusive spans.",
                 "CPU and GPU clocks use independent origins in Chrome export; use Nsight for precise correlation.",

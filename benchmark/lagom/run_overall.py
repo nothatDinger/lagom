@@ -476,7 +476,10 @@ def trace_config(cell, folder):
         "steps": cell["trace_steps"],
         "skip": cell["trace_skip"],
         "nsys": cell["nsys"],
-        "min_output_tokens": OUTPUT_LEN - 1,  # PD can publish one token during prefill.
+        # Filter by the request's generation limit (warmup <= 32). PD may
+        # publish the first token in prefill. W affects tokens committed per
+        # verify step, not the generation limit used to identify this cohort.
+        "min_output_tokens": OUTPUT_LEN - 1,
     }
 
 
@@ -802,7 +805,7 @@ def main():
         help="Pack a local ShareGPT JSON file into exact-length token IDs",
     )
     parser.add_argument(
-        "--h2d-pair", action="store_true", help="Trace two DSPARK fused-swap-in arms"
+        "--h2d-pair", action="store_true", help="Trace matched adaptive DSPARK decode arms"
     )
     parser.add_argument("--trace-steps", type=int, default=12)
     parser.add_argument("--trace-skip", type=int, default=2)
@@ -948,7 +951,11 @@ def main():
             "harness_sha256": sha(
                 {
                     name: (HERE / name).read_text()
-                    for name in ("run_overall.py", "longbench_v2_fixed.py")
+                    for name in (
+                        "run_overall.py",
+                        "longbench_v2_fixed.py",
+                        "h2d_trace.py",
+                    )
                 }
             ),
         },

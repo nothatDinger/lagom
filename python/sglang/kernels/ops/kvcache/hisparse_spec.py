@@ -13,7 +13,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.srt.mem_cache.hisparse_spec import HiSparseSpecLayout
-from sglang.srt.observability.lagom_perf import get_trace
+from sglang.srt.observability.lagom_perf import SWAP_IN_COUNTERS, get_trace
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -212,7 +212,7 @@ def load_cache_to_device_buffer_spec_mla(
         else empty
     )
     counts = (
-        torch.zeros(4, dtype=torch.int32, device=top_k_tokens.device)
+        torch.zeros(SWAP_IN_COUNTERS, dtype=torch.int32, device=top_k_tokens.device)
         if trace
         else empty
     )
@@ -257,7 +257,9 @@ def load_cache_to_device_buffer_spec_mla(
     for part, name in enumerate(names, 1):
         with trace.region(name, layer=trace_layer):
             module.load_cache_to_device_buffer_spec(*args, part)
-    trace.record_swap_in(trace_layer, names, counts, force_h2d_each_step)
+    trace.record_swap_in(
+        trace_layer, names, counts, force_h2d_each_step, implementation="legacy"
+    )
 
 
 @cache_once

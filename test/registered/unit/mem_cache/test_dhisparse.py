@@ -261,7 +261,7 @@ def test_c4_pool_reserves_one_physical_arena_and_keeps_it_outside_allocatable_pa
 def test_extra_h2d_uses_an_unused_arena_row_and_preserves_victims_and_read_addresses():
     from sglang.kernels.ops.kvcache.dhisparse import reread
 
-    def step(force):
+    def step(force, *, drop_planned_hit=False):
         # Slot 6 is active at batch row 0; PD reservation slots do not own arenas.
         request = 6
         host = torch.arange(64 * 8, dtype=torch.uint8).view(64, 8)
@@ -279,7 +279,7 @@ def test_extra_h2d_uses_an_unused_arena_row_and_preserves_victims_and_read_addre
         ages = torch.zeros((7, 2), dtype=torch.long)
         epochs = torch.zeros(7, dtype=torch.long)
         workspace = allocate_workspace(1, 6, 2, "cpu", track_hits=True)
-        counts = torch.zeros(4, dtype=torch.int32)
+        counts = torch.zeros(5, dtype=torch.int32)
         args = dict(
             request_ids=torch.tensor([request]),
             buffer_tokens=tokens,
@@ -306,6 +306,11 @@ def test_extra_h2d_uses_an_unused_arena_row_and_preserves_victims_and_read_addre
             output=out,
             **args,
         )
+        assert counts.tolist() == [2, 1, 0, 0, 0]
+        if drop_planned_hit:
+            # Simulate a copy kernel missing an elected row. Eligibility must
+            # survive even though no destination is written.
+            workspace["hit_src"].fill_(-1)
         if force:
             reread(
                 request_ids=args["request_ids"],
@@ -316,20 +321,23 @@ def test_extra_h2d_uses_an_unused_arena_row_and_preserves_victims_and_read_addre
                 staging_offset=4,
                 staging_stride=6,
                 item_bytes=8,
+                counts=counts,
             )
         torch.testing.assert_close(payload[out.long()], host[selected.long()])
         assert tokens[request].tolist() == [4, 3, 19]  # reader has not completed
-        assert counts.tolist() == [2, 1, 0, 0]
-        expected_hit = host[4] if force else torch.full((8,), 251, dtype=torch.uint8)
+        copied = int(force and not drop_planned_hit)
+        assert counts.tolist() == [2, 1, 0, 0, copied]
+        expected_hit = host[4] if copied else torch.full((8,), 251, dtype=torch.uint8)
         torch.testing.assert_close(payload[4], expected_hit)
         promote(lru_slots=torch.arange(2, dtype=torch.int32).repeat(7, 1), **args)
         # Selected resident 4 stays hot. Only unselected slot 1 can admit a miss.
         assert tokens[request].tolist() == [4, 8, 19]
-        assert counts.tolist() == [2, 1, 0, 1]
-        return out, tokens, ages, counts, payload[:4]
+        assert counts.tolist() == [2, 1, 0, 1, copied]
+        return out, tokens, ages, counts[:4], payload[:4]
 
     for control, forced in zip(step(False), step(True)):
         torch.testing.assert_close(control, forced)
+    step(True, drop_planned_hit=True)
 
 
 def test_pd_admission_publishes_only_complete_backed_pages_after_copy():

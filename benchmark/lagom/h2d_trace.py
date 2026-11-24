@@ -9,6 +9,43 @@ PHASES = ("target.swap_in_gather", "target.swap_in_reread", "target.swap_in_comm
 C4_BYTES = 584
 
 
+def validate_swap_in_step(row, path, forced, markers_only):
+    gather, reread, commit = PHASES
+    for name in ("step", *PHASES):
+        ms = row.get(name + "_ms")
+        empty_span = markers_only and name == reread
+        if empty_span and ms is None:
+            continue
+        if (
+            type(ms) not in (int, float)
+            or not math.isfinite(ms)
+            or ms < 0
+            or (ms == 0 and not empty_span)
+        ):
+            raise ValueError(
+                f"Missing or invalid {name} span at step {row['step']} in {path}"
+            )
+    for field in (
+        gather + "_entries",
+        commit + "_entries",
+        commit + "_admissions",
+        reread + "_resident_hits",
+        reread + "_entries",
+        reread + "_mismatched_layers",
+    ):
+        if type(row.get(field)) is not int or row[field] < 0:
+            raise ValueError(
+                f"Missing or invalid {field} counter at step {row['step']} in {path}"
+            )
+    expected = row[reread + "_resident_hits"] if forced else 0
+    copied = row[reread + "_entries"]
+    if copied != expected or row[reread + "_mismatched_layers"]:
+        raise ValueError(
+            f"Resident-hit copy count mismatch at step {row['step']} in {path}: "
+            f"expected {expected}, copied {copied}, mismatched layers {row[reread + '_mismatched_layers']}"
+        )
+
+
 def read_cell(folder, cell):
     gather, reread, commit = PHASES
     folder = Path(folder)
@@ -24,10 +61,30 @@ def read_cell(folder, cell):
                 f"Profiler setting differs from the requested cell in {config}"
             )
     ranks = {}
+    implementation = None
+    forced = cell["force_h2d_each_step"]
     for path in sorted((folder / "steps").glob("rank-*.json")):
         if path.name.endswith(".trace.json"):
             continue
         trace = json.loads(path.read_text())
+        mode = trace.get("swap_in") or {}
+        current = mode.get("implementation")
+        if trace.get("schema_version") != 2 or current not in ("adaptive", "legacy"):
+            raise ValueError(
+                f"Independent reread copy counters require a new schema v2 trace: {path}"
+            )
+        if mode.get("force_h2d_each_step") is not forced:
+            raise ValueError(
+                f"Recorded force_h2d_each_step differs from the requested arm in {path}"
+            )
+        if cell.get("method") == "dhisparse" and current != "adaptive":
+            raise ValueError(
+                f"Expected the adaptive swap-in path for this PD cell in {path}"
+            )
+        if implementation is not None and implementation != current:
+            raise ValueError(f"Mixed swap-in implementations across ranks in {folder}")
+        implementation = current
+        markers_only = current == "adaptive" and not forced
         if trace.get("nsys", configured_nsys) != profiled:
             raise ValueError(
                 f"Profiler setting differs from the requested cell in {path}"
@@ -52,16 +109,7 @@ def read_cell(folder, cell):
                 raise ValueError(f"Unexpected graph, prefix or decode batch in {path}")
             if min(rec["accepted_tokens"]) <= 0:
                 raise ValueError(f"Invalid committed token count in {path}")
-            for name in ("step", *PHASES):
-                if not math.isfinite(row[name + "_ms"]) or row[name + "_ms"] <= 0:
-                    raise ValueError(f"Missing or invalid {name} span in {path}")
-            expected = (
-                row[reread + "_resident_hits"] if cell["force_h2d_each_step"] else 0
-            )
-            if row[reread + "_entries"] != expected:
-                raise ValueError(
-                    f"Resident-hit copy count differs from the selected arm in {path}"
-                )
+            validate_swap_in_step(row, path, forced, markers_only)
 
         def mean(key):
             return statistics.mean(r[key] for r in rows)
@@ -86,19 +134,22 @@ def read_cell(folder, cell):
             )
             continue
         step_ms = mean("step_ms")
-        times = [r[reread + "_ms"] for r in rows]
-        reread_ms = statistics.mean(times)
+        spans = [r.get(reread + "_ms") for r in rows]
+        span_ms = statistics.mean(spans) if None not in spans else None
+        reread_ms = 0.0 if markers_only else span_ms
+        step_times = [r["step_ms"] for r in rows]
         ranks[rank].update(
             {
                 "step_ms": step_ms,
+                "step_iqr_ms": (
+                    statistics.quantiles(step_times, n=4, method="inclusive")[::2]
+                    if len(step_times) > 1
+                    else None
+                ),
                 "decode_tpot_ms": step_ms / tokens,
                 "gather_ms": mean(gather + "_ms"),
                 "reread_ms": reread_ms,
-                "reread_se_ms": (
-                    statistics.stdev(times) / math.sqrt(len(times))
-                    if len(times) > 1
-                    else None
-                ),
+                "reread_span_ms": span_ms,
                 "commit_ms": mean(commit + "_ms"),
                 "reread_pct_of_step": 100 * reread_ms / step_ms,
                 "reread_ms_per_token": reread_ms / tokens,
@@ -110,7 +161,7 @@ def read_cell(folder, cell):
         )
     if profiled and len({r["pid"] for r in ranks.values()}) != len(ranks):
         raise ValueError("Expected a distinct profiled process for every decode rank")
-    return {"cell": cell, "ranks": ranks}
+    return {"cell": cell, "implementation": implementation, "ranks": ranks}
 
 
 def compare_cells(baseline, forced):
@@ -118,12 +169,24 @@ def compare_cells(baseline, forced):
     a, b = baseline["cell"].copy(), forced["cell"].copy()
     if a.get("nsys") or b.get("nsys"):
         raise ValueError("H2D latency comparison requires two profiler-free traces")
+    implementation = baseline.get("implementation")
+    if implementation not in ("adaptive", "legacy") or implementation != forced.get(
+        "implementation"
+    ):
+        raise ValueError(
+            "Expected the same independently traced swap-in implementation in both arms"
+        )
     if (
         a.pop("force_h2d_each_step") is not False
         or b.pop("force_h2d_each_step") is not True
         or a != b
     ):
         raise ValueError("Expected matched baseline and forced cells")
+    if (
+        set(baseline["ranks"]) != {"0", "1", "2", "3"}
+        or baseline["ranks"].keys() != forced["ranks"].keys()
+    ):
+        raise ValueError("Expected four matching decode ranks in both arms")
     ranks = {}
     for rank, base in baseline["ranks"].items():
         force = forced["ranks"][rank]
@@ -131,7 +194,6 @@ def compare_cells(baseline, forced):
             k: force[k] - base[k]
             for k in (
                 "step_ms",
-                "reread_ms",
                 "commit_ms",
                 "admissions",
                 "eligible_hits",
@@ -141,9 +203,13 @@ def compare_cells(baseline, forced):
                 "decode_tpot_ms",
             )
         }
-        se = [arm["reread_se_ms"] for arm in (base, force)]
-        noise = None if None in se else 2 * math.hypot(*se)
-        residual = delta["step_ms"] - delta["reread_ms"]
+        # The adaptive control runs no reread kernel. Subtract its marker
+        # overhead only when measured over the whole window.
+        reference = base["reread_span_ms"]
+        increment = force["reread_span_ms"] - (reference or 0)
+        delta["reread_ms"] = increment
+        residual = delta["step_ms"] - increment
+        base_iqr, force_iqr = base["step_iqr_ms"], force["step_iqr_ms"]
 
         def close(key):
             return abs(delta[key]) <= 0.10 * base[key]
@@ -151,20 +217,28 @@ def compare_cells(baseline, forced):
         checks = {
             "additional_host_payload": delta["h2d_payload_bytes_per_step"] > 0
             and force["reread_rows"] > 0,
-            "reread_delta_exceeds_noise": noise is not None
-            and delta["reread_ms"] > noise,
+            "step_iqr_separated": (
+                force_iqr[0] > base_iqr[1] if base_iqr and force_iqr else None
+            ),
             "similar_commit_work": all(
                 close(k) for k in ("admissions", "eligible_hits", "native_h2d_rows")
             ),
             "similar_commit_time": close("commit_ms"),
             "similar_acceptance": close("tokens_per_request_step"),
             "step_tracks_reread": delta["step_ms"] > 0
-            and abs(residual) <= max(0.05 * base["step_ms"], 0.20 * delta["reread_ms"]),
+            and increment > 0
+            and abs(residual) <= max(0.05 * base["step_ms"], 0.20 * increment),
         }
+        if implementation == "legacy":
+            reference_kind = "legacy_scan"
+        else:
+            reference_kind = (
+                "empty_markers" if reference is not None else "uncorrected_force_span"
+            )
         ranks[rank] = {
             "delta": delta,
+            "reread_reference": reference_kind,
             "step_minus_reread_delta_ms": residual,
-            "two_standard_errors_ms": noise,
             "checks": checks,
         }
     return {

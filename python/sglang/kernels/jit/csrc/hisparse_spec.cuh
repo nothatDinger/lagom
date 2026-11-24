@@ -340,11 +340,6 @@ __device__ __forceinline__ bool try_get_active_tail_device_loc(
   return true;
 }
 
-// Optional per-layer counters for the bounded step trace (one TP rank).
-struct SwapInCounts {
-  int32_t gather_copies, reread_candidates, overflow_copies, admissions;
-};
-
 __device__ __forceinline__ void count_warp(int32_t* counter, BallotMask mask, int lane) {
   if (lane == 0 && mask != 0) atomicAdd(counter, __popcll(static_cast<unsigned long long>(mask)));
 }
@@ -540,7 +535,10 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
   }
 
   BallotMask copy_mask = __ballot_sync(FULL_WARP_MASK, copy_owner);
-  if constexpr (CountIO) count_warp(&counts->gather_copies, copy_mask, lane_id);
+  if constexpr (CountIO) {
+    count_warp(&counts->gather_copies, copy_mask, lane_id);
+    count_warp(&counts->eligible_hits, __ballot_sync(FULL_WARP_MASK, hit_src >= 0), lane_id);
+  }
   while (copy_mask != 0) {
     const int owner_lane = first_set_lane(copy_mask);
     const int32_t copy_token = __shfl_sync(FULL_WARP_MASK, token, owner_lane);
@@ -561,8 +559,8 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
 }
 
 // Replay only the elected, host-backed hits into their existing physical
-// slots, before commit rotates scratch locations. Both trace arms execute
-// this same launch and count the same eligible entries.
+// slots, before commit rotates scratch locations. Both legacy arms launch
+// the scan. Only completed transfers contribute to the copy counter.
 template <int OCCURRENCES, bool CountIO, typename KVTransferPolicy>
 __global__ void reread_resident_hits_kernel(
     const int64_t* __restrict__ sources,
@@ -580,14 +578,18 @@ __global__ void reread_resident_hits_kernel(
   const int64_t src = occ < OCCURRENCES ? sources[static_cast<int64_t>(bid) * OCCURRENCES + occ] : -1;
   const int32_t dst = src >= 0 ? destinations[bid * dst_stride + occ] : -1;
   BallotMask mask = __ballot_sync(FULL_WARP_MASK, dst >= 0);
-  if constexpr (CountIO) count_warp(&counts->reread_candidates, mask, lane);
   if (copy) {
+    int copied = 0;
     while (mask) {
       const int owner = first_set_lane(mask);
       const int64_t from = __shfl_sync(FULL_WARP_MASK, src, owner);
       const int32_t to = __shfl_sync(FULL_WARP_MASK, dst, owner);
       KVTransferPolicy::copy_warp(lane, host, device, from, to);
+      if constexpr (CountIO) ++copied;
       mask &= ~(static_cast<BallotMask>(1) << owner);
+    }
+    if constexpr (CountIO) {
+      if (lane == 0 && copied) atomicAdd(&counts->reread_copies, copied);
     }
   }
 }
@@ -1060,7 +1062,7 @@ void load_cache_to_device_buffer_spec(
     hit_src_ptr = static_cast<int64_t*>(reread_src.data_ptr());
   }
   if constexpr (CountIO) {
-    TensorMatcher({4}).with_dtype<int32_t>().with_device(cuda_device).verify(io_counts);
+    TensorMatcher({5}).with_dtype<int32_t>().with_device(cuda_device).verify(io_counts);
     count_ptr = static_cast<SwapInCounts*>(io_counts.data_ptr());
   }
   // An untraced call uses a single FFI dispatch. Tracing places GPU stamps at

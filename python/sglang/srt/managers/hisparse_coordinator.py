@@ -2110,7 +2110,7 @@ class HiSparseCoordinator:
         skip_io: Optional[bool] = None,
         num_real_reqs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Maintain the entire window and transfer KV in one gather/commit pair."""
+        """Resolve KV for the verification window. Adaptive promotion follows attention."""
         if getattr(self, "adaptive", None) is not None:
             lengths = compressed_seq_lens.reshape(req_pool_indices.numel(), -1)
             if lengths.shape[1] == 1:

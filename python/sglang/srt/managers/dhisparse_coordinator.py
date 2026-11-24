@@ -8,7 +8,7 @@ import torch
 
 from sglang.kernels.ops.kvcache import dhisparse as kernels
 from sglang.srt.mem_cache.dhisparse import RequiredPageAllocator, ResidencyManager
-from sglang.srt.observability.lagom_perf import get_trace, phase
+from sglang.srt.observability.lagom_perf import SWAP_IN_COUNTERS, get_trace, phase
 from sglang.srt.utils import get_device_module
 
 
@@ -65,7 +65,7 @@ class AdaptiveHiSparse:
         ]
         self.io_counts = [
             (
-                torch.zeros(4, dtype=torch.int32, device=c.device)
+                torch.zeros(SWAP_IN_COUNTERS, dtype=torch.int32, device=c.device)
                 if self.trace is not None
                 else workspace["empty_counts"]
             )
@@ -321,6 +321,7 @@ class AdaptiveHiSparse:
                     device_buffer=args["device_buffer"],
                     workspace=args["workspace"],
                     num_real_requests=args["num_real_requests"],
+                    counts=counts,
                     staging_offset=args["staging_offset"],
                     staging_stride=layout.rows_per_request,
                     item_bytes=c.item_size_bytes,
@@ -344,6 +345,7 @@ class AdaptiveHiSparse:
                     ("swap_in_gather", "swap_in_reread", "swap_in_commit"),
                     args["counts"],
                     self.c.force_h2d_each_step,
+                    implementation="adaptive",
                 )
 
     def release(self, request):

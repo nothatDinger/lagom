@@ -6,6 +6,12 @@
 
 namespace sglang {
 
+// Per-layer int32 layout shared with the Lagom trace writer.
+struct SwapInCounts {
+  int32_t gather_copies, eligible_hits, overflow_copies, admissions, reread_copies;
+};
+static_assert(sizeof(SwapInCounts) == 5 * sizeof(int32_t));
+
 #ifdef USE_ROCM
 constexpr int HISPARSE_TRANSFER_WARP_SIZE = 64;
 #else

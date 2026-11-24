@@ -1,4 +1,4 @@
-# Fused swap-in 的 H2D 延迟实验
+# Adaptive HiSparse 的 H2D 延迟实验
 
 在 `perf/swapin_oneshot` 上，`run_overall.py --h2d-pair` 依次运行两个 DSPARK decode 实例。两次使用相同的输入、seed、CUDA Graph 档位和缓存容量，decode 的 `force_h2d_each_step` 分别为 `false` 和 `true`。默认是 P TP4 + D TP4 + router，32768 输入、1024 输出、C=256。H2D 配对配置指定 `W=5`，含 anchor 的最大验证宽度为 6。模型每个 query 选 512 行，hot 保留 2048 行，每个活跃请求另有 3072 行 staging。两组均设置 `resident_first=false`、`refill_pages_per_step=0`，使采样覆盖有 host 备份的 hot 命中。普通 PD 矩阵启用可选历史驻留；这两个参数也可在配对配置中一起调整。
 
@@ -19,6 +19,8 @@ uv run --active --no-project python benchmark/lagom/run_overall.py --h2d-pair \
 
 默认在实际 decode batch 达到 256 后跳过两步，记录 12 步，排除启动预热请求。若机器容量使实际 batch 小于并发上限，`--trace-batch-size B` 可为两格指定相同的实际 batch。四个 TP rank 都要产出完整窗口，任一缺失会将该格标为失败。`--resume` 在相同协议下从最后成功的格继续。
 
+`min_output_tokens=1023` 筛选的是请求的 `max_new_tokens`。正式请求输出 1024 个 token，prefill 可先产出 1 个，客户端预热请求最多生成 32 个。采样所需步数另算。W=5 时每步最多提交 6 个 token，跳过 2 步再采 12 步最多用 84 个，示例中的 16 步最多用 108 个。
+
 ## 如何核对解耦
 
 每个 attempt 的 `steps/` 保留各 rank 的逐步时间戳、接受 token 数、前缀长度和 CSV。`h2d.json` 给出每个 rank 的每步均值，强制组的 `comparison.json` 给出两格差值。按 rank 比较，避免重复累计 TP 时间。
@@ -26,14 +28,18 @@ uv run --active --no-project python benchmark/lagom/run_overall.py --h2d-pair \
 | GPU 区间 | 实际执行和计数 |
 |---|---|
 | `target.swap_in_gather` | 解析各 query 的有序选择，记录从 pinned host 复制到 arena 的唯一 C4 缺失行数 |
-| `target.swap_in_reread` | gather 在两组中以相同规则标记长请求中有 host 备份的唯一 hot 命中。强制组把这些行重读到 arena 的空位，attention 继续使用原 hot 地址。`resident_hits` 和实际复制行数分别记录 |
+| `target.swap_in_reread` | resolve 将有 host 备份且符合重读条件的唯一 hot 命中计入 `resident_hits`。复制 kernel 在写完各行后累计 `kv_entries`。强制组写入 arena 空位，attention 继续使用原 hot 地址 |
 | `target.swap_in_commit` | attention 读完后，LRU 将可接纳的缺失行从 arena 复制到固定 hot 地址。`admissions` 统计实际 D2D 行数，此段的 H2D `kv_entries` 为 0 |
 
-每行 C4 payload 为 584 字节。三段的 `kv_entries` 之和乘 584 是该 rank 每步由 resolver 发起的逻辑 H2D 字节数。强制组与基线的 reread 时间差给出重读增量，两组还应报告相近的原生缺失、晋升和接受 token 数。
+每行 C4 payload 为 584 字节，三段的 `kv_entries` 之和乘 584 给出该 rank 每步的逻辑 H2D 字节数。验收读取 schema v2，逐层逐步核对基线实际复制 0 行、强制组实际复制数等于 eligible hits。`_mismatched_layers` 可检出不同层的误差相互抵消。旧 trace 的重读数由命中数推导，只能用于回看。源、目的地址和 KV 内容由对应的字节级 kernel 测试验证。
+
+Adaptive 基线只保留两端的 GPU 打点。`h2d.json` 的 `reread_ms` 在该组为 0，`reread_span_ms` 单列空打点实测开销。整窗打点齐全时，`comparison.json` 中每个 rank 的 `delta.reread_ms` 为强制组区间减去基线空区间。基线缺少时间戳时，保留独立行计数，增量估计使用强制组原始区间并标记 `uncorrected_force_span`。该区间包括复制 kernel 的启动与 trace 计数开销，实际行数在复制循环结束后按线程块汇总。强制组及旧实现中确实执行扫描的基线都要求有效正时长。
 
 `step_ms` 覆盖一个 DSPARK decode step。`decode_tpot_ms = 平均 step_ms / 每请求每步平均提交 token 数`。`reread_pct_of_step` 的分母是整个 step，`reread_ms_per_token` 已按提交 token 数摊销。客户端 `output_tps` 的计时包含长上下文预填充，逐步成本由上述 GPU 区间计算。
 
-比较器逐 rank 检查新增 payload、重读时间增量超过两倍合并标准误、接纳数/候选数/原生 H2D 行数/commit 耗时/每步 token 数的相对变化在 10% 内，以及 step 增量为正。允许的 step 与重读增量之差取基线 step 的 5% 和重读增量的 20% 中较大者。这些是诊断阈值，连续 step 的相关性会影响标准误。每个判断及原始均值均可复核。
+比较器逐 rank 检查新增 payload、接纳数、符合重读条件的命中数、原生 H2D 行数、commit 耗时和每步 token 数。后五项的组间相对变化容差为 10%。step 与重读增量须为正，两者差值的容差取基线 step 的 5% 和重读增量的 20% 中较大者。
+
+`step_iqr_separated` 检查实测 step 分布的分离程度，要求强制组第 25 百分位超过基线第 75 百分位。单步窗口的这一项为 `null`，无法通过整体验收。一次 A/B 含两次独立启动，连续 step 可能相关，TP rank 也观测同一批请求。这项检查是描述性诊断。估计跨运行的统计显著性需要独立重复 A/B，并按运行对计算差值。
 
 ## Nsight Systems
 

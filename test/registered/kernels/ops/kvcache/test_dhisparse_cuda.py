@@ -70,6 +70,7 @@ def test_union_overflow_payload_padding_and_graph_replay(packed, capture, force)
         n, dtype=torch.int64, device="cuda"
     )
     workspace = allocate_workspace(n, capacity, hot, "cuda", track_hits=True)
+    counts = torch.zeros(5, dtype=torch.int32, device="cuda")
     kwargs = dict(
         request_ids=requests,
         buffer_tokens=tokens,
@@ -81,6 +82,7 @@ def test_union_overflow_payload_padding_and_graph_replay(packed, capture, force)
         staging_stride=capacity,
         hot_size=hot,
         workspace=workspace,
+        counts=counts,
         num_real_requests=torch.tensor([2], dtype=torch.int32, device="cuda"),
         item_bytes=item_bytes,
         packed=packed,
@@ -89,6 +91,7 @@ def test_union_overflow_payload_padding_and_graph_replay(packed, capture, force)
     lru = torch.arange(hot, dtype=torch.int32, device="cuda").repeat(n, 1)
 
     def run():
+        counts.zero_()
         resolve(
             selections=selected,
             seq_lens=lengths,
@@ -109,6 +112,7 @@ def test_union_overflow_payload_padding_and_graph_replay(packed, capture, force)
                 staging_stride=capacity,
                 item_bytes=item_bytes,
                 packed=packed,
+                counts=counts,
             )
         saved.copy_(rows(payload, output.clamp_min(0), packed))
         promote(lru_slots=lru, **kwargs)
@@ -127,6 +131,19 @@ def test_union_overflow_payload_padding_and_graph_replay(packed, capture, force)
         else:
             graph.replay()
         torch.cuda.synchronize()
+        eligible = (workspace["hit_src"][:2] >= 0).sum().item()
+        assert counts[1].item() == eligible
+        assert counts[4].item() == (eligible if force else 0)
+        if force and eligible:
+            batch, occurrence = torch.where(workspace["hit_src"][:2] >= 0)
+            source = workspace["hit_src"][batch, occurrence].cpu()
+            destination = owned + batch * capacity + occurrence
+            torch.testing.assert_close(
+                rows(payload, destination, packed).cpu(),
+                rows(host, source, packed),
+                rtol=0,
+                atol=0,
+            )
         chosen = selected.cpu()
         valid = (chosen >= 0) & (chosen < lengths.cpu()[..., None])
         valid[2] = False

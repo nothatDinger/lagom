@@ -297,6 +297,10 @@ class OverallProtocolTest(unittest.TestCase):
                 ]
             )
             self.assertGreater(width * hs["top_k"], hs["device_buffer_size"])
+            trace = cell["decode_trace_config"]
+            self.assertEqual(trace["min_output_tokens"], overall.OUTPUT_LEN - 1)
+            self.assertEqual(width * (trace["skip"] + trace["steps"]), 84)
+            self.assertLess(84, trace["min_output_tokens"])
             self.assertIs(hs["force_h2d_each_step"], force)
         self.assertEqual(base["commands"]["prefill"], forced["commands"]["prefill"])
         self.assertEqual(base["commands"]["router"], forced["commands"]["router"])

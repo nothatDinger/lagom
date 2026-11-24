@@ -187,7 +187,7 @@ def test_reread_changes_only_backed_long_hits_and_preserves_commit(
         counters = []
         trace = SimpleNamespace(
             region=lambda *a, **kw: nullcontext(),
-            record_swap_in=lambda l, n, c, f: counters.append(c),
+            record_swap_in=lambda l, n, c, f, *, implementation: counters.append(c),
         )
         monkeypatch.setattr(ops, "get_trace", lambda: trace)
 
@@ -210,7 +210,7 @@ def test_reread_changes_only_backed_long_hits_and_preserves_commit(
             )
 
         forward()
-        assert counters[-1].tolist() == [1, 1, 0, 1]
+        assert counters[-1].tolist() == [1, 1, 0, 1, int(force)]
         if graph_replay:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -218,7 +218,7 @@ def test_reread_changes_only_backed_long_hits_and_preserves_commit(
             graph.replay()
         else:
             forward()
-        assert counters[-1].tolist() == [0, 2, 0, 0]
+        assert counters[-1].tolist() == [0, 2, 0, 0, 2 * int(force)]
         device_cpu = device.cpu()
         assert (item(device_cpu, 5) == (92 if force else 13)).all()
         assert (item(device_cpu, 6) == 13).all() and (item(device_cpu, hot) == 13).all()

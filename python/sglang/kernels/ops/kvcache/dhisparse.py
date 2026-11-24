@@ -158,6 +158,7 @@ def reread(
     staging_offset,
     staging_stride,
     item_bytes,
+    counts=None,
     packed=False,
 ):
     """Repeat host-backed hot hits into unused arena rows; keep the normal selection and LRU."""
@@ -166,6 +167,8 @@ def reread(
         raise ValueError("Hit tracking must be enabled for a forced reread")
     if not request_ids.numel():
         return
+    if counts is None:
+        counts = workspace["empty_counts"]
     if device_buffer.device.type == "cpu":
         for batch in range(int(num_real_requests[0])):
             for i in torch.where(hits[batch] >= 0)[0].tolist():
@@ -176,6 +179,8 @@ def reread(
                     staging_offset + batch * staging_stride + i,
                     packed,
                 )
+                if counts.numel():
+                    counts[4] += 1
         return
     _module(item_bytes, packed).reread(
         request_ids.to(torch.int64),
@@ -183,6 +188,7 @@ def reread(
         host,
         device_buffer,
         num_real_requests,
+        counts,
         staging_offset,
         staging_stride,
     )

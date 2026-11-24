@@ -1,9 +1,11 @@
 #pragma once
 
+#include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/utils.cuh>
 
+#include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
 #include <tvm/ffi/container/tensor.h>
 
@@ -18,7 +20,8 @@ using namespace host;
 struct DHiSparsePlan {
   int32_t *keys, *locations, *hot_indices, *tokens;
   int64_t *sources, *hits;
-  int32_t *counts, *miss_order, *activity;
+  SwapInCounts* counts;
+  int32_t *miss_order, *activity;
   int64_t hash_size, capacity;
 };
 
@@ -159,7 +162,7 @@ __global__ void dhisparse_plan_kernel(
         const auto src = host_locs[request * host_stride + token];
         if (src >= 0) {
           hits[i] = src;
-          if (plan.counts) atomicAdd(plan.counts + 1, 1);
+          if (plan.counts) atomicAdd(&plan.counts->eligible_hits, 1);
         }
       }
     } else {
@@ -170,7 +173,7 @@ __global__ void dhisparse_plan_kernel(
         assert(src >= 0 && "Adaptive HiSparse selected a row without host backing");
         sources[i] = src;
         tokens[i] = token;
-        if (plan.counts) atomicAdd(plan.counts, 1);
+        if (plan.counts) atomicAdd(&plan.counts->gather_copies, 1);
       }
     }
   }
@@ -253,7 +256,7 @@ __global__ void dhisparse_copy_kernel(
     const int32_t* victims,
     const int32_t* order,
     const int32_t* activity,
-    int32_t* counts,
+    SwapInCounts* counts,
     const int32_t* real,
     int capacity,
     int buffer_stride,
@@ -268,6 +271,7 @@ __global__ void dhisparse_copy_kernel(
   const int warps = gridDim.y * blockDim.x / 32;
   using Transfer = std::conditional_t<PACKED, Dsv4PagedKVTransferPolicy, LinearKVTransferPolicy<BYTES>>;
   int limit = capacity;
+  int copied = 0;
   if constexpr (KIND == DHiSparseCopy::Promote) limit = activity[batch];
   for (int rank = warp; rank < limit; rank += warps) {
     int i = rank;
@@ -283,12 +287,22 @@ __global__ void dhisparse_copy_kernel(
     }
     Transfer::copy_warp(lane, src, dst, source, destination);
     __syncwarp();
+    if constexpr (KIND == DHiSparseCopy::Reread) ++copied;
     if constexpr (KIND == DHiSparseCopy::Promote) {
       if (lane == 0) {
         buffer_tokens[request * buffer_stride + victim] = tokens[batch * capacity + i];
         ages[request * hot + victim] = epochs[request];
-        if (counts) atomicAdd(counts + 3, 1);
+        if (counts) atomicAdd(&counts->admissions, 1);
       }
+    }
+  }
+  if constexpr (KIND == DHiSparseCopy::Reread) {
+    if (counts) {
+      // One global counter update per block, outside the row-copy loop.
+      using Reduce = cub::BlockReduce<int, 256>;
+      __shared__ typename Reduce::TempStorage temp;
+      const int rows = Reduce(temp).Sum(lane == 0 ? copied : 0);
+      if (threadIdx.x == 0 && rows) atomicAdd(&counts->reread_copies, rows);
     }
   }
 }
@@ -329,7 +343,7 @@ void dhisparse_resolve(
       static_cast<int32_t*>(tokens.data_ptr()),
       static_cast<int64_t*>(sources.data_ptr()),
       hits.numel() ? static_cast<int64_t*>(hits.data_ptr()) : nullptr,
-      counts.numel() ? static_cast<int32_t*>(counts.data_ptr()) : nullptr,
+      counts.numel() ? static_cast<SwapInCounts*>(counts.data_ptr()) : nullptr,
       static_cast<int32_t*>(order.data_ptr()),
       static_cast<int32_t*>(activity.data_ptr()),
       keys.shape()[1],
@@ -387,8 +401,10 @@ void dhisparse_reread(
     tvm::ffi::TensorView host,
     tvm::ffi::TensorView device,
     tvm::ffi::TensorView real,
+    tvm::ffi::TensorView counts,
     int64_t offset,
     int64_t stride) {
+  if (counts.numel()) TensorMatcher({5}).with_dtype<int32_t>().with_device(requests.device()).verify(counts);
   LaunchKernel(dim3(requests.numel(), std::clamp<int>(requests.numel(), 4, 32)), 256, requests.device())(
       dhisparse_copy_kernel<BYTES, PACKED, DHiSparseCopy::Reread>,
       static_cast<const int64_t*>(requests.data_ptr()),
@@ -403,7 +419,7 @@ void dhisparse_reread(
       nullptr,
       nullptr,
       nullptr,
-      nullptr,
+      counts.numel() ? static_cast<SwapInCounts*>(counts.data_ptr()) : nullptr,
       static_cast<const int32_t*>(real.data_ptr()),
       static_cast<int>(hits.shape()[1]),
       0,
@@ -455,7 +471,7 @@ void dhisparse_promote(
       static_cast<const int32_t*>(victims.data_ptr()),
       static_cast<const int32_t*>(order.data_ptr()),
       static_cast<const int32_t*>(activity.data_ptr()),
-      counts.numel() ? static_cast<int32_t*>(counts.data_ptr()) : nullptr,
+      counts.numel() ? static_cast<SwapInCounts*>(counts.data_ptr()) : nullptr,
       static_cast<const int32_t*>(real.data_ptr()),
       static_cast<int>(sources.shape()[1]),
       static_cast<int>(buffer_tokens.strides()[0]),
