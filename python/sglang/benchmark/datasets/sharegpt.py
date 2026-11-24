@@ -14,6 +14,7 @@ from sglang.benchmark.datasets.common import (
     BaseDataset,
     DatasetRow,
 )
+from sglang.benchmark.sharegpt_packing import pack_sharegpt
 from sglang.benchmark.utils import (
     download_and_cache_hf_file,
     is_file_valid_json,
@@ -29,10 +30,27 @@ class ShareGPTDataset(BaseDataset):
     context_len: Optional[int]
     prompt_suffix: str
     apply_chat_template: bool
+    fixed_input_len: Optional[int] = None
+    seed: int = 0
 
     @classmethod
     def from_args(cls, args: Namespace) -> "ShareGPTDataset":
-        assert not getattr(args, "tokenize_prompt", False)
+        length = getattr(args, "sharegpt_input_len", None)
+        if length is None:
+            assert not getattr(args, "tokenize_prompt", False)
+        elif not (
+            args.dataset_path
+            and args.tokenize_prompt
+            and length > 0
+            and args.sharegpt_output_len
+        ):
+            raise ValueError(
+                "Fixed ShareGPT inputs require a local dataset, positive lengths and --tokenize-prompt"
+            )
+        elif args.apply_chat_template or args.prompt_suffix:
+            raise ValueError(
+                "Fixed ShareGPT inputs pack raw conversations without a chat template or prompt suffix"
+            )
         return cls(
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
@@ -40,11 +58,41 @@ class ShareGPTDataset(BaseDataset):
             context_len=args.sharegpt_context_len,
             prompt_suffix=args.prompt_suffix,
             apply_chat_template=args.apply_chat_template,
+            fixed_input_len=length,
+            seed=getattr(args, "seed", 0),
         )
 
     def load(
         self, tokenizer: PreTrainedTokenizerBase, model_id=None
     ) -> List[DatasetRow]:
+        if self.fixed_input_len is not None:
+            if (
+                self.fixed_output_len is None
+                or self.fixed_output_len < 1
+                or (
+                    self.context_len
+                    and self.fixed_input_len + self.fixed_output_len > self.context_len
+                )
+            ):
+                raise ValueError(
+                    "Invalid fixed ShareGPT input/output length for the requested context"
+                )
+            with open(self.dataset_path) as f:
+                packed = pack_sharegpt(
+                    json.load(f),
+                    lambda text: tokenizer.encode(text, add_special_tokens=False),
+                    count=self.num_requests,
+                    length=self.fixed_input_len,
+                    seed=self.seed,
+                )
+            return [
+                DatasetRow(
+                    prompt=row["input_ids"],
+                    prompt_len=self.fixed_input_len,
+                    output_len=self.fixed_output_len,
+                )
+                for row in packed
+            ]
         return sample_sharegpt_requests(
             dataset_path=self.dataset_path,
             num_requests=self.num_requests,

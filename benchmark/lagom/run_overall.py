@@ -18,12 +18,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from analyze_nsys import step_breakdown
+from h2d_trace import compare_cells, read_cell
 from longbench_v2_fixed import load_manifest
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 METHODS = ("hisparse", "dhisparse", "lagom")
-INPUT_LENS = (32768, 65536, 131072)
+INPUT_LENS = (32768, 65536, 131072, 204800)
 CONCURRENCIES = (8, 16, 32, 64, 128, 256)
 OUTPUT_LEN = 1024
 CLEANUP_RESERVE = 20
@@ -32,10 +34,22 @@ TRACE_ENV = (
     "SGLANG_DSPARK_DEBUG_DUMP", "SGLANG_OASISKV_TRACE_CONFIG",
 )
 SUMMARY_FIELDS = (
-    "method", "input_len", "max_concurrency", "num_requests", "status",
-    "output_tps", "mean_tpot_ms", "median_tpot_ms", "p99_tpot_ms",
-    "mean_ttft_ms", "benchmark_seconds", "cell_seconds", "completed",
-    "error", "attempt",
+    "method",
+    "force_h2d_each_step",
+    "input_len",
+    "max_concurrency",
+    "num_requests",
+    "status",
+    "output_tps",
+    "mean_tpot_ms",
+    "median_tpot_ms",
+    "p99_tpot_ms",
+    "mean_ttft_ms",
+    "benchmark_seconds",
+    "cell_seconds",
+    "completed",
+    "error",
+    "attempt",
 )
 
 
@@ -62,8 +76,8 @@ def load_config(path):
         raise ValueError(f"Unknown config keys: {sorted(unknown)}")
     cfg = defaults | supplied
     cfg["python"] = cfg["python"] or sys.executable
-    if "/" in cfg["python"]:
-        cfg["python"] = str((ROOT / cfg["python"]).resolve())
+    if "/" in cfg["python"] and not Path(cfg["python"]).is_absolute():
+        cfg["python"] = str(ROOT / cfg["python"])
     cfg["tokenizer"] = cfg["tokenizer"] or cfg["model"]
     positive = (
         "w", "p", "prefetch_slots", "top_k", "device_buffer_size", "chunked_prefill_size",
@@ -78,8 +92,6 @@ def load_config(path):
     hot = cfg["device_buffer_size"]
     if hot % 64 or not 64 <= hot <= 32768:
         raise ValueError("device_buffer_size must be a multiple of 64 in [64,32768]")
-    if (cfg["w"] + cfg["p"] + 1) * cfg["top_k"] > 8192:
-        raise ValueError("Require (W+P+1)*index_topk <= verification staging capacity 8192")
     if hot < cfg["top_k"]:
         raise ValueError("device_buffer_size must hold at least index_topk entries")
     if cfg["decode_extra_slots"] < 0:
@@ -130,6 +142,10 @@ def commands(cfg, cell, data_dir, folder):
     method, length, concurrency = (
         cell["method"], cell["input_len"], cell["max_concurrency"]
     )
+    if method == "lagom" and (cfg["w"] + cfg["p"] + 1) * cfg["top_k"] > 8192:
+        raise ValueError(
+            "Require (W+P+1)*index_topk <= verification staging capacity 8192"
+        )
     spec = method != "hisparse"
     context = length + OUTPUT_LEN + cfg["w"] + cfg["p"] + 128
     graph_bs = [1 << i for i in range(concurrency.bit_length())]
@@ -176,7 +192,7 @@ def commands(cfg, cell, data_dir, folder):
                 "top_k": cfg["top_k"],
                 "device_buffer_size": cfg["device_buffer_size"],
                 "host_to_device_ratio": cfg["host_to_device_ratio"],
-                "force_h2d_each_step": False,
+                "force_h2d_each_step": cell.get("force_h2d_each_step", False),
             }
             if method == "lagom":
                 hisparse.update(
@@ -200,17 +216,74 @@ def commands(cfg, cell, data_dir, folder):
         "--worker-startup-timeout-secs", str(cfg["startup_timeout_seconds"]),
     ]
     launch["router"] = check_extra(router, cfg["router_extra_args"])
+    if cell.get("nsys"):
+        launch["decode"] = [
+            "nsys",
+            "profile",
+            "--trace=cuda,nvtx",
+            "--sample=none",
+            "--cpuctxsw=none",
+            "--cuda-event-trace=false",
+            "--cuda-graph-trace=node",
+            "--capture-range=cudaProfilerApi",
+            "--capture-range-end=stop",
+            "--force-overwrite=true",
+            "-o",
+            str(folder / "prof"),
+        ] + launch["decode"]
+    sharegpt = cell.get("dataset") == "sharegpt"
+    client = (
+        ["-m", "sglang.benchmark.serving"]
+        if sharegpt
+        else [str(HERE / "longbench_v2_fixed.py"), "bench"]
+    )
+    dataset = (
+        [
+            "--dataset-name",
+            "sharegpt",
+            "--dataset-path",
+            str(data_dir),
+            "--sharegpt-input-len",
+            str(length),
+        ]
+        if sharegpt
+        else [
+            "--dataset-name",
+            "longbench_v2",
+            "--dataset-path",
+            str(data_dir / str(length) / "manifest.json"),
+        ]
+    )
     launch["benchmark"] = [
-        cfg["python"], str(HERE / "longbench_v2_fixed.py"), "bench",
-        "--backend", "sglang", "--base-url", urls["router"],
-        "--model", cfg["model"], "--tokenizer", cfg["tokenizer"],
-        "--dataset-name", "longbench_v2",
-        "--dataset-path", str(data_dir / str(length) / "manifest.json"),
-        "--tokenize-prompt", "--num-prompts", str(cell["num_requests"]),
-        "--max-concurrency", str(concurrency), "--request-rate", "inf",
-        "--sharegpt-output-len", str(OUTPUT_LEN), "--temperature", "0",
-        "--seed", str(cfg["seed"]), "--warmup-requests", "1",
-        "--output-file", str(folder / "benchmark.jsonl"), "--output-details",
+        cfg["python"],
+        *client,
+        "--backend",
+        "sglang",
+        "--base-url",
+        urls["router"],
+        "--model",
+        cfg["model"],
+        "--tokenizer",
+        cfg["tokenizer"],
+        *dataset,
+        "--tokenize-prompt",
+        "--num-prompts",
+        str(cell["num_requests"]),
+        "--max-concurrency",
+        str(concurrency),
+        "--request-rate",
+        "inf",
+        "--sharegpt-output-len",
+        str(OUTPUT_LEN),
+        "--temperature",
+        "0",
+        "--seed",
+        str(cfg["seed"]),
+        "--warmup-requests",
+        "1",
+        "--output-file",
+        str(folder / "benchmark.jsonl"),
+        "--output-details",
         "--disable-tqdm",
     ]
     return launch, urls
@@ -222,8 +295,9 @@ def source_preflight():
     tree = ast.parse(text)
     evidence = {}
     for name, callee in (
-        ("stage_verify_pages", "resolve"),
-        ("stage_verify_ragged_pages", "stage_verify_pages"),
+        ("swap_in_selected_pages_spec", "_run_swap_in_verify_window"),
+        ("_run_swap_in_kernel", "_run_swap_in_verify_window"),
+        ("_run_swap_in_verify_window", "load_cache_to_device_buffer_spec_mla"),
     ):
         matches = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name]
         ok = any(
@@ -317,8 +391,12 @@ def validate_server_info(info, cfg, cell, role):
         for key in ("device_buffer_size", "host_to_device_ratio"):
             if hs.get(key) != cfg[key]:
                 raise ValueError(f"Resolved HiSparse {key} differs from the shared config")
-        if hs.get("force_h2d_each_step", False):
-            raise ValueError("force_h2d_each_step must remain false")
+        if hs.get("force_h2d_each_step", False) is not cell.get(
+            "force_h2d_each_step", False
+        ):
+            raise ValueError(
+                "Resolved force_h2d_each_step differs from the requested arm"
+            )
         if cell["method"] == "lagom":
             if hs.get("prefetcher") != "lagom" or hs.get("prefetcher_config", {}).get("prediction_steps") != cfg["p"]:
                 raise ValueError("Lagom prefetch did not resolve with the requested P")
@@ -326,6 +404,26 @@ def validate_server_info(info, cfg, cell, role):
                 raise ValueError("Lagom prefetch did not resolve with the requested N")
         elif hs.get("prefetcher"):
             raise ValueError("A baseline unexpectedly enabled prefetch")
+
+
+def cell_directory(output, cell):
+    method = cell["method"]
+    if "force_h2d_each_step" in cell:
+        method += "-force-h2d" if cell["force_h2d_each_step"] else "-baseline"
+    return output / method / str(cell["input_len"]) / str(cell["max_concurrency"])
+
+
+def trace_config(cell, folder):
+    if "force_h2d_each_step" not in cell:
+        return None
+    return {
+        "output_dir": str(folder / "steps"),
+        "required_batch_size": cell["trace_batch_size"],
+        "steps": cell["trace_steps"],
+        "skip": cell["trace_skip"],
+        "nsys": cell["nsys"],
+        "min_output_tokens": OUTPUT_LEN - 1,  # PD can publish one token during prefill.
+    }
 
 
 def runtime_env(cfg):
@@ -461,23 +559,42 @@ def run_cell(cfg, cell, data_dir, folder):
     try:
         env = runtime_env(cfg)
         launch, urls = commands(cfg, cell, data_dir, folder)
-        save(folder / "launch.json", {
-            "commands": launch,
-            "shell_display_only": {k: shlex.join(v) for k, v in launch.items()},
-            "controlled_environment": {
-                k: env[k] for k in (
-                    set(cfg["env"]) | {
-                        "SGLANG_RAGGED_VERIFY_MODE", "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT",
-                        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT",
-                    }
-                )
+        trace = trace_config(cell, folder)
+        decode_env = env
+        if trace:
+            path = folder / "trace_config.json"
+            save(path, trace)
+            decode_env = env | {"SGLANG_LAGOM_PERF_TRACE": str(path)}
+        save(
+            folder / "launch.json",
+            {
+                "commands": launch,
+                "shell_display_only": {k: shlex.join(v) for k, v in launch.items()},
+                "controlled_environment": {
+                    k: env[k]
+                    for k in (
+                        set(cfg["env"])
+                        | {
+                            "SGLANG_RAGGED_VERIFY_MODE",
+                            "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT",
+                            "SGLANG_DISAGGREGATION_WAITING_TIMEOUT",
+                        }
+                    )
+                },
+                "decode_trace_config": trace,
+                "removed_trace_environment": list(TRACE_ENV),
             },
-            "removed_trace_environment": list(TRACE_ENV),
-        })
+        )
         assert_free_ports(cfg)
         for role in ("prefill", "decode", "router"):
             remaining(startup_deadline)
-            spawn(role, launch[role], folder, env, processes)
+            spawn(
+                role,
+                launch[role],
+                folder,
+                decode_env if role == "decode" else env,
+                processes,
+            )
             wait_ready(urls[role], processes, startup_deadline)
         for role in ("prefill", "decode"):
             info = get_json(urls[role] + "/server_info", deadline)
@@ -496,6 +613,9 @@ def run_cell(cfg, cell, data_dir, folder):
         if len(lines) != 1:
             raise ValueError("Expected exactly one fresh SGLang benchmark result")
         result.update(validate_result(json.loads(lines[0]), cell))
+        if trace:
+            # All four TP processes must deliver their complete measured window.
+            save(folder / "h2d.json", read_cell(folder, cell))
         result["status"] = "ok"
     except KeyboardInterrupt:
         result.update(status="interrupted", error="Interrupted by user/signal")
@@ -506,9 +626,31 @@ def run_cell(cfg, cell, data_dir, folder):
         result.update(status="failed", error=f"{type(exc).__name__}: {exc}")
     finally:
         cleanup(processes)
+        if cell.get("nsys") and result["status"] == "ok":
+            try:
+                with (folder / "nsys-stats.txt").open("w") as log:
+                    subprocess.run(
+                        [
+                            "nsys",
+                            "stats",
+                            "--force-export=true",
+                            "--report",
+                            "cuda_gpu_kern_sum,cuda_gpu_mem_time_sum,cuda_gpu_mem_size_sum,cuda_api_sum",
+                            str(folder / "prof.nsys-rep"),
+                        ],
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        check=True,
+                        timeout=remaining(deadline + CLEANUP_RESERVE),
+                    )
+                breakdown = step_breakdown(folder / "prof.sqlite")
+                save(folder / "nsys-steps.json", breakdown)
+            except Exception as exc:
+                result.update(status="failed", error=f"Nsight export: {exc}")
         result["cell_seconds"] = time.monotonic() - started
         if result["cell_seconds"] > cfg["cell_timeout_seconds"] and result["status"] == "ok":
             result.update(status="timeout", error="Cell including cleanup exceeded its budget")
+        if result["status"] != "ok":
             for key in ("output_tps", "mean_tpot_ms", "median_tpot_ms", "p99_tpot_ms"):
                 result.pop(key, None)
         save(folder / "status.json", result)
@@ -549,26 +691,112 @@ def provenance():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=HERE / "overall.example.json")
-    parser.add_argument("--data-dir", type=Path, required=True)
+    parser.add_argument("--config", type=Path)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--data-dir", type=Path, help="Prepared LongBench-v2 token banks"
+    )
+    source.add_argument(
+        "--sharegpt",
+        type=Path,
+        help="Pack a local ShareGPT JSON file into exact-length token IDs",
+    )
+    parser.add_argument(
+        "--h2d-pair", action="store_true", help="Trace two DSPARK fused-swap-in arms"
+    )
+    parser.add_argument("--trace-steps", type=int, default=12)
+    parser.add_argument("--trace-skip", type=int, default=2)
+    parser.add_argument(
+        "--trace-batch-size",
+        type=int,
+        help="Actual decode batch to match (default: concurrency)",
+    )
+    parser.add_argument(
+        "--nsys",
+        action="store_true",
+        help="Profile the paired decode windows with Nsight Systems",
+    )
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
-    parser.add_argument("--input-lens", nargs="+", type=int, choices=INPUT_LENS, default=list(INPUT_LENS))
-    parser.add_argument("--concurrencies", nargs="+", type=int, choices=CONCURRENCIES, default=list(CONCURRENCIES))
+    parser.add_argument("--methods", nargs="+", choices=METHODS)
+    parser.add_argument("--input-lens", nargs="+", type=int, choices=INPUT_LENS)
+    parser.add_argument("--concurrencies", nargs="+", type=int, choices=CONCURRENCIES)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--resume", action="store_true", help="Skip only successful identical cells")
     args = parser.parse_args()
-    cfg = load_config(args.config)
-    data_dir, output = args.data_dir.resolve(), args.output.resolve()
+    if args.nsys and not args.h2d_pair:
+        parser.error("--nsys requires --h2d-pair")
+    if args.h2d_pair and args.methods not in (None, ["dhisparse"]):
+        parser.error("--h2d-pair compares DSPARK dhisparse with itself")
+    args.methods = args.methods or (
+        ["dhisparse"] if args.h2d_pair else ["hisparse", "dhisparse"]
+    )
+    args.input_lens = args.input_lens or (
+        [32768] if args.h2d_pair else list(INPUT_LENS)
+    )
+    args.concurrencies = args.concurrencies or (
+        [256] if args.h2d_pair else list(CONCURRENCIES)
+    )
+    cfg = load_config(
+        args.config
+        or HERE / ("h2d.example.json" if args.h2d_pair else "overall.example.json")
+    )
+    if "dhisparse" in args.methods and (cfg["w"] + 1) * cfg["top_k"] > min(
+        8192, cfg["device_buffer_size"]
+    ):
+        parser.error(
+            "Fused swap-in requires (W + 1) * top_k <= min(8192, device_buffer_size)"
+        )
+    data_dir, output = (args.sharegpt or args.data_dir).resolve(), args.output.resolve()
     cells = matrix(args.methods, args.input_lens, args.concurrencies)
+    if args.sharegpt:
+        cells = [cell | {"dataset": "sharegpt"} for cell in cells]
+    if args.h2d_pair:
+        if not 1 <= args.trace_steps <= 256 or args.trace_skip < 0:
+            parser.error("Require 1..256 trace steps and a nonnegative skip")
+        if args.trace_batch_size is not None and not 1 <= args.trace_batch_size <= min(
+            args.concurrencies
+        ):
+            parser.error(
+                "The matched decode batch size must fit every selected concurrency"
+            )
+        cells = [
+            cell
+            | {
+                "force_h2d_each_step": force,
+                "nsys": args.nsys,
+                "trace_steps": args.trace_steps,
+                "trace_skip": args.trace_skip,
+                "trace_batch_size": args.trace_batch_size or cell["max_concurrency"],
+            }
+            for cell in cells
+            for force in (False, True)
+        ]
     preflight = source_preflight()
     if args.dry_run:
-        print(json.dumps({
-            "preflight": preflight, "config": cfg, "cells": [
-                cell | {"commands": commands(cfg, cell, data_dir, output / cell["method"] / str(cell["input_len"]) / str(cell["max_concurrency"]) / "attempt-0001")[0]}
-                for cell in cells
-            ],
-        }, indent=2))
+        print(
+            json.dumps(
+                {
+                    "preflight": preflight,
+                    "config": cfg,
+                    "cells": [
+                        cell
+                        | {
+                            "commands": commands(
+                                cfg,
+                                cell,
+                                data_dir,
+                                cell_directory(output, cell) / "attempt-0001",
+                            )[0],
+                            "decode_trace_config": trace_config(
+                                cell, cell_directory(output, cell) / "attempt-0001"
+                            ),
+                        }
+                        for cell in cells
+                    ],
+                },
+                indent=2,
+            )
+        )
         return
     if "lagom" in args.methods and not preflight["lagom_pd_layout_ready"]:
         raise RuntimeError(
@@ -579,24 +807,51 @@ def main():
     if set(args.methods) & {"dhisparse", "lagom"} and not preflight["oneshot_source_check_passed"]:
         raise RuntimeError("DHisparse oneshot verify source check failed; inspect this checkout")
     manifests = {}
-    for path in sorted(data_dir.glob("*/manifest.json")):
-        m = load_manifest(path)
-        length = m["input_len"]
-        if path.parent.name != str(length) or m["seed"] != cfg["seed"]:
-            raise ValueError(f"Input manifest length/seed mismatch: {path}")
-        if length in args.input_lens and len(m["order"]) < 4 * max(args.concurrencies):
-            raise ValueError(f"Not enough prepared requests: {path}")
-        manifests[str(length)] = sha(m)
-    if any(str(length) not in manifests for length in args.input_lens):
-        raise ValueError("Prepare a token-bank manifest for every selected input length")
+    if args.sharegpt:
+        with data_dir.open("rb") as handle:
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        manifests["sharegpt_sha256"] = digest.hexdigest()
+    else:
+        for path in sorted(data_dir.glob("*/manifest.json")):
+            m = load_manifest(path)
+            length = m["input_len"]
+            if path.parent.name != str(length) or m["seed"] != cfg["seed"]:
+                raise ValueError(f"Input manifest length/seed mismatch: {path}")
+            if length in args.input_lens and len(m["order"]) < 4 * max(
+                args.concurrencies
+            ):
+                raise ValueError(f"Not enough prepared requests: {path}")
+            manifests[str(length)] = sha(m)
+        if any(str(length) not in manifests for length in args.input_lens):
+            raise ValueError(
+                "Prepare a token-bank manifest for every selected input length"
+            )
     current_provenance = provenance()
     protocol = {
         "source": {
-            **{key: current_provenance[key] for key in ("git_head", "git_status", "git_diff_sha256")},
-            "harness_sha256": sha({name: (HERE / name).read_text() for name in ("run_overall.py", "longbench_v2_fixed.py")}),
+            **{
+                key: current_provenance[key]
+                for key in ("git_head", "git_status", "git_diff_sha256")
+            },
+            "harness_sha256": sha(
+                {
+                    name: (HERE / name).read_text()
+                    for name in ("run_overall.py", "longbench_v2_fixed.py")
+                }
+            ),
         },
-        "config": cfg, "data_dir": str(data_dir), "data_manifests": manifests,
-        "output_len": OUTPUT_LEN, "requests_per_concurrency": 4,
+        "config": cfg,
+        "data_dir": str(data_dir),
+        "data_manifests": manifests,
+        "h2d_pair": args.h2d_pair,
+        "nsys": args.nsys,
+        "trace_batch_size": args.trace_batch_size,
+        "trace_steps": args.trace_steps,
+        "trace_skip": args.trace_skip,
+        "output_len": OUTPUT_LEN,
+        "requests_per_concurrency": 4,
     }
     identity = sha(protocol)
     # Exclusive lock prevents concurrent drivers sharing ports/results.
@@ -619,7 +874,7 @@ def main():
         failed = False
         try:
             for cell in cells:
-                cell_dir = output / cell["method"] / str(cell["input_len"]) / str(cell["max_concurrency"])
+                cell_dir = cell_directory(output, cell)
                 attempts = sorted(cell_dir.glob("attempt-*"))
                 if args.resume and attempts:
                     status_file = attempts[-1] / "status.json"
@@ -632,6 +887,18 @@ def main():
                 failed |= result["status"] != "ok"
                 summary(output)
                 print(canonical(result), flush=True)
+            if args.h2d_pair and not failed:
+                for baseline, force in zip(cells[::2], cells[1::2]):
+                    attempts = [
+                        sorted(cell_directory(output, c).glob("attempt-*"))[-1]
+                        for c in (baseline, force)
+                    ]
+                    comparison = compare_cells(
+                        *(json.loads((d / "h2d.json").read_text()) for d in attempts)
+                    )
+                    save(attempts[1] / "comparison.json", comparison)
+                    print(canonical(comparison), flush=True)
+                    failed |= not comparison["passed"]
         finally:
             summary(output)
     if failed:

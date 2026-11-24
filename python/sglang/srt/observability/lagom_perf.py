@@ -154,6 +154,11 @@ def summarize(regions, steps):
                 if r["name"] == kind and "kv_entries" in r
             ]
             row[kind + "_entries"] = sum(entries) if entries else None
+        for region in step_regions:
+            for field in ("resident_hits", "admissions"):
+                if field in region:
+                    key = region["name"] + "_" + field
+                    row[key] = row.get(key, 0) + region[field]
         # Without CUPTI activity, a stream timestamp gap cannot distinguish
         # host starvation, D2H, launch latency, NCCL or uninstrumented kernels.
         row["gpu_wait_cpu_ms"] = None
@@ -178,9 +183,11 @@ class StepTrace:
             count_forecast_copies,
             count_verify_copies,
             stamp,
+            store_swap_in_counts,
         )
 
         self.torch, self.stamp = torch, stamp
+        self.store_swap_in_counts = store_swap_in_counts
         self.count_verify_copies = count_verify_copies
         self.count_forecast_copies = count_forecast_copies
         self.steps, self.skip = int(config.get("steps", 12)), int(config.get("skip", 2))
@@ -194,10 +201,15 @@ class StepTrace:
         if self.max_batch_size is not None and self.max_batch_size <= 0:
             raise ValueError("max_batch_size must be positive")
         self.request_prefix = config.get("request_prefix")
+        self.min_output_tokens = config.get("min_output_tokens")
         self.nsys_running = False
         self.output = Path(config["output_dir"])
         self.output.mkdir(parents=True, exist_ok=True)
         self.device = torch.cuda.current_device()
+        # PD decode TP rank zero can live on physical GPU 4.
+        self.rank = (
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        )
         self.slot = torch.full((1,), -1, dtype=torch.int32, device="cuda")
         self.stamps = torch.zeros(
             (self.MAX_REGIONS, self.steps, 2), dtype=torch.int64, device="cuda"
@@ -205,6 +217,8 @@ class StepTrace:
         self.kv_entries = torch.zeros(
             (self.MAX_REGIONS, self.steps), dtype=torch.int32, device="cuda"
         )
+        self.cache_work = torch.zeros_like(self.kv_entries)
+        self.cache_work_regions = {}
         self.kv_entry_regions = set()
         self.names, self.side_slots, self.records, self.cpu = {}, {}, [], []
         self.accepted, self.prefix_lens_gpu, self.events = {}, {}, []
@@ -238,17 +252,29 @@ class StepTrace:
             self.names[key] = len(self.names)
         region = self.names[key]
         target_slot = self.slot if slot is None else slot
-        self.stamp[(1,)](self.stamps, target_slot, self.steps, region, 0)
         cpu_start = time.perf_counter_ns()
         live = self.active >= 0 and not self.torch.cuda.is_current_stream_capturing()
         if live:
             self.torch.cuda.nvtx.range_push(
                 f"lagom/{full_name}/step={self.active}/layer={layer}"
             )
+        mark_edges = live and self.nsys and name == "step"
+        nvtx = self.torch.cuda.nvtx
+        with (
+            nvtx.range(f"lagom/step_begin/step={self.active}")
+            if mark_edges
+            else nullcontext()
+        ):
+            self.stamp[(1,)](self.stamps, target_slot, self.steps, region, 0)
         try:
             yield self
         finally:
-            self.stamp[(1,)](self.stamps, target_slot, self.steps, region, 1)
+            with (
+                nvtx.range(f"lagom/step_end/step={self.active}")
+                if mark_edges
+                else nullcontext()
+            ):
+                self.stamp[(1,)](self.stamps, target_slot, self.steps, region, 1)
             if live:
                 self.torch.cuda.nvtx.range_pop()
                 self.cpu.append(
@@ -282,6 +308,22 @@ class StepTrace:
             1 << (capacity - 1).bit_length(),
         )
 
+    def record_swap_in(self, layer, names, counts, force):
+        gather, reread, commit = (self._kv_region(name, layer) for name in names)
+        self.cache_work_regions[reread] = "resident_hits"
+        self.cache_work_regions[commit] = "admissions"
+        self.store_swap_in_counts[(1,)](
+            self.kv_entries,
+            self.cache_work,
+            self.slot,
+            counts,
+            self.steps,
+            gather,
+            reread,
+            commit,
+            force,
+        )
+
     def record_forecast_copies(self, layer, slot, counts, reqs, live):
         batch = reqs.numel()
         self.count_forecast_copies[(1,)](
@@ -308,6 +350,13 @@ class StepTrace:
                 and not 0 < len(batch.reqs) <= self.max_batch_size
             )
             or (
+                getattr(self, "min_output_tokens", None) is not None
+                and any(
+                    r.sampling_params.max_new_tokens < self.min_output_tokens
+                    for r in batch.reqs
+                )
+            )
+            or (
                 self.request_prefix is not None
                 and any(not r.rid.startswith(self.request_prefix) for r in batch.reqs)
             )
@@ -320,7 +369,7 @@ class StepTrace:
         if not 0 <= self.active < self.steps:
             self.active = -1
         self.slot.fill_(self.active)
-        if self.active == 0 and self.nsys and self.device == 0:
+        if self.active == 0 and self.nsys and self.rank == 0:
             self.torch.cuda.cudart().cudaProfilerStart()
             self.nsys_running = True
         if self.active >= 0:
@@ -376,6 +425,11 @@ class StepTrace:
             self.nsys_running = False
         values = self.stamps.cpu().tolist()
         kv_entries = self.kv_entries.cpu().tolist() if self.kv_entry_regions else None
+        cache_work = (
+            self.cache_work.cpu().tolist()
+            if getattr(self, "cache_work_regions", {})
+            else None
+        )
         regions = []
         for (name, layer), index in self.names.items():
             for step, (start, end) in enumerate(values[index]):
@@ -389,6 +443,8 @@ class StepTrace:
                     }
                     if index in self.kv_entry_regions:
                         region["kv_entries"] = kv_entries[index][step]
+                    if cache_work is not None and index in self.cache_work_regions:
+                        region[self.cache_work_regions[index]] = cache_work[index][step]
                     regions.append(region)
         for record in self.records:
             if record["prefix_lens"] is None:
@@ -402,6 +458,7 @@ class StepTrace:
         payload = {
             "schema_version": 1,
             "device": self.device,
+            "rank": getattr(self, "rank", self.device),
             "records": self.records,
             "regions": regions,
             "cpu_regions": self.cpu,

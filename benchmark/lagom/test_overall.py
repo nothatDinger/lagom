@@ -1,6 +1,8 @@
 """CPU-only protocol tests. Run: python -m unittest discover -s benchmark/lagom -p test_overall.py"""
 import copy
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,8 +19,10 @@ class OverallProtocolTest(unittest.TestCase):
 
     def test_matrix_order_counts_and_concurrency_is_only_a_cap(self):
         cells = overall.matrix(overall.METHODS, overall.INPUT_LENS, overall.CONCURRENCIES)
-        self.assertEqual(len(cells), 54)
-        self.assertEqual([cells[i]["method"] for i in (0, 18, 36)], list(overall.METHODS))
+        self.assertEqual(len(cells), 72)
+        self.assertEqual(
+            [cells[i]["method"] for i in (0, 24, 48)], list(overall.METHODS)
+        )
         self.assertTrue(all(c["num_requests"] == 4 * c["max_concurrency"] for c in cells))
         self.assertEqual(cells[-1]["num_requests"], 1024)
 
@@ -181,7 +185,6 @@ class OverallProtocolTest(unittest.TestCase):
             self.assertEqual(json.loads((folder / "status.json").read_text())["status"], "timeout")
             cleanup.assert_called_once()
 
-
     def test_prediction_window_is_configurable_and_shared_with_prefill_layout(self):
         self.assertEqual(self.cfg["p"], 4)
         flag = "--disaggregation-dsv4-state-execution-width"
@@ -218,7 +221,98 @@ class OverallProtocolTest(unittest.TestCase):
         preflight = overall.source_preflight()
         self.assertTrue(preflight["oneshot_source_check_passed"])
         self.assertFalse(preflight["lagom_pd_explicitly_blocked"])
-        self.assertTrue(preflight["lagom_pd_layout_ready"])
+        self.assertFalse(preflight["lagom_pd_layout_ready"])
+
+    def test_python_paths_preserve_venv_symlinks(self):
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            interpreter = Path(tmp) / "python"
+            interpreter.symlink_to(sys.executable)
+            config = Path(tmp) / "cfg.json"
+            for value in (str(interpreter), os.path.relpath(interpreter, overall.ROOT)):
+                config.write_text(json.dumps({"python": value}))
+                self.assertEqual(
+                    Path(os.path.abspath(overall.load_config(config)["python"])),
+                    interpreter,
+                )
+
+    def test_paired_dry_run_uses_same_workload_and_decode_only_trace(self):
+        output = subprocess.check_output(
+            [
+                sys.executable,
+                str(overall.HERE / "run_overall.py"),
+                "--h2d-pair",
+                "--dry-run",
+                "--nsys",
+                "--sharegpt",
+                "/data/local.json",
+                "--output",
+                "/out",
+            ]
+        )
+        base, forced = json.loads(output)["cells"]
+        for cell, flag in ((base, False), (forced, True)):
+            self.assertEqual((cell["input_len"], cell["max_concurrency"]), (32768, 256))
+            cmds = cell["commands"]
+            self.assertEqual(cmds["prefill"][0], sys.executable)
+            self.assertEqual(cmds["decode"][0], "nsys")
+            self.assertEqual(cmds["router"][0], sys.executable)
+            self.assertNotIn("nsys", cmds["prefill"])
+            self.assertIn("--sharegpt-input-len", cmds["benchmark"])
+            self.assertEqual(cell["decode_trace_config"]["required_batch_size"], 256)
+            hs = json.loads(
+                cmds["decode"][cmds["decode"].index("--hisparse-config") + 1]
+            )
+            self.assertEqual(hs["device_buffer_size"], 2048)
+            self.assertIs(hs["force_h2d_each_step"], flag)
+        self.assertEqual(base["commands"]["prefill"], forced["commands"]["prefill"])
+        self.assertEqual(base["commands"]["router"], forced["commands"]["router"])
+
+    def test_local_sharegpt_fixed_ids_through_dataset_loader(self):
+        from argparse import Namespace
+        from types import SimpleNamespace
+        from sglang.benchmark.datasets import get_dataset
+
+        tokenizer = SimpleNamespace(
+            encode=lambda text, add_special_tokens: list(text.encode())
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sharegpt.json"
+            path.write_text(
+                json.dumps(
+                    [
+                        {"conversations": [{"from": "human", "value": str(i) * 40}]}
+                        for i in range(5)
+                    ]
+                )
+            )
+            args = Namespace(
+                dataset_name="sharegpt",
+                dataset_path=str(path),
+                num_prompts=3,
+                sharegpt_input_len=32,
+                sharegpt_output_len=24,
+                sharegpt_context_len=None,
+                tokenize_prompt=True,
+                apply_chat_template=False,
+                prompt_suffix="",
+                seed=42,
+            )
+            rows = get_dataset(args, tokenizer)
+            self.assertEqual(
+                [row.prompt for row in rows],
+                [row.prompt for row in get_dataset(args, tokenizer)],
+            )
+            self.assertTrue(
+                all(
+                    len(row.prompt) == row.prompt_len == 32 and row.output_len == 24
+                    for row in rows
+                )
+            )
+            args.num_prompts = 100
+            with self.assertRaisesRegex(ValueError, "insufficient tokens"):
+                get_dataset(args, tokenizer)
 
 
 if __name__ == "__main__":

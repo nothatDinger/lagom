@@ -30,8 +30,9 @@ def settings():
     )
 
 
-def test_request_tail_keeps_canonical_and_provisional_slots_fixed():
-    assert validate_pr_fused_config(**settings()) == dict(
+@pytest.mark.parametrize("force", [False, True])
+def test_request_tail_keeps_canonical_and_provisional_slots_fixed(force):
+    assert validate_pr_fused_config(**(settings() | {"force_h2d": force})) == dict(
         active_slots=3075, scratch_offset=3075, scratch_slots=61
     )
 
@@ -42,7 +43,6 @@ def test_request_tail_keeps_canonical_and_provisional_slots_fixed():
         ("cuda", False),
         ("dsv4", False),
         ("speculative", False),
-        ("force_h2d", False),
         ("skip_io", True),
         ("width", 0),
         ("hot", 2560),
@@ -81,10 +81,11 @@ def test_state_budget_matches_allocations_and_kv_scratch_aliases_request_tail(nu
         assert state.scratch_locs.data_ptr() == locs[layer, :, 131:].data_ptr()
 
 
+@pytest.mark.parametrize("force", [False, True])
 @pytest.mark.parametrize("request_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("per_row", [False, True])
 def test_service_dispatch_uses_fused_io_and_preserves_graph_buffers(
-    monkeypatch, request_dtype, per_row
+    monkeypatch, request_dtype, per_row, force
 ):
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 
@@ -102,7 +103,7 @@ def test_service_dispatch_uses_fused_io_and_preserves_graph_buffers(
     c = HiSparseCoordinator.__new__(HiSparseCoordinator)
     c._pr_verify_layout = dict(active_slots=131, scratch_offset=131, scratch_slots=61)
     c._speculative_verify_width = 6
-    c.force_h2d_each_step = True
+    c.force_h2d_each_step = force
     c.top_k, c.device_buffer_size, c.item_size_bytes, c.skip_io = 16, 128, 584, False
     c.req_device_buffer_tokens = torch.full((1, 4, 192), 17, dtype=torch.int32)
     c.req_device_buffer_token_locs = torch.arange(4 * 192, dtype=torch.int32).view(
@@ -129,7 +130,7 @@ def test_service_dispatch_uses_fused_io_and_preserves_graph_buffers(
     )
     fused.assert_called_once()
     separate.assert_not_called()
-    init.assert_called_once()
+    init.assert_not_called()
     args = fused.call_args.kwargs
     assert args["req_pool_indices"].dtype == torch.int64
     assert args["device_buffer_locs"].shape == (4, 131)
@@ -142,8 +143,9 @@ def test_service_dispatch_uses_fused_io_and_preserves_graph_buffers(
     assert args["top_k_tokens"].data_ptr() == top_k.data_ptr()
     assert args["transfer_kind"] == "dsv4_paged"
     assert "miss_src" not in args
-    assert (c.req_device_buffer_tokens[0, [2, 0]] == -1).all()
-    assert (c.req_device_buffer_tokens[0, [1, 3]] == 17).all()
+    assert args["force_h2d_each_step"] is force
+    assert (c.req_device_buffer_tokens == 17).all()
+    assert (c.lru_slots == 0).all()
     torch.testing.assert_close(c.req_device_buffer_token_locs, locs_before)
 
 

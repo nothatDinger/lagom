@@ -61,6 +61,7 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.observability.lagom_perf import phase
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
@@ -1683,45 +1684,46 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if _is_sm120:
-                from sglang.kernels.ops.attention.flash_mla_sm120 import (
-                    flash_mla_with_kvcache_sm120,
-                )
+            with phase("attention_core", layer=layer_id):
+                if _is_sm120:
+                    from sglang.kernels.ops.attention.flash_mla_sm120 import (
+                        flash_mla_with_kvcache_sm120,
+                    )
 
-                o = flash_mla_with_kvcache_sm120(
-                    q=q,
-                    k_cache=swa_k_cache,
-                    head_dim_v=self.head_dim_v,
-                    softmax_scale=self.softmax_scale,
-                    indices=swa_page_indices,
-                    topk_length=swa_topk_lengths,
-                    attn_sink=attn_sink,
-                    extra_k_cache=extra_k_cache,
-                    extra_indices_in_kvcache=extra_indices,
-                    extra_topk_length=extra_topk_lengths,
-                )[0]
-            else:
-                if _is_xpu:
-                    from sgl_kernel import flash_mla_with_kvcache
+                    o = flash_mla_with_kvcache_sm120(
+                        q=q,
+                        k_cache=swa_k_cache,
+                        head_dim_v=self.head_dim_v,
+                        softmax_scale=self.softmax_scale,
+                        indices=swa_page_indices,
+                        topk_length=swa_topk_lengths,
+                        attn_sink=attn_sink,
+                        extra_k_cache=extra_k_cache,
+                        extra_indices_in_kvcache=extra_indices,
+                        extra_topk_length=extra_topk_lengths,
+                    )[0]
                 else:
-                    from sgl_kernel.flash_mla import flash_mla_with_kvcache
+                    if _is_xpu:
+                        from sgl_kernel import flash_mla_with_kvcache
+                    else:
+                        from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
-                o = flash_mla_with_kvcache(
-                    q=q,
-                    k_cache=swa_k_cache,
-                    head_dim_v=self.head_dim_v,
-                    block_table=None,
-                    cache_seqlens=None,
-                    tile_scheduler_metadata=flashmla_metadata,
-                    softmax_scale=self.softmax_scale,
-                    is_fp8_kvcache=True,
-                    indices=swa_page_indices,
-                    topk_length=swa_topk_lengths,
-                    attn_sink=attn_sink,
-                    extra_k_cache=extra_k_cache,
-                    extra_indices_in_kvcache=extra_indices,
-                    extra_topk_length=extra_topk_lengths,
-                )[0]
+                    o = flash_mla_with_kvcache(
+                        q=q,
+                        k_cache=swa_k_cache,
+                        head_dim_v=self.head_dim_v,
+                        block_table=None,
+                        cache_seqlens=None,
+                        tile_scheduler_metadata=flashmla_metadata,
+                        softmax_scale=self.softmax_scale,
+                        is_fp8_kvcache=True,
+                        indices=swa_page_indices,
+                        topk_length=swa_topk_lengths,
+                        attn_sink=attn_sink,
+                        extra_k_cache=extra_k_cache,
+                        extra_indices_in_kvcache=extra_indices,
+                        extra_topk_length=extra_topk_lengths,
+                    )[0]
 
             o = o.squeeze(1)
             return o

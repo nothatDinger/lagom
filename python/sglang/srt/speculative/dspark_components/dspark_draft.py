@@ -18,6 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     enable_num_token_non_padded,
 )
+from sglang.srt.observability.lagom_perf import note_draft_graph, timed
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
@@ -190,6 +191,7 @@ class DraftBlockProposer:
             return draft_tp_context(get_parallel().attn_tp_group)
         return nullcontext()
 
+    @timed("draft")
     def propose(
         self,
         *,
@@ -214,6 +216,7 @@ class DraftBlockProposer:
             draft_sampler=draft_sampler,
             sampling_info=sampling_info,
         )
+        note_draft_graph(fwd.can_run_graph)
         draft_block_ids = fwd.draft_block_ids
 
         folded_confidence = None

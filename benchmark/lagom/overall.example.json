@@ -1,7 +1,7 @@
 {
   "model": "/mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-0731",
   "draft": "/mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-DSpark",
-  "python": ".venv/bin/python",
+  "python": null,
   "tokenizer": null,
   "prefill_base_gpu": 0,
   "decode_base_gpu": 4,

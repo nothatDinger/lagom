@@ -29,6 +29,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.observability.lagom_perf import phase, timed
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
@@ -123,16 +124,17 @@ class TargetVerifyExecutor:
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
 
-        correct_len, bonus, cap_trim_lens = accept_draft_tokens(
-            candidates=verify_ids_2d,
-            target_logits=target_logits,
-            draft_block=draft_block,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-            gamma=self.gamma,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            cutoff_layout=layout,
-        )
+        with phase("sample"):
+            correct_len, bonus, cap_trim_lens = accept_draft_tokens(
+                candidates=verify_ids_2d,
+                target_logits=target_logits,
+                draft_block=draft_block,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+                gamma=self.gamma,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                cutoff_layout=layout,
+            )
         if self._simulate_acc_len > 0:
             correct_len = self._simulated_correct_len(
                 bs=bs, dtype=correct_len.dtype, device=correct_len.device
@@ -276,6 +278,7 @@ class TargetVerifyExecutor:
 
         return result
 
+    @timed("target_verify")
     def _forward_prepared_verify(
         self,
         *,
@@ -301,6 +304,7 @@ class TargetVerifyExecutor:
             can_run_cuda_graph=target_out.can_run_cuda_graph,
         )
 
+    @timed("draft_inject")
     def commit_hidden(
         self,
         *,
@@ -620,6 +624,7 @@ class DsparkVerifyEpilogue:
             fill_value=0.0,
         )
 
+    @timed("sample")
     def _accept(self, input_ids, seq_lens, verify_lens, bs: int) -> torch.Tensor:
         candidates = torch.zeros(
             (bs * self.stride, 1), dtype=input_ids.dtype, device=input_ids.device

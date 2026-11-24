@@ -62,9 +62,11 @@ def validate_pr_fused_config(
     skip_io,
     prefetcher=None,
 ):
-    if not (cuda and dsv4 and speculative and width > 0 and force_h2d and not skip_io):
+    if not isinstance(force_h2d, bool):
+        raise ValueError("force_h2d_each_step must be a boolean")
+    if not (cuda and dsv4 and speculative and width > 0 and not skip_io):
         raise ValueError(
-            "pr_fused experiment requires CUDA DSv4 speculative verify, force_h2d_each_step=true and real IO"
+            "pr_fused experiment requires CUDA DSv4 speculative verify and real IO"
         )
     if prefetcher:
         raise ValueError("pr_fused experiment does not support a named prefetcher")

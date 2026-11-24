@@ -49,6 +49,7 @@ from sglang.srt.models.dspark import (
     gather_and_crop_vocab,
     run_markov_block,
 )
+from sglang.srt.observability.lagom_perf import model_role, timed
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
@@ -226,6 +227,7 @@ class DSparkAttention(MqaAttentionBase):
                 return q_out
             return q
 
+    @timed("attention_block", layer=True)
     def forward(
         self,
         positions: torch.Tensor,
@@ -825,6 +827,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         x = x.unsqueeze(1).repeat(1, self.hc_mult, 1)
         return x
 
+    @model_role("draft")
+    @timed("model")
     def forward(
         self,
         input_ids: torch.Tensor,

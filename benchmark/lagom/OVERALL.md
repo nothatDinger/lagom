@@ -3,12 +3,14 @@
 入口：`run_overall.py`。指标为端到端 serving 的 output TPS 和 TPOT。
 本方案与 ShareGPT 短测并存，不改变 `run.py` / `run_concurrent.py` 的模式含义。
 
-本分支已加入 Lagom 的 Mooncake PD 状态布局兼容：预填充节点使用普通 DSpark，
+`perf/swapin_oneshot` 默认运行 Hisparse 和 DHisparse。成对的 H2D 延迟实验使用 `--h2d-pair`，见 [运行说明](README.md)。
+
+`perf/lagom` 提供 Lagom 的 Mooncake PD 状态布局兼容：预填充节点使用普通 DSpark，
 按解码节点的 `W+P+1` 准备 C4 压缩状态环；HiSparse/Lagom 预取只在 D 节点开启。
 默认 **W=7、P=4**，配置里的 `p` 可修改，启动器自动推导预填充端布局宽度。
 Mooncake 在复制前校验两端状态条目的字节步长。
 
-本次修改没有可用执行环境，CPU 测试和 GPU PD/CUDA Graph smoke 均尚未执行。
+下文记录 `perf/lagom` 的三方法协议。
 正式测量前按文末清单完成本机验证。脚本会检查源码是否包含布局兼容实现，
 并检查服务启动后的实际配置。
 

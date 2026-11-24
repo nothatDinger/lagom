@@ -199,7 +199,9 @@ def main():
     parser.add_argument("--dataset-path", help="Local LongBench-v2 JSON/JSONL or parquet")
     parser.add_argument("--dataset-revision", help="HF dataset revision to pin")
     parser.add_argument("--output", required=True, help="New token-bank directory")
-    parser.add_argument("--input-lens", type=int, nargs="+", default=[32768, 65536, 131072])
+    parser.add_argument(
+        "--input-lens", type=int, nargs="+", default=[32768, 65536, 131072, 204800]
+    )
     parser.add_argument("--max-requests", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=42)
     prepare(parser.parse_args())

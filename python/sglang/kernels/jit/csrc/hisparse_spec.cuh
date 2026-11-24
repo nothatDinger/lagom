@@ -3,7 +3,7 @@
 // Extracted from perf/hisparse-h2d-diagnosis at 3f9ff3a49.
 // PR #40670 (70bc9e9a) gather/commit and initialization, including the
 // CAS retry-budget correction from cbaea63b2; accepted-C4 finalization stays
-// with HiSparseCoordinator. Kernel bodies and launch shapes are preserved.
+// with HiSparseCoordinator.
 
 #include <sgl_kernel/tensor.h>  // TensorMatcher and symbolic tensor validation
 #include <sgl_kernel/utils.h>   // RuntimeCheck and host utilities
@@ -340,6 +340,15 @@ __device__ __forceinline__ bool try_get_active_tail_device_loc(
   return true;
 }
 
+// Optional per-layer counters for the bounded step trace (one TP rank).
+struct SwapInCounts {
+  int32_t gather_copies, reread_candidates, overflow_copies, admissions;
+};
+
+__device__ __forceinline__ void count_warp(int32_t* counter, BallotMask mask, int lane) {
+  if (lane == 0 && mask != 0) atomicAdd(counter, __popcll(static_cast<unsigned long long>(mask)));
+}
+
 // Flatten all speculative steps. Each lane resolves one occurrence; the warp
 // cooperatively copies only lanes that won a unique-miss claim.
 template <
@@ -348,6 +357,8 @@ template <
     int HOT_BUFFER_SIZE,
     int NUM_STEPS,
     bool RecordMissPlan,
+    bool TrackHits,
+    bool CountIO,
     typename KVTransferPolicy>
 __global__ void load_cache_to_device_buffer_spec_gather_kernel(
     const int32_t* __restrict__ top_k_tokens,
@@ -370,7 +381,9 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
     int64_t plan_stride,
-    int64_t active_tail_slots) {
+    int64_t active_tail_slots,
+    int64_t* __restrict__ reread_src,
+    SwapInCounts* counts) {
   const int bid = blockIdx.x;
   const int tid = threadIdx.x;
   constexpr int64_t total_occurrences = NUM_STEPS * NUM_TOP_K;
@@ -512,16 +525,22 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
     loc = owner_loc;
     cache_slot = owner_cache_slot;
   }
-  if (cache_slot >= 0) {
-    if (mark_cache_epoch(req_cache_ref_bits + cache_slot, cache_epoch)) {
-      atomicAdd(req_union_hit_count, 1);
+  int64_t hit_src = -1;
+  if (cache_slot >= 0 && mark_cache_epoch(req_cache_ref_bits + cache_slot, cache_epoch)) {
+    atomicAdd(req_union_hit_count, 1);
+    // The epoch claim elects exactly one owner per resident slot in this
+    // window. Active-tail and unbacked provisional KV never enter the plan.
+    if constexpr (TrackHits) {
+      if (seq_lens[bid * NUM_STEPS] > HOT_BUFFER_SIZE && loc >= 0) hit_src = req_host_cache_locs[token];
     }
   }
   if (occ < total_occurrences) {
+    if constexpr (TrackHits) reread_src[bid * total_occurrences + occ] = hit_src;
     req_top_k_device_locs[occ] = loc;
   }
 
   BallotMask copy_mask = __ballot_sync(FULL_WARP_MASK, copy_owner);
+  if constexpr (CountIO) count_warp(&counts->gather_copies, copy_mask, lane_id);
   while (copy_mask != 0) {
     const int owner_lane = first_set_lane(copy_mask);
     const int32_t copy_token = __shfl_sync(FULL_WARP_MASK, token, owner_lane);
@@ -541,11 +560,44 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
   }
 }
 
+// Replay only the elected, host-backed hits into their existing physical
+// slots, before commit rotates scratch locations. Both trace arms execute
+// this same launch and count the same eligible entries.
+template <int OCCURRENCES, bool CountIO, typename KVTransferPolicy>
+__global__ void reread_resident_hits_kernel(
+    const int64_t* __restrict__ sources,
+    const int32_t* __restrict__ destinations,
+    int64_t dst_stride,
+    const void* __restrict__ host,
+    void* __restrict__ device,
+    const int32_t* __restrict__ num_real_reqs,
+    bool copy,
+    SwapInCounts* counts) {
+  const int bid = blockIdx.x;
+  if (bid >= num_real_reqs[0]) return;
+  const int lane = threadIdx.x % WARP_SIZE;
+  const int occ = blockIdx.y * blockDim.x + threadIdx.x;
+  const int64_t src = occ < OCCURRENCES ? sources[static_cast<int64_t>(bid) * OCCURRENCES + occ] : -1;
+  const int32_t dst = src >= 0 ? destinations[bid * dst_stride + occ] : -1;
+  BallotMask mask = __ballot_sync(FULL_WARP_MASK, dst >= 0);
+  if constexpr (CountIO) count_warp(&counts->reread_candidates, mask, lane);
+  if (copy) {
+    while (mask) {
+      const int owner = first_set_lane(mask);
+      const int64_t from = __shfl_sync(FULL_WARP_MASK, src, owner);
+      const int32_t to = __shfl_sync(FULL_WARP_MASK, dst, owner);
+      KVTransferPolicy::copy_warp(lane, host, device, from, to);
+      mask &= ~(static_cast<BallotMask>(1) << owner);
+    }
+  }
+}
+
 template <
     int NUM_TOP_K,
     int HOT_BUFFER_SIZE,
     int NUM_STEPS,
     bool RecordMissPlan,
+    bool CountIO,
     typename KVTransferPolicy,
     bool USE_PDL>
 __global__ void load_cache_to_device_buffer_spec_commit_kernel(
@@ -567,7 +619,8 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
     int64_t top_k_device_locs_stride,
     int64_t buffer_stride_0,
     int64_t host_stride,
-    int64_t plan_stride) {
+    int64_t plan_stride,
+    SwapInCounts* counts) {
   device::PDLWaitPrimary<USE_PDL>();
   const int bid = blockIdx.x;
   if (bid >= num_real_reqs[0]) return;
@@ -686,6 +739,7 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
     int32_t victim = -1;
     bool direct_overflow = false;
     bool rotate_compact = false;
+    bool admitted = false;
 
     if (compact_idx < miss_count) {
       const int32_t compact_entry = req_compact_hash_positions[compact_idx];
@@ -773,6 +827,7 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
         const int32_t old_loc = req_device_buffer_locs[victim];
         const int32_t new_loc = direct_overflow ? old_loc : req_scratch_locs[unique_idx];
         if (new_loc >= 0 && old_loc >= 0) {
+          admitted = true;
           const int32_t old_token = req_device_buffer_tokens[victim];
           req_device_buffer_tokens[victim] = token;
           req_cache_ref_bits[victim] = cache_epoch;
@@ -801,6 +856,10 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
     }
 
     BallotMask copy_mask = __ballot_sync(FULL_WARP_MASK, copy_owner);
+    if constexpr (CountIO) {
+      count_warp(&counts->overflow_copies, copy_mask, lane_id);
+      count_warp(&counts->admissions, __ballot_sync(FULL_WARP_MASK, admitted), lane_id);
+    }
     while (copy_mask != 0) {
       const int owner_lane = first_set_lane(copy_mask);
       const int64_t src_loc = __shfl_sync(FULL_WARP_MASK, copy_src_loc, owner_lane);
@@ -873,6 +932,8 @@ template <
     int HOT_BUFFER_SIZE,
     int NUM_STEPS,
     bool RecordMissPlan,
+    bool TrackHits,
+    bool CountIO,
     typename KVTransferPolicy,
     bool USE_PDL>
 void load_cache_to_device_buffer_spec(
@@ -893,7 +954,11 @@ void load_cache_to_device_buffer_spec(
     int64_t active_tail_slots,
     tvm::ffi::TensorView miss_src_out,
     tvm::ffi::TensorView miss_dst_out,
-    tvm::ffi::TensorView miss_count_out) {
+    tvm::ffi::TensorView miss_count_out,
+    tvm::ffi::TensorView reread_src,
+    tvm::ffi::TensorView io_counts,
+    bool copy_hits,
+    int64_t phase) {
   using namespace host;
 
   static_assert(NUM_STEPS > 0, "HiSparse speculative swap requires at least one step.");
@@ -988,65 +1053,101 @@ void load_cache_to_device_buffer_spec(
   TensorMatcher({bs * NUM_STEPS}).with_dtype<int32_t>().with_device(cuda_device).verify(seq_lens);
   const auto device = cuda_device.unwrap();
 
-  const uint32_t tiles = static_cast<uint32_t>((total_occurrences + BLOCK_SIZE - 1) / BLOCK_SIZE);
-  LaunchKernel(dim3(static_cast<uint32_t>(bs), tiles), BLOCK_SIZE, device)(
-      load_cache_to_device_buffer_spec_gather_kernel<
-          BLOCK_SIZE,
-          NUM_TOP_K,
-          HOT_BUFFER_SIZE,
-          NUM_STEPS,
-          RecordMissPlan,
-          KVTransferPolicy>,
-      static_cast<const int32_t*>(top_k_tokens.data_ptr()),
-      static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
-      static_cast<const int64_t*>(host_cache_locs.data_ptr()),
-      static_cast<int32_t*>(device_buffer_locs.data_ptr()),
-      host_cache_k.data_ptr(),
-      device_buffer_k.data_ptr(),
-      static_cast<int32_t*>(top_k_device_locs.data_ptr()),
-      static_cast<const int64_t*>(req_pool_indices.data_ptr()),
-      static_cast<const int32_t*>(seq_lens.data_ptr()),
-      cache_state,
-      miss_workspace,
-      static_cast<const int32_t*>(num_real_reqs.data_ptr()),
-      miss_src_ptr,
-      miss_dst_ptr,
-      miss_count_ptr,
-      buffer_stride_0,
-      host_stride,
-      top_k_tokens_stride,
-      top_k_device_locs_stride,
-      plan_stride,
-      active_tail_slots);
-
-  LaunchKernel(dim3(static_cast<uint32_t>(bs)), 512, device)
-      .enable_pdl(USE_PDL)(
-          load_cache_to_device_buffer_spec_commit_kernel<
-              NUM_TOP_K,
-              HOT_BUFFER_SIZE,
-              NUM_STEPS,
-              RecordMissPlan,
-              KVTransferPolicy,
-              USE_PDL>,
-          static_cast<const int32_t*>(top_k_tokens.data_ptr()),
+  int64_t* hit_src_ptr = nullptr;
+  SwapInCounts* count_ptr = nullptr;
+  if constexpr (TrackHits) {
+    TensorMatcher({bs, total_occurrences}).with_dtype<int64_t>().with_device(cuda_device).verify(reread_src);
+    hit_src_ptr = static_cast<int64_t*>(reread_src.data_ptr());
+  }
+  if constexpr (CountIO) {
+    TensorMatcher({4}).with_dtype<int32_t>().with_device(cuda_device).verify(io_counts);
+    count_ptr = static_cast<SwapInCounts*>(io_counts.data_ptr());
+  }
+  // An untraced call uses a single FFI dispatch. Tracing places GPU stamps at
+  // the same launch boundaries, including inside a captured decode graph.
+  if (phase == 0 || phase == 1) {
+    const uint32_t tiles = static_cast<uint32_t>((total_occurrences + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    LaunchKernel(dim3(static_cast<uint32_t>(bs), tiles), BLOCK_SIZE, device)(
+        load_cache_to_device_buffer_spec_gather_kernel<
+            BLOCK_SIZE,
+            NUM_TOP_K,
+            HOT_BUFFER_SIZE,
+            NUM_STEPS,
+            RecordMissPlan,
+            TrackHits,
+            CountIO,
+            KVTransferPolicy>,
+        static_cast<const int32_t*>(top_k_tokens.data_ptr()),
+        static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
+        static_cast<const int64_t*>(host_cache_locs.data_ptr()),
+        static_cast<int32_t*>(device_buffer_locs.data_ptr()),
+        host_cache_k.data_ptr(),
+        device_buffer_k.data_ptr(),
+        static_cast<int32_t*>(top_k_device_locs.data_ptr()),
+        static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+        static_cast<const int32_t*>(seq_lens.data_ptr()),
+        cache_state,
+        miss_workspace,
+        static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+        miss_src_ptr,
+        miss_dst_ptr,
+        miss_count_ptr,
+        buffer_stride_0,
+        host_stride,
+        top_k_tokens_stride,
+        top_k_device_locs_stride,
+        plan_stride,
+        active_tail_slots,
+        hit_src_ptr,
+        count_ptr);
+  }
+  if constexpr (TrackHits) {
+    if (phase == 0 || phase == 2) {
+      constexpr int threads = 128;
+      LaunchKernel(dim3(static_cast<uint32_t>(bs), (total_occurrences + threads - 1) / threads), threads, device)(
+          reread_resident_hits_kernel<NUM_STEPS * NUM_TOP_K, CountIO, KVTransferPolicy>,
+          hit_src_ptr,
           static_cast<int32_t*>(top_k_device_locs.data_ptr()),
-          static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
-          static_cast<int32_t*>(device_buffer_locs.data_ptr()),
-          static_cast<const int64_t*>(host_cache_locs.data_ptr()),
+          top_k_device_locs_stride,
           host_cache_k.data_ptr(),
           device_buffer_k.data_ptr(),
-          static_cast<const int64_t*>(req_pool_indices.data_ptr()),
-          cache_state,
-          miss_workspace,
           static_cast<const int32_t*>(num_real_reqs.data_ptr()),
-          miss_src_ptr,
-          miss_dst_ptr,
-          miss_count_ptr,
-          top_k_tokens_stride,
-          top_k_device_locs_stride,
-          buffer_stride_0,
-          host_stride,
-          plan_stride);
+          copy_hits,
+          count_ptr);
+    }
+  }
+  if (phase == 0 || phase == 3) {
+    LaunchKernel(dim3(static_cast<uint32_t>(bs)), 512, device)
+        .enable_pdl(USE_PDL)(
+            load_cache_to_device_buffer_spec_commit_kernel<
+                NUM_TOP_K,
+                HOT_BUFFER_SIZE,
+                NUM_STEPS,
+                RecordMissPlan,
+                CountIO,
+                KVTransferPolicy,
+                USE_PDL>,
+            static_cast<const int32_t*>(top_k_tokens.data_ptr()),
+            static_cast<int32_t*>(top_k_device_locs.data_ptr()),
+            static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
+            static_cast<int32_t*>(device_buffer_locs.data_ptr()),
+            static_cast<const int64_t*>(host_cache_locs.data_ptr()),
+            host_cache_k.data_ptr(),
+            device_buffer_k.data_ptr(),
+            static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+            cache_state,
+            miss_workspace,
+            static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+            miss_src_ptr,
+            miss_dst_ptr,
+            miss_count_ptr,
+            top_k_tokens_stride,
+            top_k_device_locs_stride,
+            buffer_stride_0,
+            host_stride,
+            plan_stride,
+            count_ptr);
+  }
 }
 
 template <int HOT_BUFFER_SIZE>

@@ -21,9 +21,9 @@ def _jit_sparse_module(
     is_dsv4_layout: bool = False,
     record_miss_plan: bool = False,
     skip_io: bool = False,
+    force_h2d_each_step: bool = False,
 ) -> Module:
-    # record_miss_plan / skip_io are compile-time kernel flags; the
-    # (False, False) production instantiation stays byte-identical.
+    # Compile optional diagnostics out of the normal swap-in kernel.
     template_args = make_cpp_args(
         block_size,
         num_top_k,
@@ -32,6 +32,7 @@ def _jit_sparse_module(
         is_dsv4_layout,
         record_miss_plan,
         skip_io,
+        force_h2d_each_step,
     )
     cache_args = make_cpp_args(
         item_size_bytes,
@@ -42,6 +43,7 @@ def _jit_sparse_module(
         is_dsv4_layout,
         record_miss_plan,
         skip_io,
+        force_h2d_each_step,
     )
     return load_jit(
         "sparse_cache",
@@ -136,6 +138,7 @@ def _load_cache_to_device_buffer_mla(
     miss_dst: torch.Tensor | None,
     miss_count: torch.Tensor | None,
     skip_io: bool,
+    force_h2d_each_step: bool,
 ) -> None:
     assert (
         hot_buffer_size >= num_top_k
@@ -151,6 +154,7 @@ def _load_cache_to_device_buffer_mla(
         is_dsv4_layout=is_dsv4_layout,
         record_miss_plan=record_miss_plan,
         skip_io=skip_io,
+        force_h2d_each_step=force_h2d_each_step,
     )
 
     empty = torch.empty(0)
@@ -213,11 +217,12 @@ def load_cache_to_device_buffer_mla(
     miss_dst: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
     skip_io: bool = False,
+    force_h2d_each_step: bool = False,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes).
 
-    Optional miss_src/miss_dst/miss_count record the miss plan for replay by
-    copy_cache_planned_mla; skip_io elides only the KV bytes (timing probe).
+    Optional miss_src/miss_dst/miss_count record transfers for copy_cache_planned_mla.
+    The force-H2D transfer plan also includes host-backed hits.
     """
     _load_cache_to_device_buffer_mla(
         is_dsv4_layout=False,
@@ -241,6 +246,7 @@ def load_cache_to_device_buffer_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+        force_h2d_each_step=force_h2d_each_step,
     )
 
 
@@ -302,6 +308,7 @@ def load_cache_to_device_buffer_dsv4_mla(
     miss_dst: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
     skip_io: bool = False,
+    force_h2d_each_step: bool = False,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
@@ -326,4 +333,5 @@ def load_cache_to_device_buffer_dsv4_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+        force_h2d_each_step=force_h2d_each_step,
     )

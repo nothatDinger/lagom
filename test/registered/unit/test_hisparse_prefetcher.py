@@ -354,25 +354,23 @@ def test_dspark_defaults_without_explicit_hisparse_config():
     assert config.device_buffer_size == 6144
 
 
-def test_force_h2d_invalidation_preserves_hot_buffer_allocation():
-    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+def test_demand_reread_preserves_residency_and_lru():
+    from unittest.mock import Mock
 
-    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
-    coordinator.force_h2d_each_step = True
-    coordinator.req_device_buffer_tokens = torch.arange(24).view(2, 3, 4)
-    coordinator.req_device_buffer_token_locs = torch.arange(24).view(2, 3, 4)
-    coordinator.lru_slots = torch.arange(24, dtype=torch.int16).view(2, 3, 4)
-    coordinator._lru_init = torch.arange(4, dtype=torch.int16)
-    physical_hot_buffer = torch.full((2, 3, 4), 7)
-    coordinator.mem_pool_device = SimpleNamespace(kv_buffer=physical_hot_buffer)
-    physical_slot_mapping = coordinator.req_device_buffer_token_locs.clone()
+    from sglang.srt.managers import hisparse_coordinator as module
 
-    coordinator._invalidate_hot_buffer_residency(torch.tensor([0, 2]), layer_id=1)
-
-    assert torch.all(coordinator.req_device_buffer_tokens[1, [0, 2]] == -1)
-    assert torch.equal(coordinator.req_device_buffer_token_locs, physical_slot_mapping)
-    assert torch.equal(
-        coordinator.lru_slots[1, [0, 2]],
-        coordinator._lru_init.expand(2, -1),
-    )
-    assert torch.all(physical_hot_buffer == 7)
+    c = module.HiSparseCoordinator.__new__(module.HiSparseCoordinator)
+    c.force_h2d_each_step = True
+    c.enable_prefetch = False
+    c.prefetcher_name = None
+    c.top_k = 2
+    c._consume_previous_prefetch = Mock()
+    c._run_swap_in_kernel = Mock()
+    c.req_device_buffer_tokens = torch.arange(24).view(2, 3, 4)
+    c.lru_slots = torch.arange(24, dtype=torch.int16).view(2, 3, 4)
+    tokens, lru = c.req_device_buffer_tokens.clone(), c.lru_slots.clone()
+    reqs, lengths, top_k = torch.tensor([2]), torch.tensor([15]), torch.tensor([[3, 2]])
+    c.swap_in_selected_pages(reqs, lengths, top_k, 1)
+    assert c._run_swap_in_kernel.call_args.kwargs["reread_hits"]
+    torch.testing.assert_close(c.req_device_buffer_tokens, tokens)
+    torch.testing.assert_close(c.lru_slots, lru)

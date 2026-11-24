@@ -13,6 +13,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.srt.mem_cache.hisparse_spec import HiSparseSpecLayout
+from sglang.srt.observability.lagom_perf import get_trace
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -97,6 +98,8 @@ def _jit_spec_module(
     hot_buffer_size: int,
     num_steps: int,
     record_miss_plan: bool,
+    track_hits: bool,
+    count_io: bool,
     transfer_policy: str,
 ) -> Module:
     template_args = make_cpp_args(
@@ -105,6 +108,8 @@ def _jit_spec_module(
         hot_buffer_size,
         num_steps,
         record_miss_plan,
+        track_hits,
+        count_io,
         transfer_policy,
         is_arch_support_pdl(),
     )
@@ -139,8 +144,10 @@ def load_cache_to_device_buffer_spec_mla(
     miss_count: torch.Tensor | None = None,
     transfer_kind: str = _LINEAR_TRANSFER,
     item_size_bytes: int | None = None,
+    force_h2d_each_step: bool = False,
+    trace_layer: int | None = None,
 ) -> None:
-    """Resolve all speculative steps and swap unique misses in one launch pair.
+    """Resolve the window in gather/commit and optionally reread distinct resident hits.
 
     Optional miss-plan outputs use the same protocol as the single-step HiSparse
     kernel, so shared-index layers can replay only the Host-to-GPU copies with
@@ -155,6 +162,7 @@ def load_cache_to_device_buffer_spec_mla(
     hot_buffer_size = state.cache_policy.size(1)
     active_tail_slots = device_buffer_tokens.size(1) - hot_buffer_size
     record_miss_plan = miss_src is not None
+    empty = torch.empty(0)
     if record_miss_plan:
         if miss_dst is None or miss_count is None:
             raise ValueError(
@@ -187,22 +195,39 @@ def load_cache_to_device_buffer_spec_mla(
             raise ValueError(
                 "miss_src, miss_dst, and miss_count must be provided together."
             )
-        empty = torch.empty(0)
         miss_src = miss_dst = miss_count = empty
 
     if transfer_kind == _LINEAR_TRANSFER and item_size_bytes is None:
         item_size_bytes = host_cache.stride(0) * host_cache.element_size()
 
+    trace = get_trace() if trace_layer is not None else None
+    track_hits = force_h2d_each_step or trace is not None
+    sources = (
+        torch.empty(
+            (top_k_tokens.size(0), num_steps * num_top_k),
+            dtype=torch.int64,
+            device=top_k_tokens.device,
+        )
+        if track_hits
+        else empty
+    )
+    counts = (
+        torch.zeros(4, dtype=torch.int32, device=top_k_tokens.device)
+        if trace
+        else empty
+    )
     module = _jit_spec_module(
         _GATHER_BLOCK_SIZE,
         num_top_k,
         hot_buffer_size,
         num_steps,
         record_miss_plan,
+        track_hits,
+        trace is not None,
         _spec_transfer_policy(transfer_kind, item_size_bytes),
     )
 
-    module.load_cache_to_device_buffer_spec(
+    args = (
         top_k_tokens,
         device_buffer_tokens,
         host_cache_locs,
@@ -221,7 +246,18 @@ def load_cache_to_device_buffer_spec_mla(
         miss_src,
         miss_dst,
         miss_count,
+        sources,
+        counts,
+        force_h2d_each_step,
     )
+    if trace is None:
+        module.load_cache_to_device_buffer_spec(*args, 0)
+        return
+    names = ("swap_in_gather", "swap_in_reread", "swap_in_commit")
+    for part, name in enumerate(names, 1):
+        with trace.region(name, layer=trace_layer):
+            module.load_cache_to_device_buffer_spec(*args, part)
+    trace.record_swap_in(trace_layer, names, counts, force_h2d_each_step)
 
 
 @cache_once

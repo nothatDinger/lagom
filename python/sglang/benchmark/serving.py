@@ -2298,6 +2298,11 @@ def cli_main():
         help="Number of prompts to process. Default is 1000.",
     )
     parser.add_argument(
+        "--sharegpt-input-len",
+        type=int,
+        help="Pack local ShareGPT conversations into prompts of exactly this many token IDs.",
+    )
+    parser.add_argument(
         "--sharegpt-output-len",
         type=int,
         default=None,

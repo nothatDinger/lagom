@@ -10,18 +10,17 @@ deduplicates misses, and transfers KV. Single-token fallback uses the same state
 
 The extracted kernel is the PR #40670 implementation pinned at `70bc9e9a`, with
 the CAS retry correction from `cbaea63b2`. It was connected to serving in
-`3f9ff3a49`. Kernel bodies and launch shapes are preserved; unused PR accepted-C4
-finalization kernels are omitted because the parent branch already owns those
-transactions in `HiSparseCoordinator`. The source branch's benchmark imports,
-manifest checks, split planner, probes and comparison scripts are not needed.
+`3f9ff3a49`. The performance harness uses the original gather and commit launches
+with an optional reread of host-backed resident hits between them.
 
-The original serving restrictions are retained: CUDA DSv4 speculative verify,
-`force_h2d_each_step=true`, real KV IO, no named prefetcher, compressed prefixes
-longer than the hot buffer, and `verify_width * effective_top_k <= min(hot, 8192)`.
+Fused swap-in requires CUDA DSv4 speculative verify, real KV IO, an unnamed
+prefetch configuration and `verify_width * effective_top_k <= min(hot, 8192)`.
+Short prefixes fit in the preloaded hot buffer. Both force-H2D settings use the
+same cache state and victim selection. See the [paired PD experiment](../../../../../benchmark/lagom/README.md).
 For DSPARK, the hot buffer defaults to `2 * verify_width * effective_top_k`,
 including force-H2D mode (width 6 and effective Top-K 512 default to 6144 C4
 entries). Explicit buffer sizes are preserved if they can hold one complete
-verify window; force-H2D invalidates residency without changing that capacity.
+verify window. The forced arm refreshes eligible hits in their existing slots.
 The canonical tail and provisional C4 placeholders remain fixed. Remaining slots
 in each request's existing allocation provide rotating KV scratch; separate
 coordinator-owned C4 writer scratch, accepted-token commit and rollback retain

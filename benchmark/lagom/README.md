@@ -1,4 +1,50 @@
-# Lagom 初步性能实验
+# Fused swap-in 的 H2D 延迟实验
+
+在 `perf/swapin_oneshot` 上，`run_overall.py --h2d-pair` 依次运行两个 DSPARK decode 实例。两次使用相同的输入、seed、CUDA Graph 档位和缓存容量，decode 的 `force_h2d_each_step` 分别为 `false` 和 `true`。配对实验默认使用 32768 输入、1024 输出、C=256，`h2d.example.json` 将 hot 设为 2048。模型的有效 K 为 512，因此使用 W=3，满足 `(W+1) × K ≤ hot`。
+
+在仓库根目录激活装有 SGLang 和 router 的 uv 虚拟环境。模型和 draft 的路径沿用 `overall.example.json`，可在 `--config` 指定的 JSON 中覆盖。自定义 H2D 配置请从 `h2d.example.json` 复制。先检查本地 ShareGPT 输入的命令生成，再在有 8 张可见 GPU 的主机上采集。
+
+```bash
+source .venv/bin/activate
+uv run --active --no-project python benchmark/lagom/run_overall.py --h2d-pair --dry-run \
+  --sharegpt /data/ShareGPT.json --output /results/h2d
+
+uv run --active --no-project python benchmark/lagom/run_overall.py --h2d-pair \
+  --sharegpt /data/ShareGPT.json --output /results/h2d
+```
+
+预填充和解码各用 TP4。示例给 Mooncake 设置 `MC_FORCE_TCP=1` 和 `LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64`。本地 ShareGPT 按 seed 打乱对话并直接拼出定长 token IDs，语料不足会报错。也可传 `--data-dir /data/longbench-bank` 使用 `longbench_v2_fixed.py` 制作的 token bank。两种来源均支持 204800 输入。
+
+默认在实际 decode batch 达到 256 后跳过两步，记录 12 步，排除启动预热请求。若机器容量使实际 batch 小于并发上限，`--trace-batch-size B` 可为两格指定相同的实际 batch。四个 TP rank 都要产出完整窗口，任一缺失会将该格标为失败。`--resume` 在相同协议下从最后成功的格继续。
+
+## 如何核对解耦
+
+每个 attempt 的 `steps/` 保留各 rank 的逐步时间戳、接受 token 数、前缀长度和 CSV。`h2d.json` 给出每个 rank 的每步均值，强制组的 `comparison.json` 给出两格差值。按 rank 比较，避免重复累计 TP 时间。
+
+| GPU 区间 | 实际执行和计数 |
+|---|---|
+| `target.swap_in_gather` | 一次解析完整 verify 窗口，记录实际从 host 复制到 scratch 的 C4 行数 |
+| `target.swap_in_reread` | 对已经命中、在 host 有备份的长请求 KV，每个物理槽只选一次。两格都遍历候选，强制组再将 KV 读回原物理槽。`resident_hits` 和实际复制行数分别记录 |
+| `target.swap_in_commit` | 记录 CLOCK 接纳行数 `admissions`、scratch 轮换和溢出时直接 H2D 的耗时。`kv_entries` 只计直接复制的行数 |
+
+未提交的 C4 使用 verify writer 页。短前缀继续使用已驻留的 KV。每行 payload 为 584 字节，三段的 `kv_entries` 之和乘 584 得到每 rank 实际发出的逻辑 KV 字节量。`swap_in_reread` 的基线包含候选遍历，强制组减去基线给出额外重读的延迟。
+
+`step_ms` 覆盖一个 DSPARK decode step。`decode_tpot_ms = 平均 step_ms / 每请求每步平均提交 token 数`。`reread_pct_of_step` 的分母是整个 step，`reread_ms_per_token` 已按提交 token 数摊销。客户端 `output_tps` 的计时包含长上下文预填充，逐步成本由上述 GPU 区间计算。
+
+比较器逐 rank 检查新增 payload、重读时间增量超过两倍合并标准误、接纳数/候选数/原生 H2D 行数/commit 耗时/每步 token 数的相对变化在 10% 内，以及 step 增量为正。允许的 step 与重读增量之差取基线 step 的 5% 和重读增量的 20% 中较大者。这些是诊断阈值，连续 step 的相关性会影响标准误。每个判断及原始均值均可复核。
+
+## Nsight Systems
+
+在同一条 uv 命令中加 `--nsys`，使用新的 `--output` 目录。runner 只包裹 decode，采集 CUDA/NVTX，关闭 CPU sampling 和 context switches，用 `--cuda-graph-trace=node` 展开图节点。每格结束后执行 `nsys stats --force-export=true` 并生成 `prof.nsys-rep`、`prof.sqlite`、`nsys-stats.txt` 和 `nsys-steps.json`。有独立采集的 SQLite 时也可重做分析。
+
+```bash
+python benchmark/lagom/analyze_nsys.py /results/attempt/prof.sqlite \
+  --steps --output /results/attempt/breakdown.json
+```
+
+分析器通过 NVTX 边界内的 CUDA launch 将 GPU 计时标记与 step 关联。每个 rank/device 的 GPU 区间分为仅 kernel、仅显式 H2D memcpy、仅其他活动、活动重叠和空闲。CPU CUDA API 按调用线程取区间并集，单独报告。显式 H2D 的字节数只累计完整落入窗口的 memcpy，另列跨边界次数。fused kernel 对 pinned host 内存的读取出现在 kernel 时间线上，其 payload 取自 Lagom 行计数。CUDA 分配、缓存和总线协议都会影响链路上的实际流量。
+
+## perf/lagom 原有实验
 
 8×H100、Mooncake P TP4 / D TP4、LongBench-v2 的 32k/64k/128k × 并发 8–256 overall TPS/TPOT 实验，见 [overall 实验说明](OVERALL.md)，入口为 `run_overall.py`。该方案区分无推测解码的 Hisparse、DHisparse 和 Lagom；Lagom PD 状态布局兼容及执行环境验证事项也列在该文档中。
 

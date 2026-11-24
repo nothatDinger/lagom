@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.hisparse_spec import (
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.observability.lagom_perf import phase, timed
 from sglang.srt.utils import get_device_module, is_hip
 
 device_module = get_device_module()
@@ -880,15 +881,6 @@ class HiSparseCoordinator:
                 self.req_to_token_pool.req_to_token[req.req_pool_idx, :allocated_len]
             )
         )
-        compressed_len = len(compressed_logical_indices)
-        if (
-            getattr(self, "_pr_verify_layout", None) is not None
-            and compressed_len <= self.device_buffer_size
-        ):
-            raise ValueError(
-                "pr_fused experiment requires long-context requests (compressed prefix > hot slots)"
-            )
-
         buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
             compressed_logical_indices, alloc_size
         )
@@ -897,7 +889,7 @@ class HiSparseCoordinator:
                 "HiSparse: alloc_device_buffer failed for req %s "
                 "(compressed_len=%d, alloc_size=%d)",
                 req.rid,
-                compressed_len,
+                len(compressed_logical_indices),
                 alloc_size,
             )
             raise RuntimeError("HiSparse alloc_device_buffer returned None")
@@ -1436,6 +1428,7 @@ class HiSparseCoordinator:
         miss_plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         skip_io: Optional[bool] = None,
         num_real_reqs: Optional[torch.Tensor] = None,
+        reread_hits: bool = False,
     ) -> torch.Tensor:
         """Run the full plan+IO swap-in kernel for one layer; return its slot table.
 
@@ -1504,29 +1497,10 @@ class HiSparseCoordinator:
                 self.num_real_reqs if num_real_reqs is None else num_real_reqs
             ),
             skip_io=self.skip_io if skip_io is None else skip_io,
+            force_h2d_each_step=reread_hits,
             **plan,
         )
         return top_k_indices
-
-    def _invalidate_hot_buffer_residency(
-        self, req_pool_indices: torch.Tensor, layer_id: int
-    ) -> None:
-        """Forget resident token identities while retaining physical slot mappings."""
-        if not getattr(self, "force_h2d_each_step", False):
-            return
-        req_pool_indices = req_pool_indices.to(torch.int64)
-        tokens = self.req_device_buffer_tokens[layer_id]
-        tokens.index_fill_(0, req_pool_indices, -1)
-        # req_device_buffer_token_locs is not residency metadata: it maps each
-        # logical hot-buffer slot to its allocated physical device location.
-        # Clearing it would make the swap-in kernel copy to device location -1.
-        self.lru_slots[layer_id, req_pool_indices] = self._lru_init
-        if getattr(self, "_spec_states", None) is not None:
-            initialize_hisparse_spec_state(
-                device_buffer_tokens=tokens,
-                req_pool_indices=req_pool_indices,
-                state=self._spec_states[layer_id],
-            )
 
     def _consume_previous_prefetch(
         self,
@@ -1970,14 +1944,13 @@ class HiSparseCoordinator:
             req_pool_indices_cpu,
             committed_lens_cpu,
         )
-        if getattr(self, "_spec_states", None) is None:
-            self._invalidate_hot_buffer_residency(req_pool_indices, layer_id)
         if not self.enable_prefetch:
             result = self._run_swap_in_kernel(
                 req_pool_indices,
                 compressed_seq_lens,
                 top_k_result[:, : self.top_k],
                 layer_id,
+                reread_hits=getattr(self, "force_h2d_each_step", False),
             )
             if self.prefetcher_name == "previous" and not defer_previous_prefetch:
                 self._submit_previous_prefetch(
@@ -2020,6 +1993,7 @@ class HiSparseCoordinator:
             top_k_result,
             layer_id,
             record_plan=group is not None,
+            reread_hits=getattr(self, "force_h2d_each_step", False),
         )
         if group:
             # Fork: the prefetch stream must observe the anchor's plan (produced
@@ -2057,7 +2031,6 @@ class HiSparseCoordinator:
             )
         if skip_io or self.skip_io:
             raise ValueError("pr_fused cannot skip KV IO")
-        self._invalidate_hot_buffer_residency(req_pool_indices, layer_id)
         num_reqs = req_pool_indices.numel()
         active = self._pr_verify_layout["active_slots"]
         lengths = compressed_seq_lens.reshape(num_reqs, -1)
@@ -2077,6 +2050,8 @@ class HiSparseCoordinator:
             num_real_reqs=(
                 self.num_real_reqs if num_real_reqs is None else num_real_reqs
             ),
+            force_h2d_each_step=self.force_h2d_each_step,
+            trace_layer=layer_id,
             transfer_kind="dsv4_paged",
             item_size_bytes=self.item_size_bytes,
         )
@@ -2205,6 +2180,7 @@ class HiSparseCoordinator:
                 ]
         return result
 
+    @timed("kv_prepare")
     def prepare_dspark_verify_window(
         self,
         *,
@@ -2320,12 +2296,19 @@ class HiSparseCoordinator:
         mapped_device_locs: torch.Tensor,
     ) -> torch.Tensor:
         """Current-window C4 always reads its writer page, even on fast paths."""
-        # Always execute this selection when fixed scratch exists. During CUDA
-        # graph capture the identities are all -1; replay updates the same
-        # device buffer before launch, so no capture-time Python branch or slice
-        # address is frozen into the graph.
+        mask = self.dspark_scratch_mask(compressed_locs)
+        return (
+            torch.where(mask, mapped_device_locs, swapped_locs)
+            if mask is not None
+            else swapped_locs
+        )
+
+    def dspark_scratch_mask(
+        self, compressed_locs: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Identify current-window writer pages using the replay-time device mapping."""
         if self._dspark_scratch_valid_mapping is None:
-            return swapped_locs
+            return None
         valid_logical_loc = torch.logical_and(
             compressed_locs >= 0,
             compressed_locs < self._dspark_scratch_valid_mapping.numel(),
@@ -2333,10 +2316,9 @@ class HiSparseCoordinator:
         safe_locs = compressed_locs.clamp(
             0, self._dspark_scratch_valid_mapping.numel() - 1
         )
-        belongs_to_window = torch.logical_and(
+        return torch.logical_and(
             valid_logical_loc, self._dspark_scratch_valid_mapping[safe_locs]
         )
-        return torch.where(belongs_to_window, mapped_device_locs, swapped_locs)
 
     def rollback_dspark_verify_window(self, window: HiSparseDSparkWindow) -> None:
         if window.compressed_locs.numel() == 0:
@@ -2360,6 +2342,7 @@ class HiSparseCoordinator:
         self._dspark_commit_done_event.record(device_module.current_stream())
         self._has_pending_dspark_commit = True
 
+    @timed("kv_commit")
     def commit_dspark_verify_window(
         self, window: HiSparseDSparkWindow, commit_lens: torch.Tensor
     ) -> None:
@@ -2367,9 +2350,10 @@ class HiSparseCoordinator:
         if window.compressed_locs.numel() == 0:
             return
         commit_cpu = commit_lens.to("cpu").tolist()
-        accepted = speculative_accepted_c4_indices(
-            window, commit_cpu, self.compress_ratio
-        )
+        with phase("cpu_dependency_commit"):
+            accepted = speculative_accepted_c4_indices(
+                window, commit_cpu, self.compress_ratio
+            )
         if accepted:
             accepted_idx = torch.tensor(accepted, dtype=torch.int64, device=self.device)
             host_locs = []

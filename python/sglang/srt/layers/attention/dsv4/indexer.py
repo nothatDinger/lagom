@@ -992,117 +992,86 @@ class C4IndexerBackendMixin:
                     # Submission mutates Python state and launches work on an
                     # external stream, so it must happen after graph replay.
                     prefetch_candidates = None
-        if hisparse_paired:
-            normal_rows = forward_batch.oasiskv_normal_rows
-            draft_rows = forward_batch.oasiskv_draft_rows
-            if normal_rows is None or draft_rows is None:
-                raise RuntimeError("OasisKV paired ForwardBatch is incomplete")
-            if normal_rows.numel() != forward_batch.req_pool_indices.numel():
-                raise RuntimeError("OasisKV paired rows must map one pair per request")
+        if hisparse_paired or hisparse_verify:
+            verify_lens_cpu = None
+            if hisparse_paired:
+                normal_rows = forward_batch.oasiskv_normal_rows
+                draft_rows = forward_batch.oasiskv_draft_rows
+                if normal_rows is None or draft_rows is None:
+                    raise RuntimeError("OasisKV paired ForwardBatch is incomplete")
+                if normal_rows.numel() != forward_batch.req_pool_indices.numel():
+                    raise RuntimeError(
+                        "OasisKV paired rows must map one pair per request"
+                    )
+            else:
+                from sglang.srt.speculative.ragged_verify import (
+                    resolve_ragged_verify_layout,
+                )
 
-            # Unlike ordinary EAGLE-3, OasisKV makes the Indexer Top-K for every
-            # verification row resident in the request's fixed-size device
-            # buffer.  Process the root and draft steps in order so the draft
-            # attention uses its own selected working set rather than a copy of
-            # the root selection.
+                layout = resolve_ragged_verify_layout(forward_batch)
+                if layout is not None:
+                    verify_lens_cpu = layout.verify_lens_cpu
+                    if verify_lens_cpu is None:
+                        # Device-only ragged geometry is eager; cache the D2H once.
+                        verify_lens_cpu = getattr(
+                            forward_batch, "_hisparse_verify_lens_cpu", None
+                        )
+                        if verify_lens_cpu is None:
+                            verify_lens_cpu = layout.verify_lens.to("cpu").tolist()
+                            forward_batch._hisparse_verify_lens_cpu = verify_lens_cpu
+
+            # Host pages are allocated in advance. A positive host address for
+            # an uncommitted C4 row does not establish that its KV is valid.
+            # Exclude writer pages from persistent cache admission as well as IO.
+            writer_mask = hisparse_coordinator.dspark_scratch_mask(
+                c4_sparse_page_indices
+            )
+            history = raw_indices
+            if writer_mask is not None:
+                history = raw_indices.masked_fill(writer_mask, -1)
+                writer_locs = (
+                    token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
+                        c4_sparse_page_indices
+                    ).to(torch.int32)
+                )
             compress_layer_id = token_to_kv_pool.layer_mapping[
                 c4_indexer.layer_id
             ].compress_layer_id
-            logical_indices = c4_sparse_page_indices.clone()
-            speculative_device_locs = (
-                token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
-                    logical_indices
-                ).to(torch.int32)
-            )
             swapped_locs = hisparse_coordinator.swap_in_selected_pages_spec(
                 req_pool_indices=forward_batch.req_pool_indices,
                 compressed_seq_lens=indexer_metadata.c4_seq_lens,
-                top_k_result=raw_indices,
+                top_k_result=history,
                 layer_id=compress_layer_id,
-                verify_lens_cpu=None,
+                verify_lens_cpu=verify_lens_cpu,
                 output_buffer=c4_sparse_page_indices,
             )
             core_metadata.c4_sparse_page_indices = (
-                hisparse_coordinator.select_dspark_scratch_locs(
-                    logical_indices,
-                    swapped_locs,
-                    speculative_device_locs,
+                torch.where(writer_mask, writer_locs, swapped_locs)
+                if writer_mask is not None
+                else swapped_locs
+            )
+        elif hisparse_decode:
+            compress_layer_id = token_to_kv_pool.layer_mapping[
+                c4_indexer.layer_id
+            ].compress_layer_id
+            core_metadata.c4_sparse_page_indices = (
+                hisparse_coordinator.swap_in_selected_pages(
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                    top_k_result=raw_indices,
+                    layer_id=compress_layer_id,
+                    prefetch_candidates=prefetch_candidates,
+                    req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
+                    committed_lens_cpu=forward_batch.seq_lens_cpu,
+                    defer_previous_prefetch=forward_batch.is_previous_graph_capture,
                 )
             )
         elif hisparse_coordinator is not None:
-            if hisparse_decode or hisparse_verify:
-                compress_layer_id = token_to_kv_pool.layer_mapping[
-                    c4_indexer.layer_id
-                ].compress_layer_id
-                if hisparse_verify:
-                    from sglang.srt.speculative.ragged_verify import (
-                        resolve_ragged_verify_layout,
-                    )
-
-                    layout = resolve_ragged_verify_layout(forward_batch)
-                    verify_lens_cpu = None
-                    if layout is not None:
-                        verify_lens_cpu = layout.verify_lens_cpu
-                        if verify_lens_cpu is None:
-                            # CUDA graphs are disabled for this combination, so
-                            # materializing device-only ragged geometry here is
-                            # safe and prevents [1,3] from being guessed as [2,2].
-                            verify_lens_cpu = getattr(
-                                forward_batch, "_hisparse_verify_lens_cpu", None
-                            )
-                            if verify_lens_cpu is None:
-                                verify_lens_cpu = layout.verify_lens.to("cpu").tolist()
-                                forward_batch._hisparse_verify_lens_cpu = (
-                                    verify_lens_cpu
-                                )
-                    # swap_in_selected_pages_spec writes device locations into
-                    # its output buffer. Preserve the compressed logical C4
-                    # locations for the transaction-validity lookup below.
-                    logical_c4_sparse_page_indices = c4_sparse_page_indices.clone()
-                    speculative_device_locs = (
-                        token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
-                            logical_c4_sparse_page_indices
-                        ).to(torch.int32)
-                    )
-                    swapped_locs = hisparse_coordinator.swap_in_selected_pages_spec(
-                        req_pool_indices=forward_batch.req_pool_indices,
-                        compressed_seq_lens=indexer_metadata.c4_seq_lens,
-                        top_k_result=raw_indices,
-                        layer_id=compress_layer_id,
-                        verify_lens_cpu=verify_lens_cpu,
-                        output_buffer=c4_sparse_page_indices,
-                    )
-                    # Host misses for current verify C4 rows resolve through the
-                    # transaction's scratch mapping rather than becoming -1.
-                    core_metadata.c4_sparse_page_indices = (
-                        hisparse_coordinator.select_dspark_scratch_locs(
-                            logical_c4_sparse_page_indices,
-                            swapped_locs,
-                            speculative_device_locs,
-                        )
-                    )
-                else:
-                    core_metadata.c4_sparse_page_indices = (
-                        hisparse_coordinator.swap_in_selected_pages(
-                            req_pool_indices=forward_batch.req_pool_indices,
-                            compressed_seq_lens=indexer_metadata.c4_seq_lens,
-                            top_k_result=raw_indices,
-                            layer_id=compress_layer_id,
-                            prefetch_candidates=prefetch_candidates,
-                            req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
-                            committed_lens_cpu=forward_batch.seq_lens_cpu,
-                            defer_previous_prefetch=(
-                                forward_batch.is_previous_graph_capture
-                            ),
-                        )
-                    )
-            else:
-                # flash_mla C4 attention requires int32 page indices.
-                core_metadata.c4_sparse_page_indices = (
-                    token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
-                        core_metadata.c4_sparse_page_indices
-                    ).to(torch.int32)
-                )
+            core_metadata.c4_sparse_page_indices = (
+                token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
+                    core_metadata.c4_sparse_page_indices
+                ).to(torch.int32)
+            )
 
         if capture_enabled:
             compress_layer_id = token_to_kv_pool.layer_mapping[

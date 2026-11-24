@@ -1,0 +1,9 @@
+{
+  "w": 3,
+  "top_k": 512,
+  "device_buffer_size": 2048,
+  "env": {
+    "LD_LIBRARY_PATH": "/usr/local/cuda-13.0/lib64",
+    "MC_FORCE_TCP": "1"
+  }
+}

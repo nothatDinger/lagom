@@ -441,3 +441,109 @@ def test_timestamp_ring_survives_independent_graph_replays(tmp_path):
     assert [s["target.kv_refill_entries"] for s in data["summary"]] == [1, 2]
     assert [s["target.kv_stage_copy_entries"] for s in data["summary"]] == [2, 2]
     assert [s["target.kv_prefetch_entries"] for s in data["summary"]] == [7, 8]
+
+
+def test_compare_matched_fused_steps_counts_payload_and_committed_tokens(tmp_path):
+    analysis = module("h2d_trace")
+    gather, reread, commit = analysis.PHASES
+    reports = []
+    for force in (False, True):
+        folder = tmp_path / str(force)
+        (folder / "steps").mkdir(parents=True)
+        cell = dict(
+            input_len=32768,
+            trace_batch_size=2,
+            trace_steps=2,
+            force_h2d_each_step=force,
+        )
+        for rank in range(4):
+            records = [
+                dict(
+                    step=i,
+                    batch_size=2,
+                    cuda_graph=True,
+                    draft_cuda_graph=True,
+                    accepted_tokens=[2, 3],
+                    prefix_lens=[32768, 32770],
+                )
+                for i in range(2)
+            ]
+            rows = [
+                {
+                    "step": i,
+                    "step_ms": 24 if force else 20,
+                    gather + "_ms": 2,
+                    reread + "_ms": 5 if force else 1,
+                    commit + "_ms": 3,
+                    gather + "_entries": 4,
+                    reread + "_entries": 7 if force else 0,
+                    commit + "_entries": 2,
+                    reread + "_resident_hits": 7,
+                    commit + "_admissions": 6,
+                }
+                for i in range(2)
+            ]
+            (folder / "steps" / f"rank-{rank}.json").write_text(
+                json.dumps(dict(rank=rank, records=records, summary=rows))
+            )
+        reports.append(analysis.read_cell(folder, cell))
+    assert reports[0]["ranks"]["0"]["decode_tpot_ms"] == 8
+    result = analysis.compare_cells(*reports)
+    assert result["passed"]
+    assert result["ranks"]["0"]["delta"]["h2d_payload_bytes_per_step"] == 7 * 584
+    reports[1]["ranks"]["1"].update(step_ms=19, admissions=1)
+    assert not analysis.compare_cells(*reports)["passed"]
+    (folder / "steps/rank-3.json").unlink()
+    with pytest.raises(ValueError, match="four complete"):
+        analysis.read_cell(folder, cell)
+
+
+def test_nsys_step_uses_gpu_edges_and_keeps_api_and_overlaps_separate(tmp_path):
+    path = tmp_path / "report.sqlite"
+    pid, tid = 17 << 24, (17 << 24) + 5
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE NVTX_EVENTS(start,end,globalTid,text)")
+        db.executemany(
+            "INSERT INTO NVTX_EVENTS VALUES(?,?,?,?)",
+            [
+                (0, 30, tid, "lagom/step/step=0/layer=None"),
+                (1, 5, tid, "lagom/step_begin/step=0"),
+                (25, 29, tid, "lagom/step_end/step=0"),
+            ],
+        )
+        db.execute(
+            "CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME(start,end,globalTid,correlationId)"
+        )
+        db.executemany(
+            "INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES(?,?,?,?)",
+            [(2, 4, tid, 1), (7, 12, tid, 2), (26, 28, tid, 3)],
+        )
+        db.execute(
+            "CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL(start,end,globalPid,correlationId,deviceId)"
+        )
+        db.executemany(
+            "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES(?,?,?,?,4)",
+            [
+                (98, 100, pid, 1),
+                (110, 150, pid, 2),
+                (200, 202, pid, 3),
+                (100, 200, pid + 1, 2),
+            ],
+        )
+        db.execute(
+            "CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY(start,end,globalPid,deviceId,copyKind,bytes)"
+        )
+        db.execute(
+            "INSERT INTO CUPTI_ACTIVITY_KIND_MEMCPY VALUES(130,160,?,4,1,584)", (pid,)
+        )
+    (row,) = nsys.step_breakdown(path)
+    for name, ns in dict(
+        gpu_step_ms=100,
+        kernel_only_ms=20,
+        explicit_h2d_only_ms=10,
+        gpu_overlap_ms=20,
+        gpu_idle_ms=50,
+        cpu_cuda_api_union_ms=9,
+    ).items():
+        assert row[name] == pytest.approx(ns / 1e6)
+    assert row["explicit_h2d_bytes"] == 584

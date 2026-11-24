@@ -332,6 +332,7 @@ template <
     bool IsDsv4Layout,
     bool RecordMissPlan,
     bool SkipIO,
+    bool RereadHits,
     typename SeqLensT,
     typename ReqPoolIndicesT>
 __global__ void load_cache_to_device_buffer_kernel(
@@ -693,6 +694,29 @@ __global__ void load_cache_to_device_buffer_kernel(
 #endif
   }
 
+  // Reuse the actual hit list. Newest/provisional entries and short requests
+  // never reach this loop. Shared-index layers replay exactly the same copies.
+  if constexpr (RereadHits && !SkipIO) {
+    if constexpr (RecordMissPlan) __syncthreads();  // Publish the initial miss count before appending hit copies.
+    for (int i = warp_id; i < s_total_hits; i += NUM_WARPS) {
+      const int slot = s_lru_slots_out[i];
+      const int token = req_device_buffer_tokens[slot];
+      const int64_t src = req_host_cache_locs[token];
+      const int32_t dst = req_device_buffer_locs[slot];
+      if (src >= 0 && dst >= 0) {
+        if constexpr (RecordMissPlan) {
+          if (lane_id == 0) {
+            const int i = atomicAdd(miss_count_out + bid, 1);
+            miss_src_out[bid * plan_stride + i] = src;
+            miss_dst_out[bid * plan_stride + i] = dst;
+          }
+        }
+        copy_miss_item<IsMLA, IsDsv4Layout>(
+            lane_id, host_cache_k, host_cache_v, device_buffer_k, device_buffer_v, src, dst, item_size_bytes);
+      }
+    }
+  }
+
   // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
   if constexpr (!SkipIO) {
     for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
@@ -715,7 +739,8 @@ template <
     bool IsMLA,
     bool IsDsv4Layout,
     bool RecordMissPlan,
-    bool SkipIO>
+    bool SkipIO,
+    bool RereadHits = false>
 void load_cache_to_device_buffer(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -805,6 +830,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            RereadHits,
             int64_t,
             int64_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()),
@@ -819,6 +845,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            RereadHits,
             int64_t,
             int32_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()),
@@ -833,6 +860,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            RereadHits,
             int32_t,
             int64_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),
@@ -847,6 +875,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            RereadHits,
             int32_t,
             int32_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),

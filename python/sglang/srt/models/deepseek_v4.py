@@ -159,6 +159,7 @@ if not _is_hip:
         prepare_context_parallel_metadata,
     )
 
+from sglang.srt.observability.lagom_perf import timed
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -1384,6 +1385,7 @@ class MQALayer(MqaAttentionBase):
 
         return q, kv
 
+    @timed("attention_block", layer=True)
     def forward(
         self,
         x: torch.Tensor,
@@ -2031,6 +2033,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # cross-layer fusion, and the final layer is completed in DeepseekV4Model.
         return hidden_states, residual, post, comb
 
+    @timed("mlp", layer=True)
     def _run_moe_ffn_dp_sync(
         self,
         hidden_states: torch.Tensor,

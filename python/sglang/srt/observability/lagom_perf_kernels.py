@@ -69,3 +69,25 @@ def count_forecast_copies(
         tl.atomic_add(
             buffer + region * steps + step, tl.sum(rows, 0), sem="relaxed"
         )
+
+
+@triton.jit(do_not_specialize=["gather", "reread", "commit"])
+def store_swap_in_counts(
+    entries,
+    cache_work,
+    slot,
+    counts,
+    steps: tl.constexpr,
+    gather,
+    reread,
+    commit,
+    force: tl.constexpr,
+):
+    step = tl.load(slot)
+    if (step >= 0) & (step < steps):
+        hits = tl.load(counts + 1)
+        tl.store(entries + gather * steps + step, tl.load(counts))
+        tl.store(entries + reread * steps + step, hits if force else 0)
+        tl.store(entries + commit * steps + step, tl.load(counts + 2))
+        tl.store(cache_work + reread * steps + step, hits)
+        tl.store(cache_work + commit * steps + step, tl.load(counts + 3))

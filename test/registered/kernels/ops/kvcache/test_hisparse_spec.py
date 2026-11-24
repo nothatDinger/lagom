@@ -135,3 +135,107 @@ def test_forced_cold_windows_preserve_kv_and_owned_allocation(
         assert (tokens[:, 1] == 71).all()
         assert (output_cpu[3] == 0).all()  # Pinned PR padded-row sentinel.
         assert output.data_ptr() == output_ptr
+
+
+@pytest.mark.parametrize("graph_replay", [False, True])
+def test_reread_changes_only_backed_long_hits_and_preserves_commit(
+    monkeypatch, graph_replay
+):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from sglang.kernels.ops.kvcache import hisparse_spec as ops
+
+    # A long request, a short resident request, and a padded replay row.
+    # Token 5 has an authoritative host copy, 6 has none, 199 is active-tail
+    # KV. Duplicates span the verify rows. Token 160 is the sole true miss.
+    hot, slots, host_rows = 128, 3, 256
+    selected = torch.tensor(
+        [
+            [[5, 6, 160, 199], [160, 5, -1, 199]],
+            [[5, 5, -1, 5], [5, 5, 5, 5]],
+            [[5, 5, 5, 5], [5, 5, 5, 5]],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    host = torch.full(
+        (slots * host_rows // 64, PAGE_BYTES), 92, dtype=torch.uint8, pin_memory=True
+    )
+    host_locs = torch.arange(slots * host_rows, device="cuda").reshape(slots, host_rows)
+    host_locs[0, 6] = -1
+    reqs = torch.arange(slots, device="cuda")
+    real = torch.tensor([2], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([200, 200, 8, 8, 200, 200], dtype=torch.int32, device="cuda")
+    states = []
+    for force in (False, True):
+        locs = torch.arange(slots * 192, dtype=torch.int32, device="cuda").reshape(
+            1, slots, 192
+        )
+        tokens = torch.full_like(locs, -1)
+        tokens[:, :, 5], tokens[:, :, 6], tokens[:, :, hot] = 5, 6, 199
+        state = allocate_hisparse_spec_states(
+            HiSparseSpecLayout(hot, 2, 4), device_buffer_locs=locs, scratch_offset=131
+        )[0]
+        initialize_hisparse_spec_state(
+            device_buffer_tokens=tokens[0], req_pool_indices=reqs, state=state
+        )
+        device = torch.full(
+            (slots * 3, PAGE_BYTES), 13, dtype=torch.uint8, device="cuda"
+        )
+        out = torch.empty_like(selected)
+        counters = []
+        trace = SimpleNamespace(
+            region=lambda *a, **kw: nullcontext(),
+            record_swap_in=lambda l, n, c, f: counters.append(c),
+        )
+        monkeypatch.setattr(ops, "get_trace", lambda: trace)
+
+        def forward():
+            load_cache_to_device_buffer_spec_mla(
+                top_k_tokens=selected,
+                device_buffer_tokens=tokens[0, :, :131],
+                host_cache_locs=host_locs,
+                device_buffer_locs=locs[0, :, :131],
+                host_cache=host,
+                device_buffer=device,
+                top_k_device_locs=out,
+                req_pool_indices=reqs,
+                seq_lens=lengths,
+                state=state,
+                num_real_reqs=real,
+                transfer_kind="dsv4_paged",
+                trace_layer=0,
+                force_h2d_each_step=force,
+            )
+
+        forward()
+        assert counters[-1].tolist() == [1, 1, 0, 1]
+        if graph_replay:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                forward()
+            graph.replay()
+        else:
+            forward()
+        assert counters[-1].tolist() == [0, 2, 0, 0]
+        device_cpu = device.cpu()
+        assert (item(device_cpu, 5) == (92 if force else 13)).all()
+        assert (item(device_cpu, 6) == 13).all() and (item(device_cpu, hot) == 13).all()
+        assert (item(device_cpu, 192 + 5) == 13).all() and (device_cpu[6:] == 13).all()
+        assert (item(device_cpu, out[0, 0, 2].item()) == 92).all()
+        states.append(
+            [
+                x.cpu()
+                for x in (
+                    tokens,
+                    locs,
+                    out,
+                    state.cache_index,
+                    state.cache_policy,
+                    state.scratch_state,
+                )
+            ]
+        )
+    for baseline, forced in zip(*states):
+        torch.testing.assert_close(baseline, forced)
