@@ -1,50 +1,38 @@
-# Standalone fused HiSparse swap-in
+# DeepSeek-V4 / DSPARK KV verification
 
-`swapin_oneshot` starts directly at `heykon_main@aaff55ab6`, the parent of
-`perf/hisparse-h2d-diagnosis`'s first exclusive commit (`881a02074`).
+The C4 resolver on `perf/swapin_oneshot` follows the target KV rules in sections 3.1–3.4 of *Adaptive DHiSparse*. The implementation builds on the standalone fused swap-in in `swapin_oneshot@8948c57fb` and adapts the KV code in `DHisparse@1ad6ad8db` to the existing DSPARK, PD and H2D measurement paths. [Paper](https://arxiv.org/html/2610.13708v1#S3)
 
-DeepSeek-V4 speculative swap-in uses `pr_fused` directly. There is no
-`SGLANG_HISPARSE_VERIFY_IMPL` selector or split implementation in this branch.
-The gather/commit pair updates the complete verify window's hash/CLOCK state,
-deduplicates misses, and transfers KV. Single-token fallback uses the same state.
+| Mechanism | Original `swapin_oneshot` | Current CUDA V4 / DSPARK path |
+|---|---|---|
+| Persistent hot capacity `B` | Default `2 × verify_width × top_k`. The whole union had to fit in hot and within 8192 entries. | Explicit page-aligned `B` survives width changes. The default of `16 × model.index_topk` adopts the paper's V4.1 ratio as a starting point for this model. |
+| Verification arena | The extra page shared space with the frontier and rotating scratch. | An owned payload slab has a separate, page-rounded slice of `Kmax × top_k` rows for each active batch row and simultaneously live source. Sequential V4 C4 attention layers share one physical arena. PD transfer slots have persistent request metadata and consume arena space only while active. |
+| Resolution and promotion | The fused gather/commit pair could rotate physical hot slots before attention. | Resolve tail and ready optional history first, then hot and host. Deduplicate misses across valid queries by first occurrence and preserve selection order. Attention reads the resulting addresses. After that read, unselected LRU victims receive arena-to-hot copies at stable addresses. Overflow expires when the next source reuses the arena. |
+| Import and pressure | PD imports C4 to pinned host. Local prefill eagerly backs up its history. | Retain complete local prefill pages while capacity allows and back up the partial boundary. PD keeps its Mooncake host receive, and can populate complete spare GPU pages at admission. Publish copies after completion. Whole-request reclaim waits for backup and readers, preserves the reserve, and bounded round-robin refill repopulates backed history. |
+| Provisional writes | A separate fixed writer scratch and mapping covered the current DSPARK block. | A protected per-request tail holds the frontier and provisional C4 rows. Query visibility uses the actual number of completed compressed rows, including zero. An accepted prefix commits exactly the C4 boundaries in `[floor(prefix/4), floor((prefix+commit_len)/4))`. The next forward computes the bonus token's KV. |
+| Force-H2D control | The performance branch added an optional reread of resident hits to the original fused kernel. | Both arms use the same resolver, attention addresses, LRU and admissions. The forced arm rereads each eligible host-backed hot hit once into an unused occurrence in the arena. The trace counts native H2D, additional H2D and D2D admissions separately. |
 
-The extracted kernel is the PR #40670 implementation pinned at `70bc9e9a`, with
-the CAS retry correction from `cbaea63b2`. It was connected to serving in
-`3f9ff3a49`. The performance harness uses the original gather and commit launches
-with an optional reread of host-backed resident hits between them.
+For example, the paired PD run uses `Kmax=6`, `k=512` and `B=2048`. At 256 active requests, the single live C4 arena holds 786,432 rows per decode rank. That is 438 MiB of KV payload, or 438.75 MiB with the 64-row packed page pitch. Hot, tail and metadata have their own budgets. The original hash/CLOCK path is available with `"adaptive": false`. [PD configuration and trace interpretation](../../../../../benchmark/lagom/README.md)
 
-Fused swap-in requires CUDA DSv4 speculative verify, real KV IO, an unnamed
-prefetch configuration and `verify_width * effective_top_k <= min(hot, 8192)`.
-Short prefixes fit in the preloaded hot buffer. Both force-H2D settings use the
-same cache state and victim selection. See the [paired PD experiment](../../../../../benchmark/lagom/README.md).
-For DSPARK, the hot buffer defaults to `2 * verify_width * effective_top_k`,
-including force-H2D mode (width 6 and effective Top-K 512 default to 6144 C4
-entries). Explicit buffer sizes are preserved if they can hold one complete
-verify window. The forced arm refreshes eligible hits in their existing slots.
-The canonical tail and provisional C4 placeholders remain fixed. Remaining slots
-in each request's existing allocation provide rotating KV scratch; separate
-coordinator-owned C4 writer scratch, accepted-token commit and rollback retain
-the parent branch's implementation. Hash/CLOCK metadata is budgeted before KV
-pool allocation. No backend environment variable is required.
+## Model and transport differences
 
-Run CPU regression checks from the repository root:
+| Implementation | KV source and draft layout |
+|---|---|
+| Paper, DeepSeek-V4.1-Flash / DSpark | Eight selecting layers read four physical KV sources. Reuse consumers inherit the materialized selection, and Reindex consumers resolve new selections against the shared source. A missed row carries 288 bytes. The evaluated hot budget is `16 × 512 = 8192` rows. |
+| This branch, DeepSeek-V4 / DSPARK | Each C4 layer owns its payload and hot state. The packed row carries 576 value/RoPE bytes and 8 scale bytes. Each source finishes its attention and promotion before the next C4 layer resolves. DSPARK uses its existing SWA draft storage and PD transfer layout. |
+| Paper, GLM-5.3 / DFlash2 | 21 index producers supply selections to 78 distinct payload layers. Overlapping follower reads require separate arenas. The evaluated budget is `2 × 2048 = 4096` rows. With window 2048, page 64 and maximum verification width 8, the separate draft ring holds 2176 rows per request under equation 9. |
+
+Optional history in this branch borrows dedicated C4 payload pages. The V4 index pool uses a different row format and its logical pages are registered independently with Mooncake. Lending index backing would require coordinating those allocations and resolving the resulting payload addresses. GPU-first RDMA placement would also require per-request receive destinations. These differences affect residency and transfer cost when comparing to the paper. [Paper architecture](https://arxiv.org/html/2610.13708v1#S3) · [Paper cache-budget comparison](https://arxiv.org/html/2610.13708v1#S4.SS3)
+
+## Tests
+
+From the repository root, with the project uv environment active:
 
 ```bash
-PYTHONPATH=python python -m pytest -q \
-  test/registered/unit/mem_cache/test_hisparse_spec_swapin.py \
+uv run --active --no-project python -m pytest -q \
+  test/registered/unit/mem_cache/test_dhisparse.py \
   test/registered/unit/managers/test_hisparse_dspark.py \
-  test/registered/unit/managers/test_hisparse_eagle.py \
-  test/registered/unit/test_hisparse_prefetcher.py
+  test/registered/unit/mem_cache/test_hisparse_spec_swapin.py \
+  benchmark/lagom
 ```
 
-On a CUDA machine, also run the KV-content and graph-replay tests:
-
-```bash
-PYTHONPATH=python python -m pytest -q \
-  test/registered/kernels/ops/kvcache/test_hisparse_spec.py
-```
-
-The CUDA tests exercise non-monotonic request IDs, padding, duplicate and invalid
-selections, scratch overflow, repeated forced-cold rotations, all 584 KV bytes,
-preservation of the request's allocation set and canonical/provisional slots,
-and CUDA graph replay. A skipped CUDA suite is not a CUDA correctness pass.
+On NVIDIA hardware, add `test/registered/kernels/ops/kvcache/test_dhisparse_cuda.py` and `test/registered/kernels/ops/kvcache/test_hisparse_spec.py`. The adaptive GPU suite checks packed values and scales in eager execution and CUDA Graph replay with reordered requests, padding, warm hits and union overflow.

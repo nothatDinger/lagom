@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.mem_cache.dhisparse import DHiSparseConfig
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import BackendAdaptor
@@ -69,6 +70,7 @@ class SparseConfig:
     sparse_extra_config: dict = field(
         default_factory=dict
     )  # Algorithm-specific config, parsed by each algorithm
+    dhisparse: DHiSparseConfig = field(default_factory=DHiSparseConfig)
 
 
 class SparseCoordinator:

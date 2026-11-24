@@ -757,6 +757,8 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         finally:
             if hisparse_window is not None and not hisparse_committed:
+                if getattr(hisparse_coordinator, "adaptive", None) is not None:
+                    hisparse_coordinator.adaptive.abort_forward()
                 # prepare mutates the global C4 mapping. Any failure in target
                 # forward, grammar, acceptance, logprob, or commit must restore
                 # it before the scheduler can continue or retract the request.

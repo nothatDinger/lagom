@@ -19,7 +19,7 @@ import urllib.request
 from contextlib import ExitStack
 from pathlib import Path
 
-from analyze_nsys import FUSED, compare_kernel_windows, export_report, step_report
+from analyze_nsys import compare_kernel_windows, export_report, step_report
 from h2d_trace import compare_cells, read_cell
 from longbench_v2_fixed import load_manifest
 
@@ -93,10 +93,16 @@ def load_config(path):
     if not 0 < cfg["mem_fraction_static"] < 1 or cfg["host_to_device_ratio"] <= 0:
         raise ValueError("Invalid memory settings")
     hot = cfg["device_buffer_size"]
-    if hot % 64 or not 64 <= hot <= 32768:
-        raise ValueError("device_buffer_size must be a multiple of 64 in [64,32768]")
-    if hot < cfg["top_k"]:
-        raise ValueError("device_buffer_size must hold at least index_topk entries")
+    if cfg["page_size"] != 256 or hot % 64:
+        raise ValueError(
+            "Packed V4 requires 256-token pages and a hot cache aligned to 64 C4 rows"
+        )
+    if (
+        type(cfg["resident_first"]) is not bool
+        or type(cfg["refill_pages_per_step"]) is not int
+        or cfg["refill_pages_per_step"] < 0
+    ):
+        raise ValueError("Invalid optional history admission/refill policy")
     if cfg["decode_extra_slots"] < 0:
         raise ValueError("decode_extra_slots must be nonnegative")
     gpu_sets = [set(range(cfg[k], cfg[k] + 4)) for k in ("prefill_base_gpu", "decode_base_gpu")]
@@ -152,6 +158,10 @@ def commands(cfg, cell, data_dir, folder):
     method, length, concurrency = (
         cell["method"], cell["input_len"], cell["max_concurrency"]
     )
+    if method != "dhisparse" and not cfg["top_k"] <= cfg["device_buffer_size"] <= 32768:
+        raise ValueError(
+            "Legacy HiSparse requires top_k <= device_buffer_size <= 32768"
+        )
     if method == "lagom" and (cfg["w"] + cfg["p"] + 1) * cfg["top_k"] > 8192:
         raise ValueError(
             "Require (W+P+1)*index_topk <= verification staging capacity 8192"
@@ -203,6 +213,12 @@ def commands(cfg, cell, data_dir, folder):
                 "host_to_device_ratio": cfg["host_to_device_ratio"],
                 "force_h2d_each_step": cell.get("force_h2d_each_step", False),
             }
+            if method == "dhisparse":
+                hisparse.update(
+                    adaptive=True,
+                    resident_first=cfg["resident_first"],
+                    refill_pages_per_step=cfg["refill_pages_per_step"],
+                )
             if method == "lagom":
                 hisparse.update(
                     prefetcher="lagom", prefetcher_config={
@@ -318,7 +334,7 @@ def source_preflight():
     for name, callee in (
         ("swap_in_selected_pages_spec", "_run_swap_in_verify_window"),
         ("_run_swap_in_kernel", "_run_swap_in_verify_window"),
-        ("_run_swap_in_verify_window", "load_cache_to_device_buffer_spec_mla"),
+        ("_run_swap_in_verify_window", "resolve"),
     ):
         matches = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name]
         ok = any(
@@ -425,6 +441,16 @@ def validate_server_info(info, cfg, cell, role):
             raise ValueError(
                 "Resolved force_h2d_each_step differs from the requested arm"
             )
+        if cell["method"] == "dhisparse":
+            for key, expected_value in (
+                ("adaptive", True),
+                ("resident_first", cfg["resident_first"]),
+                ("refill_pages_per_step", cfg["refill_pages_per_step"]),
+            ):
+                if hs.get(key) != expected_value:
+                    raise ValueError(
+                        f"Resolved HiSparse {key} differs from the requested policy"
+                    )
         if cell["method"] == "lagom":
             if hs.get("prefetcher") != "lagom" or hs.get("prefetcher_config", {}).get("prediction_steps") != cfg["p"]:
                 raise ValueError("Lagom prefetch did not resolve with the requested P")
@@ -698,7 +724,11 @@ def run_cell(cfg, cell, data_dir, folder):
                 database,
                 ranks_by_pid=ranks_by_pid,
                 steps=cell["trace_steps"],
-                required_families=FUSED.values(),
+                required_families=(
+                    {"swap_in_gather", "swap_in_commit", "swap_in_reread"}
+                    if cell.get("force_h2d_each_step")
+                    else {"swap_in_gather", "swap_in_commit"}
+                ),
             )
             save(folder / "nsys-steps.json", report["decode_steps"])
             save(folder / "nsys-kernels.json", report["kernel_attribution"])
@@ -815,12 +845,6 @@ def main():
         args.config
         or HERE / ("h2d.example.json" if args.h2d_pair else "overall.example.json")
     )
-    if "dhisparse" in args.methods and (cfg["w"] + 1) * cfg["top_k"] > min(
-        8192, cfg["device_buffer_size"]
-    ):
-        parser.error(
-            "Fused swap-in requires (W + 1) * top_k <= min(8192, device_buffer_size)"
-        )
     data_dir, output = (args.sharegpt or args.data_dir).resolve(), args.output.resolve()
     cells = matrix(args.methods, args.input_lens, args.concurrencies)
     if args.graph_bs_cap is not None:

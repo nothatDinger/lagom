@@ -83,11 +83,28 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     prefetcher_config = extra_config.pop("prefetcher_config", {})
     force_h2d_each_step = extra_config.pop("force_h2d_each_step", False)
 
+    from sglang.srt.mem_cache.dhisparse import DHiSparseConfig
+
+    adaptive = DHiSparseConfig(
+        enabled=extra_config.pop(
+            "adaptive",
+            prefetcher is None
+            and getattr(server_args, "speculative_algorithm", "DSPARK") == "DSPARK",
+        ),
+        admission_reserve_pages=extra_config.pop("admission_reserve_pages", 1),
+        refill_pages_per_step=extra_config.pop("refill_pages_per_step", 16),
+        resident_first=extra_config.pop("resident_first", True),
+    )
+    if adaptive.enabled and prefetcher is not None:
+        raise ValueError("Named HiSparse prefetchers require adaptive=false")
+    # V4 uses the model's index_topk. An omitted CLI top_k is only a fallback.
     if not isinstance(force_h2d_each_step, bool):
         raise ValueError(
             f"force_h2d_each_step must be a boolean, got {force_h2d_each_step!r}"
         )
-    if device_buffer_size < top_k:
+    if type(device_buffer_size) is not int or device_buffer_size <= 0:
+        raise ValueError("device_buffer_size must be a positive integer")
+    if device_buffer_size < top_k and not adaptive.enabled:
         raise ValueError(
             f"device_buffer_size ({device_buffer_size}) must be no smaller than top_k ({top_k})"
         )
@@ -122,6 +139,7 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         prefetcher=prefetcher,
         prefetcher_config=prefetcher_config,
         force_h2d_each_step=force_h2d_each_step,
+        dhisparse=adaptive,
         sparse_extra_config=extra_config,
     )
 
@@ -137,27 +155,27 @@ def resolve_dspark_device_buffer_size(
     raw_hisparse_config: Optional[str],
     verify_width: int,
     effective_top_k: int,
+    adaptive: Optional[bool] = None,
 ) -> SparseConfig:
-    """Size DSPARK's resident C4 set for every row in one verify window.
-
-    Target verify computes attention for all rows after swap-in planning.  In the
-    worst case their Top-K sets are disjoint, so every returned device location
-    remains stable only when the resident buffer can hold ``verify_width * K``.
-    An omitted device_buffer_size defaults to twice that bound, using the
-    model's effective Top-K. Explicit values are preserved if they can hold
-    one complete window. Force-H2D only invalidates residency; it does not
-    change the configured buffer capacity.
-    """
+    """Use a per-query hot budget with independent staging, or size legacy fused hot for the window."""
     if verify_width <= 0 or effective_top_k <= 0:
         raise ValueError(
             "DSPARK HiSparse verify_width and effective_top_k must be positive, "
             f"got verify_width={verify_width}, effective_top_k={effective_top_k}"
         )
-    required = verify_width * effective_top_k
     explicit_device_buffer_size = (
         raw_hisparse_config is not None
         and "device_buffer_size" in json.loads(raw_hisparse_config)
     )
+    if adaptive is None:
+        adaptive = config.dhisparse.enabled
+    if adaptive:
+        # Use the V4.1-Flash ratio in the paper as the V4 starting point. Any
+        # explicit page-aligned B is independent of both top-k and verify width.
+        if not explicit_device_buffer_size:
+            config.device_buffer_size = 16 * effective_top_k
+        return config
+    required = verify_width * effective_top_k
     if explicit_device_buffer_size and config.device_buffer_size < required:
         raise ValueError(
             "HiSparse + DSPARK requires device_buffer_size >= verify_width * "

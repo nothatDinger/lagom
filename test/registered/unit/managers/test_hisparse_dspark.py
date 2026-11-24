@@ -360,3 +360,66 @@ def test_dspark_swap_in_rejects_inconsistent_sequence_length_geometry():
             top_k_result=torch.zeros((4, 2), dtype=torch.int64),
             layer_id=3,
         )
+
+
+@pytest.mark.parametrize("commit", [False, True])
+def test_adaptive_tail_preserves_rejected_and_bonus_c4_boundaries(monkeypatch, commit):
+    from sglang.srt.managers import hisparse_coordinator as module
+
+    c = module.HiSparseCoordinator.__new__(module.HiSparseCoordinator)
+    c.device, c.is_dsv4_hisparse, c.compress_ratio = "cpu", True, 4
+    c.adaptive, c.device_buffer_size, c.padded_buffer_size = object(), 4, 8
+    c._active_dspark_window, c._has_pending_dspark_commit = None, False
+    c._dspark_commit_done_event = MagicMock()
+    c._dspark_scratch_device_locs = None
+    c._dspark_scratch_compressed_locs = torch.full((12,), -1)
+    c._dspark_scratch_valid_mapping = torch.zeros(18, dtype=torch.bool)
+    token_table = torch.arange(4 * 16).reshape(4, 16)
+    c.req_to_token_pool = SimpleNamespace(req_to_token=token_table)
+    c.req_to_device_buffer = torch.arange(4 * 8).reshape(4, 8)
+    c.req_device_buffer_tokens = torch.full((1, 4, 8), -1, dtype=torch.int32)
+    mapping = torch.full((18,), 11, dtype=torch.int64)
+    c.mem_pool_device = SimpleNamespace(
+        full_to_hisparse_device_index_mapping=mapping,
+        translate_loc_from_full_to_compressed=lambda ids: ids // 4,
+    )
+    c.req_to_host_pool = torch.arange(32).view(4, 8)
+    c.req_to_host_pool_allocated_len = torch.full((4,), 8)
+    c.mem_pool_host = SimpleNamespace(
+        data_ptrs=1,
+        device_ptrs=2,
+        alloc_paged_token_slots=lambda table, _lens, rid, pos, count: table[
+            rid, pos : pos + count
+        ],
+    )
+    stream = MagicMock()
+    monkeypatch.setattr(
+        module, "device_module", SimpleNamespace(current_stream=lambda: stream)
+    )
+    received = []
+    monkeypatch.setattr(
+        module, "transfer_cache_dsv4_mla", lambda **kwargs: received.append(kwargs)
+    )
+    reqs, prefix = torch.tensor([3, 1]), torch.tensor([3, 7])
+    window = c.prepare_dspark_verify_window(
+        req_pool_indices=reqs,
+        prefix_lens=prefix,
+        verify_width=6,
+        req_pool_indices_cpu=reqs,
+        prefix_lens_cpu=prefix,
+    )
+    assert window.c4_positions == [0, 1, 1, 2]
+    assert window.device_locs.tolist() == [29, 30, 13, 14]
+    assert c.req_device_buffer_tokens[0, 3, 5:7].tolist() == [0, 1]
+    assert torch.equal(mapping[window.compressed_locs], window.device_locs)
+    if commit:
+        c.commit_dspark_verify_window(window, torch.tensor([1, 5]))
+        # Prefix 3 + anchor crosses C4 0, prefix 7 + five computed tokens crosses C4 1 and 2.
+        assert received[0]["src_indices"].tolist() == [29, 13, 14]
+        assert received[1]["dst_indices"].tolist() == [28, 12]
+        assert c.req_device_buffer_tokens[0, reqs, 4].tolist() == [0, 2]
+    else:
+        c.rollback_dspark_verify_window(window)
+        assert not received and (c.req_device_buffer_tokens[:, :, 4] == -1).all()
+    assert (mapping == 11).all() and not c._dspark_scratch_valid_mapping.any()
+    assert (c.req_device_buffer_tokens[:, :, 5:] == -1).all()

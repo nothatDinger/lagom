@@ -1060,6 +1060,56 @@ class KVCacheConfigurator:
                 )
         return token_to_kv_pool
 
+    def _dsv4_verify_pool_kwargs(self, num_requests, request_slots, context_len):
+        if not (
+            get_memory().enable_hisparse
+            and not self.is_draft_worker
+            and not (_is_npu or _is_hip)
+            and self.spec_algorithm.is_dspark()
+        ):
+            return {}
+        from sglang.srt.mem_cache.dhisparse import VerificationLayout
+        from sglang.srt.mem_cache.sparsity import (
+            parse_hisparse_config,
+            resolve_dspark_device_buffer_size,
+        )
+
+        cfg = parse_hisparse_config(self.server_args)
+        if not cfg.dhisparse.enabled:
+            return {}
+        ratios = self.model_config.compress_ratios[
+            self.layer_info.start_layer : self.layer_info.end_layer
+        ]
+        sources = ratios.count(4)
+        if not sources:
+            return {}
+        width = (
+            self.server_args.max_speculative_num_draft_tokens
+            or self.server_args.speculative_num_draft_tokens
+        )
+        k = getattr(self.model_config.hf_text_config, "index_topk", cfg.top_k)
+        cfg = resolve_dspark_device_buffer_size(
+            cfg,
+            raw_hisparse_config=self.server_args.hisparse_config,
+            verify_width=width,
+            effective_top_k=k,
+        )
+        page = self.pool_page_size // 4
+        # Sequential C4 sources materialize their unions into the same arena.
+        return dict(
+            dhisparse_layout=VerificationLayout(
+                num_requests,
+                width,
+                k,
+                page,
+                (0,) * sources,
+                request_slots=request_slots,
+                reserve_pages=cfg.dhisparse.admission_reserve_pages,
+            ),
+            dhisparse_hot=cfg.device_buffer_size,
+            dhisparse_context=(context_len + 3) // 4 + page,
+        )
+
     def _build_dsv4_kv_pool(
         self,
         *,
@@ -1101,6 +1151,12 @@ class KVCacheConfigurator:
         else:
             pool_cls = DeepSeekV4TokenToKVPool
 
+        adaptive_pool = self._dsv4_verify_pool_kwargs(
+            max_running_requests,
+            req_to_token_pool.req_to_token.shape[0],
+            req_to_token_pool.max_context_len,
+        )
+
         token_to_kv_pool = pool_cls(
             max_num_reqs=max_running_requests,
             # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
@@ -1128,6 +1184,7 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             enable_hisparse=get_memory().enable_hisparse and not self.is_draft_worker,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
+            **({"dhisparse_pool_kwargs": adaptive_pool} if adaptive_pool else {}),
         )
         return token_to_kv_pool
 
@@ -1930,6 +1987,7 @@ class KVCacheConfigurator:
     ) -> MemoryPoolConfig:
         """Profile GPU memory and resolve all pool parameters into a config."""
         from sglang.srt.model_executor.pool_configurator import (
+            DSV4PoolConfigurator,
             create_memory_pool_configurator,
         )
 
@@ -1939,6 +1997,53 @@ class KVCacheConfigurator:
             config.max_total_num_tokens
         )
         configurator = create_memory_pool_configurator(self)
+        if (
+            isinstance(configurator, DSV4PoolConfigurator)
+            and not (_is_npu or _is_hip)
+            and get_memory().enable_hisparse
+            and not self.is_draft_worker
+            and self.spec_algorithm.is_dspark()
+            and self.server_args.max_running_requests is None
+        ):
+            maximum = config.max_running_requests
+            extra = (
+                (self.server_args.disaggregation_decode_extra_slots or 0)
+                if self.server_args.disaggregation_mode == "decode"
+                else 0
+            )
+            options = self._dsv4_verify_pool_kwargs(
+                maximum,
+                maximum + extra + 1,
+                self.model_config.context_len + get_req_to_token_extra_context_len(),
+            )
+            limit = maximum
+            if options:
+                layout = options["dhisparse_layout"]
+                limit = layout.fitting_requests(
+                    config.c4_max_total_num_tokens,
+                    layout.packed_row_bytes,
+                    options["dhisparse_hot"],
+                    options["dhisparse_context"],
+                )
+            if self.ps.pp_size > 1:
+                common = torch.tensor(limit, dtype=torch.int64, device="cpu")
+                torch.distributed.all_reduce(
+                    common,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=self.pp_group.cpu_group,
+                )
+                limit = int(common.item())
+            if not limit:
+                raise ValueError(
+                    "KV budget cannot hold one adaptive C4 request with its arena and admission reserve"
+                )
+            if limit < maximum:
+                logger.info(
+                    "Adaptive C4 memory limits max_running_requests to %d (from %d)",
+                    limit,
+                    maximum,
+                )
+                config.max_running_requests = limit
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = get_schedule().mem_fraction_static
         return config

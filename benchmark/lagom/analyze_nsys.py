@@ -148,6 +148,24 @@ def analyze(database):
 
 
 def kernel_family(name):
+    if "dhisparse_admit_kernel" in name:
+        return "swap_in_commit"
+    if "dhisparse_plan_kernel" in name:
+        return "swap_in_gather"
+    if "dhisparse_copy_kernel" in name:
+        # Nsight demangles the scoped enum as a name or a numeric enum cast.
+        args = re.search(r"dhisparse_copy_kernel<[^,]+,[^,]+,\s*([^>]+)>", name)
+        if args:
+            kind = re.search(r"(Refill|Reread|Promote|[012])\s*$", args[1])
+            if kind:
+                return {
+                    "Refill": "swap_in_gather",
+                    "0": "swap_in_gather",
+                    "Reread": "swap_in_reread",
+                    "1": "swap_in_reread",
+                    "Promote": "swap_in_commit",
+                    "2": "swap_in_commit",
+                }[kind[1]]
     for symbol, family in FUSED.items():
         if symbol in name:
             return family

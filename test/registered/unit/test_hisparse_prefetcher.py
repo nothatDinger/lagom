@@ -33,7 +33,7 @@ def test_legacy_config_is_unchanged():
 
 @pytest.mark.parametrize("force_h2d", [False, True])
 @pytest.mark.parametrize("verify_width,effective_top_k", [(1, 128), (3, 256), (6, 512)])
-def test_dspark_defaults_device_buffer_to_twice_verify_union(
+def test_dspark_defaults_hot_to_sixteen_times_model_top_k(
     force_h2d, verify_width, effective_top_k
 ):
     raw = json.dumps(
@@ -46,7 +46,7 @@ def test_dspark_defaults_device_buffer_to_twice_verify_union(
         verify_width=verify_width,
         effective_top_k=effective_top_k,
     )
-    assert config.device_buffer_size == 2 * verify_width * effective_top_k
+    assert config.device_buffer_size == 16 * effective_top_k
 
 
 @pytest.mark.parametrize("force_h2d", [False, True])
@@ -70,9 +70,14 @@ def test_dspark_preserves_sufficient_explicit_device_buffer(force_h2d, buffer_si
 
 
 @pytest.mark.parametrize("force_h2d", [False, True])
-def test_dspark_rejects_insufficient_explicit_device_buffer(force_h2d):
+def test_legacy_dspark_rejects_insufficient_explicit_device_buffer(force_h2d):
     raw = json.dumps(
-        {"top_k": 512, "device_buffer_size": 2048, "force_h2d_each_step": force_h2d}
+        {
+            "adaptive": False,
+            "top_k": 512,
+            "device_buffer_size": 2048,
+            "force_h2d_each_step": force_h2d,
+        }
     )
     config = _config(raw)
     with pytest.raises(ValueError, match=r"6 \* 512 = 3072"):
@@ -351,7 +356,7 @@ def test_dspark_defaults_without_explicit_hisparse_config():
         verify_width=6,
         effective_top_k=512,
     )
-    assert config.device_buffer_size == 6144
+    assert config.device_buffer_size == 8192
 
 
 def test_demand_reread_preserves_residency_and_lru():

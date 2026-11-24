@@ -768,6 +768,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             verify_width = kvc.server_args.speculative_num_draft_tokens or 0
             if (
                 verify_width > 0
+                and not (
+                    kvc.spec_algorithm.is_dspark() and hisparse_cfg.dhisparse.enabled
+                )
                 and not is_hip()
                 and (
                     kvc.spec_algorithm.is_dspark()

@@ -1023,10 +1023,13 @@ class C4IndexerBackendMixin:
             # Host pages are allocated in advance. A positive host address for
             # an uncommitted C4 row does not establish that its KV is valid.
             # Exclude writer pages from persistent cache admission as well as IO.
-            writer_mask = hisparse_coordinator.dspark_scratch_mask(
-                c4_sparse_page_indices
-            )
+            adaptive = hisparse_coordinator.adaptive is not None
             history = raw_indices
+            writer_mask = None
+            if not adaptive:
+                writer_mask = hisparse_coordinator.dspark_scratch_mask(
+                    c4_sparse_page_indices
+                )
             if writer_mask is not None:
                 history = raw_indices.masked_fill(writer_mask, -1)
                 writer_locs = (
@@ -1039,7 +1042,13 @@ class C4IndexerBackendMixin:
             ].compress_layer_id
             swapped_locs = hisparse_coordinator.swap_in_selected_pages_spec(
                 req_pool_indices=forward_batch.req_pool_indices,
-                compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                # FlashMLA clamps empty histories to one. The adaptive resolver
+                # needs the true per-query number of completed C4 rows, including zero.
+                compressed_seq_lens=(
+                    match_num_queries(core_metadata.c4_topk_lengths_raw, value=0)
+                    if adaptive
+                    else indexer_metadata.c4_seq_lens
+                ),
                 top_k_result=history,
                 layer_id=compress_layer_id,
                 verify_lens_cpu=verify_lens_cpu,
@@ -1057,7 +1066,11 @@ class C4IndexerBackendMixin:
             core_metadata.c4_sparse_page_indices = (
                 hisparse_coordinator.swap_in_selected_pages(
                     req_pool_indices=forward_batch.req_pool_indices,
-                    compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                    compressed_seq_lens=(
+                        match_num_queries(core_metadata.c4_topk_lengths_raw, value=0)
+                        if hisparse_coordinator.adaptive is not None
+                        else indexer_metadata.c4_seq_lens
+                    ),
                     top_k_result=raw_indices,
                     layer_id=compress_layer_id,
                     prefetch_candidates=prefetch_candidates,

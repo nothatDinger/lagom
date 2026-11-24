@@ -1,5 +1,7 @@
 {
-  "w": 3,
+  "w": 5,
+  "resident_first": false,
+  "refill_pages_per_step": 0,
   "top_k": 512,
   "device_buffer_size": 2048,
   "env": {

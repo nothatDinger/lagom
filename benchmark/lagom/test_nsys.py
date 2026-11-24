@@ -213,3 +213,13 @@ def test_export_uses_fresh_writable_copy_and_checks_data_even_on_exit_zero(
     with pytest.raises(ValueError, match="no SQLite export"):
         nsys.export_report(report, database, log)
     assert database.read_bytes() == valid
+
+
+def test_adaptive_kernel_names_from_cuda_13_offline_h100_build():
+    assert nsys.kernel_family("sglang::dhisparse_plan_kernel(...)") == "swap_in_gather"
+    assert nsys.kernel_family("sglang::dhisparse_admit_kernel(...)") == "swap_in_commit"
+    for number, family in enumerate(
+        ("swap_in_gather", "swap_in_reread", "swap_in_commit")
+    ):
+        name = f"sglang::dhisparse_copy_kernel<584, true, (sglang::DHiSparseCopy){number}>(...)"
+        assert nsys.kernel_family(name) == family

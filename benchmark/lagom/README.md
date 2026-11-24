@@ -1,6 +1,6 @@
 # Fused swap-in 的 H2D 延迟实验
 
-在 `perf/swapin_oneshot` 上，`run_overall.py --h2d-pair` 依次运行两个 DSPARK decode 实例。两次使用相同的输入、seed、CUDA Graph 档位和缓存容量，decode 的 `force_h2d_each_step` 分别为 `false` 和 `true`。配对实验默认使用 32768 输入、1024 输出、C=256，`h2d.example.json` 将 hot 设为 2048。模型的有效 K 为 512，因此使用 W=3，满足 `(W+1) × K ≤ hot`。
+在 `perf/swapin_oneshot` 上，`run_overall.py --h2d-pair` 依次运行两个 DSPARK decode 实例。两次使用相同的输入、seed、CUDA Graph 档位和缓存容量，decode 的 `force_h2d_each_step` 分别为 `false` 和 `true`。默认是 P TP4 + D TP4 + router，32768 输入、1024 输出、C=256。H2D 配对配置指定 `W=5`，含 anchor 的最大验证宽度为 6。模型每个 query 选 512 行，hot 保留 2048 行，每个活跃请求另有 3072 行 staging。两组均设置 `resident_first=false`、`refill_pages_per_step=0`，使采样覆盖有 host 备份的 hot 命中。普通 PD 矩阵启用可选历史驻留；这两个参数也可在配对配置中一起调整。
 
 在仓库根目录激活装有 SGLang 和 router 的 uv 虚拟环境。模型和 draft 的路径沿用 `overall.example.json`，可在 `--config` 指定的 JSON 中覆盖。自定义 H2D 配置请从 `h2d.example.json` 复制。先检查本地 ShareGPT 输入的命令生成，GPU 采集使用一台 8 卡节点。
 
@@ -9,10 +9,9 @@ source .venv/bin/activate
 uv run --active --no-project python benchmark/lagom/run_overall.py --h2d-pair --dry-run \
   --sharegpt /data/ShareGPT.json --output /results/h2d
 
-# 在集群上将同一 uv 环境带入 8 卡 GPUQ 作业
-OUT=/home/jovyan/td69032/gpuq-results
-GPUQ_USER=td69032 gpuq run --project lagom --gpus 8 -- \
-  uv run --python "$VIRTUAL_ENV/bin/python" --no-project python benchmark/lagom/run_overall.py --h2d-pair \
+# 在本地 8 卡节点上运行两组测试
+OUT="$PWD/results"
+uv run --active --no-project python benchmark/lagom/run_overall.py --h2d-pair \
   --trace-steps 16 --graph-bs-cap 256 --sharegpt /data/ShareGPT.json --output "$OUT/h2d-latency"
 ```
 
@@ -26,11 +25,11 @@ GPUQ_USER=td69032 gpuq run --project lagom --gpus 8 -- \
 
 | GPU 区间 | 实际执行和计数 |
 |---|---|
-| `target.swap_in_gather` | 一次解析完整 verify 窗口，记录实际从 host 复制到 scratch 的 C4 行数 |
-| `target.swap_in_reread` | 对已经命中、在 host 有备份的长请求 KV，每个物理槽只选一次。两格都遍历候选，强制组再将 KV 读回原物理槽。`resident_hits` 和实际复制行数分别记录 |
-| `target.swap_in_commit` | 记录 CLOCK 接纳行数 `admissions`、scratch 轮换和溢出时直接 H2D 的耗时。`kv_entries` 只计直接复制的行数 |
+| `target.swap_in_gather` | 解析各 query 的有序选择，记录从 pinned host 复制到 arena 的唯一 C4 缺失行数 |
+| `target.swap_in_reread` | gather 在两组中以相同规则标记长请求中有 host 备份的唯一 hot 命中。强制组把这些行重读到 arena 的空位，attention 继续使用原 hot 地址。`resident_hits` 和实际复制行数分别记录 |
+| `target.swap_in_commit` | attention 读完后，LRU 将可接纳的缺失行从 arena 复制到固定 hot 地址。`admissions` 统计实际 D2D 行数，此段的 H2D `kv_entries` 为 0 |
 
-未提交的 C4 使用 verify writer 页。短前缀继续使用已驻留的 KV。每行 payload 为 584 字节，三段的 `kv_entries` 之和乘 584 得到每 rank 实际发出的逻辑 KV 字节量。`swap_in_reread` 的基线包含候选遍历，强制组减去基线给出额外重读的延迟。
+每行 C4 payload 为 584 字节。三段的 `kv_entries` 之和乘 584 是该 rank 每步由 resolver 发起的逻辑 H2D 字节数。强制组与基线的 reread 时间差给出重读增量，两组还应报告相近的原生缺失、晋升和接受 token 数。
 
 `step_ms` 覆盖一个 DSPARK decode step。`decode_tpot_ms = 平均 step_ms / 每请求每步平均提交 token 数`。`reread_pct_of_step` 的分母是整个 step，`reread_ms_per_token` 已按提交 token 数摊销。客户端 `output_tps` 的计时包含长上下文预填充，逐步成本由上述 GPU 区间计算。
 
@@ -38,11 +37,11 @@ GPUQ_USER=td69032 gpuq run --project lagom --gpus 8 -- \
 
 ## Nsight Systems
 
-在相同输入上另跑一组 `--nsys`，结果写入独立目录。在上述集群环境中运行以下命令。
+在相同输入上另跑一组 `--nsys`，结果写入独立目录。在同一台 8 卡节点和 uv 环境中运行以下命令。
 
 ```bash
-GPUQ_USER=td69032 gpuq run --project lagom --gpus 8 -- \
-  uv run --python "$VIRTUAL_ENV/bin/python" --no-project python benchmark/lagom/run_overall.py --h2d-pair --nsys \
+OUT="$PWD/results"
+uv run --active --no-project python benchmark/lagom/run_overall.py --h2d-pair --nsys \
   --trace-steps 16 --graph-bs-cap 256 --sharegpt /data/ShareGPT.json --output "$OUT/h2d-nsys"
 ```
 
@@ -64,7 +63,7 @@ GPUQ_USER=td69032 gpuq run --project lagom --gpus 8 -- \
 
 CPU CUDA API 按该 step 的 scheduler 调用线程取区间并集。GPU 空闲还细分出与这些 API 重叠的时间和其余空闲时间，可用于观察 launch 间隙。完整 API 并集可能与 GPU 工作并行。显式 H2D 字节数只累计完整落入 step 的 memcpy，并列出跨边界次数。fused kernel 对 pinned host KV 的读取属于 kernel 活动，其逻辑 payload 由 Lagom 行计数乘以 584 B 得到。
 
-新分支分别归因到 `swap_in_gather`、`swap_in_reread`、`swap_in_commit`。gather 包含查表和原生回填，commit 包含接纳等工作。旧分支的 `sglang::staging::promote_kernel`、`copy_kernel<true>`、`copy_kernel<false>` 各有独立分类。GEMM 与其余 kernel 保留原名供复核。
+`dhisparse_plan_kernel` 和 `DHiSparseCopy::Refill` 归入 `swap_in_gather`，`DHiSparseCopy::Reread` 归入 `swap_in_reread`，`dhisparse_admit_kernel` 和 `DHiSparseCopy::Promote` 归入 `swap_in_commit`。基线没有额外的 reread kernel。旧分支的 `sglang::staging::promote_kernel`、`copy_kernel<true>`、`copy_kernel<false>` 各有独立分类。GEMM 与其余 kernel 保留原名供复核。
 
 对已有报告，可将输出指向可写目录。`--steps` 使用本分支的 step 标记，`--kernels` 支持仅有 CUDA kernel 的历史报告，并以整个采集窗口为范围。
 

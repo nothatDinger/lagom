@@ -862,20 +862,31 @@ class ModelRunner:
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
         speculative_verify_width = get_spec().speculative_num_draft_tokens or 0
+        payload_pool = getattr(
+            self.token_to_kv_pool_allocator, "hisparse_kvcache", None
+        )
+        adaptive = getattr(payload_pool, "dhisparse_layout", None) is not None
+        if adaptive:
+            speculative_verify_width = (
+                self.server_args.max_speculative_num_draft_tokens
+                or speculative_verify_width
+            )
         if self.spec_algorithm.is_dspark():
             hisparse_cfg = resolve_dspark_device_buffer_size(
                 hisparse_cfg,
                 raw_hisparse_config=self.server_args.hisparse_config,
                 verify_width=speculative_verify_width,
                 effective_top_k=hisparse_top_k,
+                adaptive=adaptive,
             )
             logger.info(
                 "HiSparse DSPARK resident buffer uses %d C4 entries "
                 "(verify_width=%d, effective_top_k=%d; "
-                "default=2 * verify_width * effective_top_k).",
+                "independent staging=%s).",
                 hisparse_cfg.device_buffer_size,
                 speculative_verify_width,
                 hisparse_top_k,
+                adaptive,
             )
         if hisparse_top_k != hisparse_cfg.top_k:
             logger.info(
@@ -919,6 +930,7 @@ class ModelRunner:
                 else 0
             ),
             force_h2d_each_step=hisparse_cfg.force_h2d_each_step,
+            dhisparse_config=hisparse_cfg.dhisparse if adaptive else None,
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,
                 pp_size=self.ps.pp_size,

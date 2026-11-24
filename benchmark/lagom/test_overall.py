@@ -150,6 +150,10 @@ class OverallProtocolTest(unittest.TestCase):
                 "force_h2d_each_step": False,
             },
         }
+        if method == "dhisparse":
+            info["hisparse_config"].update(
+                adaptive=True, resident_first=True, refill_pages_per_step=16
+            )
         if method == "lagom":
             info["hisparse_config"].update(
                 prefetcher="lagom", prefetcher_config={
@@ -284,6 +288,15 @@ class OverallProtocolTest(unittest.TestCase):
                 cmds["decode"][cmds["decode"].index("--hisparse-config") + 1]
             )
             self.assertEqual(hs["device_buffer_size"], 2048)
+            self.assertIs(hs["adaptive"], True)
+            self.assertIs(hs["resident_first"], False)
+            self.assertEqual(hs["refill_pages_per_step"], 0)
+            width = int(
+                cmds["decode"][
+                    cmds["decode"].index("--speculative-num-draft-tokens") + 1
+                ]
+            )
+            self.assertGreater(width * hs["top_k"], hs["device_buffer_size"])
             self.assertIs(hs["force_h2d_each_step"], force)
         self.assertEqual(base["commands"]["prefill"], forced["commands"]["prefill"])
         self.assertEqual(base["commands"]["router"], forced["commands"]["router"])

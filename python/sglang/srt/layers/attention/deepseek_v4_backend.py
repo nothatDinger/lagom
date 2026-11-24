@@ -59,6 +59,7 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.managers.dhisparse_coordinator import finish_dhisparse_attention
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.observability.lagom_perf import phase
@@ -1572,6 +1573,7 @@ class DeepseekV4AttnBackend(
             cache_k=swa_k,
         )
 
+    @finish_dhisparse_attention
     def forward(
         self,
         q: torch.Tensor,
