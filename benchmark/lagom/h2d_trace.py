@@ -11,11 +11,27 @@ C4_BYTES = 584
 
 def read_cell(folder, cell):
     gather, reread, commit = PHASES
+    folder = Path(folder)
+    config = folder / "trace_config.json"
+    # Earlier rank files stored the profiler setting in the attempt config,
+    # and the process ID only in their filenames.
+    profiled = cell.get("nsys", False)
+    configured_nsys = False
+    if config.is_file():
+        configured_nsys = json.loads(config.read_text()).get("nsys", False)
+        if configured_nsys != profiled:
+            raise ValueError(
+                f"Profiler setting differs from the requested cell in {config}"
+            )
     ranks = {}
-    for path in sorted((Path(folder) / "steps").glob("rank-*.json")):
+    for path in sorted((folder / "steps").glob("rank-*.json")):
         if path.name.endswith(".trace.json"):
             continue
         trace = json.loads(path.read_text())
+        if trace.get("nsys", configured_nsys) != profiled:
+            raise ValueError(
+                f"Profiler setting differs from the requested cell in {path}"
+            )
         rank = str(trace["rank"])
         if rank in ranks:
             raise ValueError(f"Duplicate trace for TP rank {rank}")
@@ -50,45 +66,58 @@ def read_cell(folder, cell):
         def mean(key):
             return statistics.mean(r[key] for r in rows)
 
-        step_ms = mean("step_ms")
-        tokens = statistics.mean(statistics.mean(r["accepted_tokens"]) for r in records)
-        times = [r[reread + "_ms"] for r in rows]
-        reread_ms = statistics.mean(times)
         native = mean(gather + "_entries") + mean(commit + "_entries")
         rereads = mean(reread + "_entries")
+        tokens = statistics.mean(statistics.mean(r["accepted_tokens"]) for r in records)
         ranks[rank] = {
-            "step_ms": step_ms,
             "tokens_per_request_step": tokens,
-            "decode_tpot_ms": step_ms / tokens,
             "mean_prefix_tokens": statistics.mean(
                 statistics.mean(r["prefix_lens"]) for r in records
             ),
-            "gather_ms": mean(gather + "_ms"),
-            "reread_ms": reread_ms,
-            "reread_se_ms": (
-                statistics.stdev(times) / math.sqrt(len(times))
-                if len(times) > 1
-                else None
-            ),
-            "commit_ms": mean(commit + "_ms"),
-            "reread_pct_of_step": 100 * reread_ms / step_ms,
-            "reread_ms_per_token": reread_ms / tokens,
             "native_h2d_rows": native,
             "reread_rows": rereads,
             "eligible_hits": mean(reread + "_resident_hits"),
             "admissions": mean(commit + "_admissions"),
             "h2d_payload_bytes_per_step": (native + rereads) * C4_BYTES,
         }
+        if profiled:
+            ranks[rank]["pid"] = (
+                trace["pid"] if "pid" in trace else int(path.stem.rsplit("-pid", 1)[-1])
+            )
+            continue
+        step_ms = mean("step_ms")
+        times = [r[reread + "_ms"] for r in rows]
+        reread_ms = statistics.mean(times)
+        ranks[rank].update(
+            {
+                "step_ms": step_ms,
+                "decode_tpot_ms": step_ms / tokens,
+                "gather_ms": mean(gather + "_ms"),
+                "reread_ms": reread_ms,
+                "reread_se_ms": (
+                    statistics.stdev(times) / math.sqrt(len(times))
+                    if len(times) > 1
+                    else None
+                ),
+                "commit_ms": mean(commit + "_ms"),
+                "reread_pct_of_step": 100 * reread_ms / step_ms,
+                "reread_ms_per_token": reread_ms / tokens,
+            }
+        )
     if set(ranks) != {"0", "1", "2", "3"}:
         raise ValueError(
             f"Expected four complete TP4 decode traces, found ranks {sorted(ranks)}"
         )
+    if profiled and len({r["pid"] for r in ranks.values()}) != len(ranks):
+        raise ValueError("Expected a distinct profiled process for every decode rank")
     return {"cell": cell, "ranks": ranks}
 
 
 def compare_cells(baseline, forced):
     """Acceptance on each rank. TP workers observe the same steps and are not independent samples."""
     a, b = baseline["cell"].copy(), forced["cell"].copy()
+    if a.get("nsys") or b.get("nsys"):
+        raise ValueError("H2D latency comparison requires two profiler-free traces")
     if (
         a.pop("force_h2d_each_step") is not False
         or b.pop("force_h2d_each_step") is not True

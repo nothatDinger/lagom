@@ -216,7 +216,7 @@ def test_verify_step_snapshots_optional_cpu_lengths_without_host_wait(
             return list(self.values)
 
     trace = object.__new__(lagom_perf.StepTrace)
-    trace.written, trace.nsys, trace.nsys_running = False, False, False
+    trace.written, trace.nsys = False, False
     trace.seen, trace.skip, trace.steps, trace.active = 0, 1, 2, -1
     trace.required_batch_size = None
     trace.max_batch_size, trace.request_prefix = None, None
@@ -303,7 +303,7 @@ def test_export_waits_for_transfer_completion_and_writes_valid_tracks(tmp_path):
     import torch
 
     trace = object.__new__(lagom_perf.StepTrace)
-    trace.written, trace.nsys_running = False, False
+    trace.written = False
     trace.events = [Mock(query=Mock(side_effect=[False, True]))]
     trace.stamps = torch.tensor([[[100, 200]], [[120, 220]]])
     trace.names = {("step", None): 0, ("target.kv_prefetch", 2): 1}
@@ -493,9 +493,29 @@ def test_compare_matched_fused_steps_counts_payload_and_committed_tokens(tmp_pat
     assert result["ranks"]["0"]["delta"]["h2d_payload_bytes_per_step"] == 7 * 584
     reports[1]["ranks"]["1"].update(step_ms=19, admissions=1)
     assert not analysis.compare_cells(*reports)["passed"]
-    (folder / "steps/rank-3.json").unlink()
-    with pytest.raises(ValueError, match="four complete"):
+    for rank in range(4):
+        path = folder / "steps" / f"rank-{rank}.json"
+        trace = json.loads(path.read_text())
+        path.write_text(json.dumps(trace | {"nsys": True, "pid": rank + 100}))
+    profiled = analysis.read_cell(folder, cell | {"nsys": True})
+    assert profiled["ranks"]["3"]["pid"] == 103
+    assert profiled["ranks"]["0"]["h2d_payload_bytes_per_step"] == 13 * 584
+    assert "decode_tpot_ms" not in profiled["ranks"]["0"]
+    with pytest.raises(ValueError, match="profiler-free"):
+        analysis.compare_cells(reports[0], profiled)
+    with pytest.raises(ValueError, match="Profiler setting"):
         analysis.read_cell(folder, cell)
+    (folder / "trace_config.json").write_text(json.dumps({"nsys": True}))
+    current = folder / "steps/rank-3.json"
+    previous = current.rename(folder / "steps/rank-device7-pid103.json")
+    data = json.loads(previous.read_text())
+    previous.write_text(
+        json.dumps({k: v for k, v in data.items() if k not in ("nsys", "pid")})
+    )
+    assert analysis.read_cell(folder, cell | {"nsys": True}) == profiled
+    previous.unlink()
+    with pytest.raises(ValueError, match="four complete"):
+        analysis.read_cell(folder, cell | {"nsys": True})
 
 
 def test_nsys_step_uses_gpu_edges_and_keeps_api_and_overlaps_separate(tmp_path):
@@ -547,3 +567,40 @@ def test_nsys_step_uses_gpu_edges_and_keeps_api_and_overlaps_separate(tmp_path):
     ).items():
         assert row[name] == pytest.approx(ns / 1e6)
     assert row["explicit_h2d_bytes"] == 584
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_profile_window_brackets_all_tp_stamps_and_final_streams(rank):
+    trace = object.__new__(lagom_perf.StepTrace)
+    trace.written, trace.nsys, trace.rank = False, True, rank
+    trace.events, trace.records, trace.accepted = [], [], {}
+    trace.profile_group, trace.torch, trace.slot = Mock(), Mock(), Mock()
+    trace.seen, trace.skip, trace.steps = 0, 1, 2
+    trace.max_batch_size = trace.required_batch_size = trace.request_prefix = None
+    trace.streams = [Mock()]
+    calls = []
+    trace.profile_group.barrier.side_effect = lambda: calls.append("barrier")
+    cuda = trace.torch.cuda
+    cuda.cudart().cudaProfilerStart.side_effect = lambda: calls.append("start")
+    cuda.cudart().cudaProfilerStop.side_effect = lambda: calls.append("stop")
+    cuda.Event.return_value.synchronize.side_effect = lambda: calls.append(
+        "stream_complete"
+    )
+    batch = SimpleNamespace(
+        seq_lens_cpu=Mock(), forward_iter=1, reqs=[SimpleNamespace(rid="a")]
+    )
+    result = SimpleNamespace(can_run_cuda_graph=True, accept_lens=Mock())
+    for _ in range(3):
+        trace.begin(batch)
+        if trace.active >= 0:
+            calls.append("step")
+        trace.finish(result)
+    expected = [
+        "barrier",
+        "step",
+        "step",
+        "stream_complete",
+        "stream_complete",
+        "barrier",
+    ]
+    assert calls == (["start", *expected, "stop"] if rank == 0 else expected)

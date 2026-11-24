@@ -16,9 +16,10 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from contextlib import ExitStack
 from pathlib import Path
 
-from analyze_nsys import step_breakdown
+from analyze_nsys import FUSED, compare_kernel_windows, export_report, step_report
 from h2d_trace import compare_cells, read_cell
 from longbench_v2_fixed import load_manifest
 
@@ -29,6 +30,7 @@ INPUT_LENS = (32768, 65536, 131072, 204800)
 CONCURRENCIES = (8, 16, 32, 64, 128, 256)
 OUTPUT_LEN = 1024
 CLEANUP_RESERVE = 20
+NSYS_ENV = {"TORCH_NCCL_TIMEOUT": "3600000", "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC": "3600"}
 TRACE_ENV = (
     "SGLANG_LAGOM_PERF_TRACE", "SGLANG_LAGOM_DECODE_PERF",
     "SGLANG_DSPARK_DEBUG_DUMP", "SGLANG_OASISKV_TRACE_CONFIG",
@@ -36,6 +38,7 @@ TRACE_ENV = (
 SUMMARY_FIELDS = (
     "method",
     "force_h2d_each_step",
+    "nsys",
     "input_len",
     "max_concurrency",
     "num_requests",
@@ -138,6 +141,13 @@ def check_extra(base, extra):
     return base + extra
 
 
+def graph_sizes(cell):
+    cap = min(
+        cell["max_concurrency"], cell.get("graph_bs_cap", cell["max_concurrency"])
+    )
+    return sorted({cap} | {1 << i for i in range(cap.bit_length())})
+
+
 def commands(cfg, cell, data_dir, folder):
     method, length, concurrency = (
         cell["method"], cell["input_len"], cell["max_concurrency"]
@@ -148,7 +158,6 @@ def commands(cfg, cell, data_dir, folder):
         )
     spec = method != "hisparse"
     context = length + OUTPUT_LEN + cfg["w"] + cfg["p"] + 128
-    graph_bs = [1 << i for i in range(concurrency.bit_length())]
     urls = {role: f"http://127.0.0.1:{cfg[role + '_port']}"
             for role in ("prefill", "decode", "router")}
     launch = {}
@@ -201,10 +210,16 @@ def commands(cfg, cell, data_dir, folder):
                     }
                 )
             argv += [
-                "--enable-hisparse", "--hisparse-config", canonical(hisparse),
-                "--disaggregation-decode-extra-slots", str(cfg["decode_extra_slots"]),
-                "--cuda-graph-config", canonical({"decode": {"backend": "full", "bs": graph_bs}}),
+                "--enable-hisparse",
+                "--hisparse-config",
+                canonical(hisparse),
+                "--disaggregation-decode-extra-slots",
+                str(cfg["decode_extra_slots"]),
+                "--cuda-graph-config",
+                canonical({"decode": {"backend": "full", "bs": graph_sizes(cell)}}),
             ]
+            if cell.get("nsys"):
+                argv += ["--watchdog-timeout", "100000", "--dist-timeout", "3600"]
         launch[role] = check_extra(argv, cfg[role + "_extra_args"])
     router = [
         cfg["python"], "-m", "sglang_router.launch_router",
@@ -230,6 +245,12 @@ def commands(cfg, cell, data_dir, folder):
             "--force-overwrite=true",
             "-o",
             str(folder / "prof"),
+            # Retain the target PID so shutdown can leave the Nsight writer alive.
+            "sh",
+            "-c",
+            'echo "$$" > "$1" && shift && exec "$@"',
+            "lagom-nsys",
+            str(folder / "decode-target.pid"),
         ] + launch["decode"]
     sharegpt = cell.get("dataset") == "sharegpt"
     client = (
@@ -376,13 +397,20 @@ def validate_server_info(info, cfg, cell, role):
         graph = info.get("cuda_graph_config")
         if isinstance(graph, str):
             graph = json.loads(graph)
-        expected_bs = [1 << i for i in range(cell["max_concurrency"].bit_length())]
+        expected_bs = graph_sizes(cell)
         if (
             not isinstance(graph, dict)
             or graph.get("decode", {}).get("backend") != "full"
             or graph.get("decode", {}).get("bs") != expected_bs
         ):
             raise ValueError("Resolved decode graph backend/batch sizes differ from the protocol")
+        if cell.get("nsys") and (
+            info.get("watchdog_timeout"),
+            info.get("dist_timeout"),
+        ) != (100000, 3600):
+            raise ValueError(
+                "Profiled decode did not resolve the requested scheduler and distributed timeouts"
+            )
         hs = info.get("hisparse_config")
         if isinstance(hs, str):
             hs = json.loads(hs)
@@ -506,6 +534,21 @@ def cleanup(processes):
         log.close()
 
 
+def finish_profile(launcher, target, deadline):
+    import psutil
+
+    # Stop the server first. Nsight can then drain CUPTI and close its report.
+    # psutil tracks process creation time in case the target has already exited.
+    if launcher.poll() is None:
+        try:
+            target.terminate()
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.AccessDenied as exc:
+            raise PermissionError("Cannot stop the profiled decode server") from exc
+        launcher.wait(timeout=min(300, max(1, deadline - time.monotonic())))
+
+
 def validate_result(result, cell):
     n, length = cell["num_requests"], cell["input_len"]
     if result.get("completed") != n:
@@ -518,6 +561,8 @@ def validate_result(result, cell):
         raise ValueError("Aggregate token counts do not match the protocol")
     if len(result.get("errors", [])) != n or any(result["errors"]):
         raise ValueError("Benchmark contains request errors")
+    if cell.get("nsys"):
+        return {"completed": n}
     for key in ("duration", "output_throughput", "mean_tpot_ms", "median_tpot_ms", "p99_tpot_ms"):
         value = result.get(key)
         if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
@@ -554,6 +599,8 @@ def run_cell(cfg, cell, data_dir, folder):
     deadline = started + cfg["cell_timeout_seconds"] - CLEANUP_RESERVE
     startup_deadline = min(deadline, started + cfg["startup_timeout_seconds"])
     processes = {}
+    services = ExitStack()
+    services.callback(cleanup, processes)
     result = cell | {"status": "running", "attempt": str(folder), "error": ""}
     save(folder / "status.json", result)
     try:
@@ -565,6 +612,8 @@ def run_cell(cfg, cell, data_dir, folder):
             path = folder / "trace_config.json"
             save(path, trace)
             decode_env = env | {"SGLANG_LAGOM_PERF_TRACE": str(path)}
+        if cell.get("nsys"):
+            decode_env = decode_env | NSYS_ENV
         save(
             folder / "launch.json",
             {
@@ -582,6 +631,7 @@ def run_cell(cfg, cell, data_dir, folder):
                     )
                 },
                 "decode_trace_config": trace,
+                "decode_profiler_environment": NSYS_ENV if cell.get("nsys") else {},
                 "removed_trace_environment": list(TRACE_ENV),
             },
         )
@@ -596,6 +646,18 @@ def run_cell(cfg, cell, data_dir, folder):
                 processes,
             )
             wait_ready(urls[role], processes, startup_deadline)
+            if role == "decode" and cell.get("nsys"):
+                import psutil
+
+                pid = int((folder / "decode-target.pid").read_text())
+                if pid <= 1:
+                    raise ValueError("Invalid profiled decode PID")
+                services.callback(
+                    finish_profile,
+                    processes[role][0],
+                    psutil.Process(pid),
+                    started + cfg["cell_timeout_seconds"],
+                )
         for role in ("prefill", "decode"):
             info = get_json(urls[role] + "/server_info", deadline)
             save(folder / f"{role}_server_info.json", info)
@@ -615,38 +677,46 @@ def run_cell(cfg, cell, data_dir, folder):
         result.update(validate_result(json.loads(lines[0]), cell))
         if trace:
             # All four TP processes must deliver their complete measured window.
-            save(folder / "h2d.json", read_cell(folder, cell))
+            workload = read_cell(folder, cell)
+            save(
+                folder / ("nsys-workload.json" if cell["nsys"] else "h2d.json"),
+                workload,
+            )
+        if cell.get("nsys"):
+            services.close()
+            database = folder / "prof.sqlite"
+            export_report(
+                folder / "prof.nsys-rep",
+                database,
+                folder / "nsys-stats.txt",
+                timeout=remaining(deadline + CLEANUP_RESERVE),
+            )
+            ranks_by_pid = {
+                row["pid"]: int(rank) for rank, row in workload["ranks"].items()
+            }
+            report = step_report(
+                database,
+                ranks_by_pid=ranks_by_pid,
+                steps=cell["trace_steps"],
+                required_families=FUSED.values(),
+            )
+            save(folder / "nsys-steps.json", report["decode_steps"])
+            save(folder / "nsys-kernels.json", report["kernel_attribution"])
         result["status"] = "ok"
     except KeyboardInterrupt:
         result.update(status="interrupted", error="Interrupted by user/signal")
         raise
-    except TimeoutError as exc:
+    except (TimeoutError, subprocess.TimeoutExpired) as exc:
         result.update(status="timeout", error=str(exc))
     except Exception as exc:
         result.update(status="failed", error=f"{type(exc).__name__}: {exc}")
     finally:
-        cleanup(processes)
-        if cell.get("nsys") and result["status"] == "ok":
-            try:
-                with (folder / "nsys-stats.txt").open("w") as log:
-                    subprocess.run(
-                        [
-                            "nsys",
-                            "stats",
-                            "--force-export=true",
-                            "--report",
-                            "cuda_gpu_kern_sum,cuda_gpu_mem_time_sum,cuda_gpu_mem_size_sum,cuda_api_sum",
-                            str(folder / "prof.nsys-rep"),
-                        ],
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
-                        check=True,
-                        timeout=remaining(deadline + CLEANUP_RESERVE),
-                    )
-                breakdown = step_breakdown(folder / "prof.sqlite")
-                save(folder / "nsys-steps.json", breakdown)
-            except Exception as exc:
-                result.update(status="failed", error=f"Nsight export: {exc}")
+        try:
+            services.close()
+        except (OSError, TimeoutError, subprocess.SubprocessError) as exc:
+            result["error"] += f" (service shutdown: {exc})"
+            if result["status"] == "ok":
+                result["status"] = "failed"
         result["cell_seconds"] = time.monotonic() - started
         if result["cell_seconds"] > cfg["cell_timeout_seconds"] and result["status"] == "ok":
             result.update(status="timeout", error="Cell including cleanup exceeded its budget")
@@ -707,6 +777,11 @@ def main():
     parser.add_argument("--trace-steps", type=int, default=12)
     parser.add_argument("--trace-skip", type=int, default=2)
     parser.add_argument(
+        "--graph-bs-cap",
+        type=int,
+        help="Largest decode CUDA graph batch size (default: cell concurrency)",
+    )
+    parser.add_argument(
         "--trace-batch-size",
         type=int,
         help="Actual decode batch to match (default: concurrency)",
@@ -714,7 +789,7 @@ def main():
     parser.add_argument(
         "--nsys",
         action="store_true",
-        help="Profile the paired decode windows with Nsight Systems",
+        help="Collect kernel attribution on paired decode windows; use a separate trace-only run for latency",
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--methods", nargs="+", choices=METHODS)
@@ -748,6 +823,10 @@ def main():
         )
     data_dir, output = (args.sharegpt or args.data_dir).resolve(), args.output.resolve()
     cells = matrix(args.methods, args.input_lens, args.concurrencies)
+    if args.graph_bs_cap is not None:
+        if args.graph_bs_cap < 1:
+            parser.error("--graph-bs-cap must be positive")
+        cells = [cell | {"graph_bs_cap": args.graph_bs_cap} for cell in cells]
     if args.sharegpt:
         cells = [cell | {"dataset": "sharegpt"} for cell in cells]
     if args.h2d_pair:
@@ -771,6 +850,10 @@ def main():
             for cell in cells
             for force in (False, True)
         ]
+        if any(c["trace_batch_size"] > max(graph_sizes(c)) for c in cells):
+            parser.error(
+                "The measured decode batch must fit the largest captured graph"
+            )
     preflight = source_preflight()
     if args.dry_run:
         print(
@@ -789,6 +872,9 @@ def main():
                             )[0],
                             "decode_trace_config": trace_config(
                                 cell, cell_directory(output, cell) / "attempt-0001"
+                            ),
+                            "decode_profiler_environment": (
+                                NSYS_ENV if cell.get("nsys") else {}
                             ),
                         }
                         for cell in cells
@@ -847,6 +933,7 @@ def main():
         "data_manifests": manifests,
         "h2d_pair": args.h2d_pair,
         "nsys": args.nsys,
+        "graph_bs_cap": args.graph_bs_cap,
         "trace_batch_size": args.trace_batch_size,
         "trace_steps": args.trace_steps,
         "trace_skip": args.trace_skip,
@@ -893,6 +980,15 @@ def main():
                         sorted(cell_directory(output, c).glob("attempt-*"))[-1]
                         for c in (baseline, force)
                     ]
+                    if args.nsys:
+                        comparison = compare_kernel_windows(
+                            *(
+                                json.loads((d / "nsys-kernels.json").read_text())
+                                for d in attempts
+                            )
+                        )
+                        save(attempts[1] / "nsys-comparison.json", comparison)
+                        continue
                     comparison = compare_cells(
                         *(json.loads((d / "h2d.json").read_text()) for d in attempts)
                     )

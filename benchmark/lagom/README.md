@@ -2,15 +2,18 @@
 
 在 `perf/swapin_oneshot` 上，`run_overall.py --h2d-pair` 依次运行两个 DSPARK decode 实例。两次使用相同的输入、seed、CUDA Graph 档位和缓存容量，decode 的 `force_h2d_each_step` 分别为 `false` 和 `true`。配对实验默认使用 32768 输入、1024 输出、C=256，`h2d.example.json` 将 hot 设为 2048。模型的有效 K 为 512，因此使用 W=3，满足 `(W+1) × K ≤ hot`。
 
-在仓库根目录激活装有 SGLang 和 router 的 uv 虚拟环境。模型和 draft 的路径沿用 `overall.example.json`，可在 `--config` 指定的 JSON 中覆盖。自定义 H2D 配置请从 `h2d.example.json` 复制。先检查本地 ShareGPT 输入的命令生成，再在有 8 张可见 GPU 的主机上采集。
+在仓库根目录激活装有 SGLang 和 router 的 uv 虚拟环境。模型和 draft 的路径沿用 `overall.example.json`，可在 `--config` 指定的 JSON 中覆盖。自定义 H2D 配置请从 `h2d.example.json` 复制。先检查本地 ShareGPT 输入的命令生成，GPU 采集使用一台 8 卡节点。
 
 ```bash
 source .venv/bin/activate
 uv run --active --no-project python benchmark/lagom/run_overall.py --h2d-pair --dry-run \
   --sharegpt /data/ShareGPT.json --output /results/h2d
 
-uv run --active --no-project python benchmark/lagom/run_overall.py --h2d-pair \
-  --sharegpt /data/ShareGPT.json --output /results/h2d
+# 在集群上将同一 uv 环境带入 8 卡 GPUQ 作业
+OUT=/home/jovyan/td69032/gpuq-results
+GPUQ_USER=td69032 gpuq run --project lagom --gpus 8 -- \
+  uv run --python "$VIRTUAL_ENV/bin/python" --no-project python benchmark/lagom/run_overall.py --h2d-pair \
+  --trace-steps 16 --graph-bs-cap 256 --sharegpt /data/ShareGPT.json --output "$OUT/h2d-latency"
 ```
 
 预填充和解码各用 TP4。示例给 Mooncake 设置 `MC_FORCE_TCP=1` 和 `LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64`。本地 ShareGPT 按 seed 打乱对话并直接拼出定长 token IDs，语料不足会报错。也可传 `--data-dir /data/longbench-bank` 使用 `longbench_v2_fixed.py` 制作的 token bank。两种来源均支持 204800 输入。
@@ -35,14 +38,44 @@ uv run --active --no-project python benchmark/lagom/run_overall.py --h2d-pair \
 
 ## Nsight Systems
 
-在同一条 uv 命令中加 `--nsys`，使用新的 `--output` 目录。runner 只包裹 decode，采集 CUDA/NVTX，关闭 CPU sampling 和 context switches，用 `--cuda-graph-trace=node` 展开图节点。每格结束后执行 `nsys stats --force-export=true` 并生成 `prof.nsys-rep`、`prof.sqlite`、`nsys-stats.txt` 和 `nsys-steps.json`。有独立采集的 SQLite 时也可重做分析。
+在相同输入上另跑一组 `--nsys`，结果写入独立目录。在上述集群环境中运行以下命令。
 
 ```bash
-python benchmark/lagom/analyze_nsys.py /results/attempt/prof.sqlite \
-  --steps --output /results/attempt/breakdown.json
+GPUQ_USER=td69032 gpuq run --project lagom --gpus 8 -- \
+  uv run --python "$VIRTUAL_ENV/bin/python" --no-project python benchmark/lagom/run_overall.py --h2d-pair --nsys \
+  --trace-steps 16 --graph-bs-cap 256 --sharegpt /data/ShareGPT.json --output "$OUT/h2d-nsys"
 ```
 
-分析器通过 NVTX 边界内的 CUDA launch 将 GPU 计时标记与 step 关联。每个 rank/device 的 GPU 区间分为仅 kernel、仅显式 H2D memcpy、仅其他活动、活动重叠和空闲。CPU CUDA API 按调用线程取区间并集，单独报告。显式 H2D 的字节数只累计完整落入窗口的 memcpy，另列跨边界次数。fused kernel 对 pinned host 内存的读取出现在 kernel 时间线上，其 payload 取自 Lagom 行计数。CUDA 分配、缓存和总线协议都会影响链路上的实际流量。
+只有 decode 服务在 `nsys profile` 下启动。PD 使用 P TP4 + D TP4，报告应覆盖 4 个 decode rank。第一个采样 step 由 decode rank 0 调用 `cudaProfilerStart()`，各 rank 再进入 step。最后一个 step 的主流和已注册侧流完成后，各 rank 汇合，由 rank 0 调用 `cudaProfilerStop()`。启动参数使用 `--capture-range=cudaProfilerApi --capture-range-end=stop`，服务继续处理剩余请求。采集范围为 CUDA/NVTX。NVTX 标记用于关联 step，`--cuda-graph-trace=node` 展开图内 kernel，`--sample=none --cpuctxsw=none` 允许在受限主机采集。按名称触发 torch NVTX 在 nsys 2025.1.3 上曾静默产生空报告，使用 `--delay` 和 `--duration` 则可能采到模型加载期。`stop-shutdown` 会终止服务。
+
+默认 decode CUDA Graph 的最大 batch 是该格的并发上限。`--graph-bs-cap` 可以进一步限制档位，实际采样 batch 必须能被图覆盖。C=256 时最大图为 256。profiled decode 使用 `--watchdog-timeout 100000` 秒、`--dist-timeout 3600` 秒、`TORCH_NCCL_TIMEOUT=3600000` 毫秒和 `TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600` 秒。当前分支将 `dist_timeout` 传入默认进程组和模型并行 NCCL 子组。
+
+每格保留 `prof.nsys-rep`。runner 等待 profiler 收尾，在可写临时目录复制报告并执行 `nsys stats --force-export=true`，验证有正时长的 CUPTI kernel 后保存 `prof.sqlite`。缺失或空的 rep、缺少任一 decode rank 或采样步、缺少 fused kernel 均会使该格失败。`nsys-stats.txt` 是 nsys 的原始跨设备汇总。
+
+| 产物 | 读数 |
+|---|---|
+| `nsys-steps.json` | 每 rank、每 step 的 GPU 时间线。kernel、显式 H2D、其他 GPU 活动、跨类别重叠和 GPU 空闲的互斥时长之和等于采集到的 step 跨度 |
+| `nsys-kernels.json` | 每 rank 在所选 steps 内的 demangled 名称、实例数和 kernel 耗时。类别百分比的分母为该 rank 的 kernel 实例时长总和，允许并行 kernel 重叠 |
+| `nsys-comparison.json` | 强制组目录中两格相同 rank、设备、步数的对比。每类 kernel 报告整个窗口的基线、强制和差值，单位为 ms |
+| `nsys-workload.json` | 每 rank 的原生 H2D 行数、额外重读行数、候选和接纳数。按实际进程 PID 将 trace 与 CUPTI 设备对应 |
+| `h2d.json`、`comparison.json` | 单独的 Lagom trace 延迟运行产出，提供 step、decode TPOT、重读增量和配对验收结果 |
+
+开启 nsys 时，`summary.csv` 保留请求完成数和作业状态，吞吐及 TPOT 栏留空。原始客户端输出保存在 `benchmark.jsonl`。
+
+CPU CUDA API 按该 step 的 scheduler 调用线程取区间并集。GPU 空闲还细分出与这些 API 重叠的时间和其余空闲时间，可用于观察 launch 间隙。完整 API 并集可能与 GPU 工作并行。显式 H2D 字节数只累计完整落入 step 的 memcpy，并列出跨边界次数。fused kernel 对 pinned host KV 的读取属于 kernel 活动，其逻辑 payload 由 Lagom 行计数乘以 584 B 得到。
+
+新分支分别归因到 `swap_in_gather`、`swap_in_reread`、`swap_in_commit`。gather 包含查表和原生回填，commit 包含接纳等工作。旧分支的 `sglang::staging::promote_kernel`、`copy_kernel<true>`、`copy_kernel<false>` 各有独立分类。GEMM 与其余 kernel 保留原名供复核。
+
+对已有报告，可将输出指向可写目录。`--steps` 使用本分支的 step 标记，`--kernels` 支持仅有 CUDA kernel 的历史报告，并以整个采集窗口为范围。
+
+```bash
+uv run --active --no-project python benchmark/lagom/analyze_nsys.py /archive/prof.nsys-rep \
+  --steps --output /tmp/h2d-steps.json
+uv run --active --no-project python benchmark/lagom/analyze_nsys.py /archive/old.sqlite \
+  --kernels --output /tmp/h2d-kernels.json
+```
+
+在 8×H100 的历史采集中，每步耗时从约 120 ms/step 增至 6.6 s/step，约 55 倍。采集窗口中的 GPU 利用率约 37%。nsys 提供采集条件下的 kernel 相对组成，CUPTI 背压会改变调度和重叠。旧实现的 promote/refill/stage copy 约为每 rank 每 16 步 72/5.0/3.9 ms。本分支的实际增量需用相同数据和 batch 重新测量。绝对 step 和 decode TPOT 取自独立的低开销 trace，端到端吞吐取自关闭诊断的 serving 运行。
 
 ## perf/lagom 原有实验
 

@@ -202,7 +202,6 @@ class StepTrace:
             raise ValueError("max_batch_size must be positive")
         self.request_prefix = config.get("request_prefix")
         self.min_output_tokens = config.get("min_output_tokens")
-        self.nsys_running = False
         self.output = Path(config["output_dir"])
         self.output.mkdir(parents=True, exist_ok=True)
         self.device = torch.cuda.current_device()
@@ -210,6 +209,11 @@ class StepTrace:
         self.rank = (
             torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         )
+        self.profile_group = None
+        if self.nsys and torch.distributed.is_initialized():
+            from sglang.srt.distributed.parallel_state import get_tp_group
+
+            self.profile_group = get_tp_group()
         self.slot = torch.full((1,), -1, dtype=torch.int32, device="cuda")
         self.stamps = torch.zeros(
             (self.MAX_REGIONS, self.steps, 2), dtype=torch.int64, device="cuda"
@@ -223,8 +227,7 @@ class StepTrace:
         self.names, self.side_slots, self.records, self.cpu = {}, {}, [], []
         self.accepted, self.prefix_lens_gpu, self.events = {}, {}, []
         self.role, self.seen, self.active, self.written = "target", 0, -1, False
-        # Compile before graph capture. No synchronization is added to a
-        # recorded verify step; collection happens after the bounded window.
+        # Compile both stamp edges before graph capture.
         self.stamp[(1,)](self.stamps, self.slot, self.steps, 0, 0)
         self.stamp[(1,)](self.stamps, self.slot, self.steps, 0, 1)
 
@@ -369,9 +372,14 @@ class StepTrace:
         if not 0 <= self.active < self.steps:
             self.active = -1
         self.slot.fill_(self.active)
-        if self.active == 0 and self.nsys and self.rank == 0:
-            self.torch.cuda.cudart().cudaProfilerStart()
-            self.nsys_running = True
+        if self.active == 0 and self.nsys:
+            if self.rank == 0:
+                self.torch.cuda.check_error(
+                    self.torch.cuda.cudart().cudaProfilerStart()
+                )
+            if self.profile_group is not None:
+                # Keep faster workers' first NVTX and GPU stamps inside capture.
+                self.profile_group.barrier()
         if self.active >= 0:
             prefix_lens_cpu = batch.seq_lens_cpu
             if prefix_lens_cpu is None:
@@ -410,19 +418,26 @@ class StepTrace:
             event = self.torch.cuda.Event()
             event.record()
             self.events.append(event)
-            # Side streams may still write this window after the main ends.
-            # Transfer streams are registered explicitly below; no global join.
+            # Side streams can still write this window after the main stream ends.
             for stream in getattr(self, "streams", []):
                 event = self.torch.cuda.Event()
                 event.record(stream)
                 self.events.append(event)
+            if self.nsys:
+                # The final step has the same collective order on every TP rank.
+                # poll() can run at different times and must never do a barrier.
+                for event in self.events:
+                    event.synchronize()
+                if self.profile_group is not None:
+                    self.profile_group.barrier()
+                if self.rank == 0:
+                    self.torch.cuda.check_error(
+                        self.torch.cuda.cudart().cudaProfilerStop()
+                    )
 
     def poll(self):
         if self.written or not self.events or not all(e.query() for e in self.events):
             return
-        if self.nsys_running:
-            self.torch.cuda.cudart().cudaProfilerStop()
-            self.nsys_running = False
         values = self.stamps.cpu().tolist()
         kv_entries = self.kv_entries.cpu().tolist() if self.kv_entry_regions else None
         cache_work = (
@@ -458,6 +473,8 @@ class StepTrace:
         payload = {
             "schema_version": 1,
             "device": self.device,
+            "pid": pid,
+            "nsys": getattr(self, "nsys", False),
             "rank": getattr(self, "rank", self.device),
             "records": self.records,
             "regions": regions,

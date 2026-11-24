@@ -1,9 +1,12 @@
 """CPU-only protocol tests. Run: python -m unittest discover -s benchmark/lagom -p test_overall.py"""
 import copy
+import csv
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -252,22 +255,175 @@ class OverallProtocolTest(unittest.TestCase):
             ]
         )
         base, forced = json.loads(output)["cells"]
-        for cell, flag in ((base, False), (forced, True)):
+        for cell, force in ((base, False), (forced, True)):
             self.assertEqual((cell["input_len"], cell["max_concurrency"]), (32768, 256))
             cmds = cell["commands"]
             self.assertEqual(cmds["prefill"][0], sys.executable)
             self.assertEqual(cmds["decode"][0], "nsys")
             self.assertEqual(cmds["router"][0], sys.executable)
             self.assertNotIn("nsys", cmds["prefill"])
+            self.assertIn("--capture-range=cudaProfilerApi", cmds["decode"])
+            self.assertIn("--capture-range-end=stop", cmds["decode"])
+            self.assertIn("--cuda-graph-trace=node", cmds["decode"])
+            for flag, value in (
+                ("--watchdog-timeout", "100000"),
+                ("--dist-timeout", "3600"),
+            ):
+                self.assertEqual(cmds["decode"][cmds["decode"].index(flag) + 1], value)
+                self.assertNotIn(flag, cmds["prefill"])
+            self.assertEqual(
+                cell["decode_profiler_environment"],
+                {
+                    "TORCH_NCCL_TIMEOUT": "3600000",
+                    "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC": "3600",
+                },
+            )
             self.assertIn("--sharegpt-input-len", cmds["benchmark"])
             self.assertEqual(cell["decode_trace_config"]["required_batch_size"], 256)
             hs = json.loads(
                 cmds["decode"][cmds["decode"].index("--hisparse-config") + 1]
             )
             self.assertEqual(hs["device_buffer_size"], 2048)
-            self.assertIs(hs["force_h2d_each_step"], flag)
+            self.assertIs(hs["force_h2d_each_step"], force)
         self.assertEqual(base["commands"]["prefill"], forced["commands"]["prefill"])
         self.assertEqual(base["commands"]["router"], forced["commands"]["router"])
+
+    def test_graph_cap_covers_measured_batch_and_is_limited_by_concurrency(self):
+        self.assertEqual(
+            overall.graph_sizes(self.cell | {"graph_bs_cap": 6}), [1, 2, 4, 6]
+        )
+        self.assertEqual(
+            overall.graph_sizes(self.cell | {"graph_bs_cap": 512}), [1, 2, 4, 8]
+        )
+        argv = [
+            sys.executable,
+            str(overall.HERE / "run_overall.py"),
+            "--h2d-pair",
+            "--dry-run",
+            "--output",
+            "/out",
+            "--sharegpt",
+            "/data/sharegpt.json",
+            "--graph-bs-cap",
+            "128",
+        ]
+        proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("fit the largest captured graph", proc.stderr)
+        cell = json.loads(
+            subprocess.check_output(argv + ["--trace-batch-size", "128"])
+        )["cells"][0]
+        decode = cell["commands"]["decode"]
+        self.assertEqual(
+            max(
+                json.loads(decode[decode.index("--cuda-graph-config") + 1])["decode"][
+                    "bs"
+                ]
+            ),
+            128,
+        )
+        self.assertNotIn("--watchdog-timeout", decode)
+        self.assertEqual(cell["decode_profiler_environment"], {})
+
+    def test_profile_pair_publishes_only_kernel_comparison(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, data_path = Path(tmp) / "output", Path(tmp) / "sharegpt.json"
+            data_path.write_text("[]")
+
+            def profiled_cell(cfg, cell, data, folder):
+                folder.mkdir(parents=True)
+                row = overall.validate_result(
+                    self.valid_result(), self.cell | {"nsys": True}
+                )
+                self.assertEqual(row, {"completed": 32})
+                overall.save(folder / "status.json", cell | row | {"status": "ok"})
+                overall.save(
+                    folder / "nsys-kernels.json",
+                    [
+                        {
+                            "device": r + 4,
+                            "rank": r,
+                            "steps": 12,
+                            "families": [
+                                {
+                                    "family": "swap_in_reread",
+                                    "kernel_ms": (
+                                        3 if cell["force_h2d_each_step"] else 1
+                                    ),
+                                }
+                            ],
+                        }
+                        for r in range(4)
+                    ],
+                )
+                return {"status": "ok"}
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "run_overall",
+                    "--nsys",
+                    "--h2d-pair",
+                    "--sharegpt",
+                    str(data_path),
+                    "--output",
+                    str(output),
+                ],
+            ), patch.object(overall, "run_cell", side_effect=profiled_cell):
+                overall.main()
+            comparison = json.loads(
+                next(output.rglob("nsys-comparison.json")).read_text()
+            )
+            self.assertEqual(
+                [r["families"][0]["delta_kernel_ms"] for r in comparison["ranks"]],
+                [2] * 4,
+            )
+            self.assertFalse(list(output.rglob("comparison.json")))
+            with (output / "summary.csv").open() as handle:
+                for row in csv.DictReader(handle):
+                    self.assertEqual(
+                        (row["nsys"], row["output_tps"], row["mean_tpot_ms"]),
+                        ("True", "", ""),
+                    )
+
+    def test_profile_shutdown_allows_writer_to_finish(self):
+        import psutil
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            env = os.environ | {
+                "SGLANG_LAGOM_PERF_TRACE": str(folder / "trace_config.json")
+            }
+            cell = self.cell | {"nsys": True}
+            decode = overall.commands(self.cfg, cell, folder, folder)[0]["decode"]
+            # Use the exact target wrapper from the production argv.
+            target = decode[decode.index("sh") : decode.index(self.cfg["python"])] + [
+                "sleep",
+                "30",
+            ]
+            supervisor = [
+                sys.executable,
+                "-c",
+                (
+                    "import pathlib, subprocess, sys\n"
+                    "subprocess.run(sys.argv[2:], check=False)\n"
+                    "pathlib.Path(sys.argv[1]).write_text('done')"
+                ),
+                str(folder / "closed"),
+                *target,
+            ]
+            with subprocess.Popen(supervisor, env=env) as process:
+                expires = time.monotonic() + 5
+                pidfile = folder / "decode-target.pid"
+                while time.monotonic() < expires and not (
+                    pidfile.exists() and pidfile.stat().st_size
+                ):
+                    time.sleep(0.01)
+                overall.finish_profile(
+                    process, psutil.Process(int(pidfile.read_text())), expires
+                )
+                self.assertEqual((folder / "closed").read_text(), "done")
 
     def test_local_sharegpt_fixed_ids_through_dataset_loader(self):
         from argparse import Namespace
