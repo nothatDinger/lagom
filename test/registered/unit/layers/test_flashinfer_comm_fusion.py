@@ -188,6 +188,47 @@ class TestFlashInferCommFusion(CustomTestCase):
                         with self.assertRaises(ValueError):
                             fusion.resolve_flashinfer_allreduce_fusion_backend(args)
 
+    def test_broken_cudart_votes_to_skip_before_workspace_creation(self):
+        cpu_group = object()
+        cudart = MagicMock()
+        cudart.cudaGetErrorString.side_effect = AttributeError(
+            "libcudart_stub.so: undefined symbol: cudaDeviceReset"
+        )
+        comm = _FakeFlashInferComm()
+        vote = MagicMock()
+        with (
+            patch.dict(
+                "sys.modules",
+                {"flashinfer.comm.cuda_ipc": types.SimpleNamespace(cudart=cudart)},
+            ),
+            patch.object(fusion, "_flashinfer_comm", comm),
+            patch.object(fusion, "_flashinfer_allreduce_unavailable", False),
+            patch.object(
+                fusion,
+                "_create_allreduce_fusion_workspace",
+                comm.create_allreduce_fusion_workspace,
+            ),
+            patch.object(torch.distributed, "get_rank", return_value=0),
+            patch.object(torch.distributed, "all_reduce", vote),
+        ):
+            manager = fusion.FlashInferWorkspaceManager()
+            manager.initialize(
+                world_size=4,
+                rank=0,
+                max_token_num=8,
+                hidden_dim=4096,
+                backend="trtllm",
+                cpu_group=cpu_group,
+            )
+
+            cudart.cudaGetErrorString.assert_called_once_with(0)
+            vote.assert_called_once()
+            self.assertIs(vote.call_args.kwargs["group"], cpu_group)
+            self.assertEqual(vote.call_args.args[0].item(), 0)
+            self.assertEqual(comm.calls, [])
+            self.assertTrue(fusion.is_flashinfer_allreduce_unavailable())
+            self.assertFalse(manager.initialized)
+
     def test_allreduce_fusion_backends_match_torch_baseline(self):
         fake_comm = _FakeFlashInferComm()
         original_comm = fusion._flashinfer_comm
@@ -383,9 +424,7 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
                 "_create_allreduce_fusion_workspace",
                 fake_comm.create_allreduce_fusion_workspace,
             ),
-            patch.object(
-                fusion, "_preflight_check_workspace_memory", return_value=True
-            ),
+            patch.object(fusion, "_preflight_check_workspace", return_value=True),
         ):
             manager.initialize(
                 world_size=4,
