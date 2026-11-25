@@ -476,7 +476,17 @@ struct FlashCompress4Kernel {
         .num_compress = num_c,
         .num_write = num_w,
     };
-    RuntimeCheck(num_q_tokens >= num_w, "invalid prefill plan: num_q < num_w");
+    RuntimeCheck(
+        num_q_tokens >= num_w,
+        "invalid prefill plan: num_q < num_w (num_q=",
+        num_q_tokens,
+        ", num_w=",
+        num_w,
+        ", num_c=",
+        num_c,
+        ", head_dim=",
+        kHeadDim,
+        ")");
     if (const auto num_c_blocks = div_ceil(num_c * kNumSplit, kWarpsPerBlock)) {
       LaunchKernel(num_c_blocks, kBlockSize, device)  //
           .enable_pdl(kUsePDL)(prefill_c_kernel, params);
