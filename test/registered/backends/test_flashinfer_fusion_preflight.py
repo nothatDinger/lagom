@@ -4,6 +4,8 @@ import multiprocessing as mp
 import os
 import socket
 import unittest
+from contextlib import ExitStack
+from unittest.mock import patch
 
 import torch
 
@@ -45,7 +47,7 @@ def _run_rank(rank, world_size, port, scenario, result_q):
 
         from sglang.srt.layers.flashinfer_comm_fusion import (
             _make_flashinfer_workspace_allocation_prop,
-            _preflight_check_workspace_memory,
+            _preflight_check_workspace,
         )
 
         probe_kwargs = dict(
@@ -54,6 +56,7 @@ def _run_rank(rank, world_size, port, scenario, result_q):
             hidden_dim=12288,
             dtype=torch.bfloat16,
             cpu_group=cpu_group,
+            backend="trtllm",
         )
 
         if scenario == "rank0_starved" and rank == 0:
@@ -75,7 +78,13 @@ def _run_rank(rank, world_size, port, scenario, result_q):
             err, held = cuda_driver.cuMemCreate(aligned, prop, 0)
             assert err == cuda_driver.CUresult.CUDA_SUCCESS, (err, aligned)
 
-        decision = _preflight_check_workspace_memory(**probe_kwargs)
+        with ExitStack() as stack:
+            if scenario == "rank0_broken_cudart" and rank == 0:
+                cudart = stack.enter_context(patch("flashinfer.comm.cuda_ipc.cudart"))
+                cudart.cudaGetErrorString.side_effect = AttributeError(
+                    "libcudart_stub.so: undefined symbol: cudaDeviceReset"
+                )
+            decision = _preflight_check_workspace(**probe_kwargs)
         result_q.put((rank, "ok", bool(decision)))
     except Exception as e:  # pragma: no cover - debug path
         result_q.put((rank, "err", repr(e)))
@@ -157,6 +166,12 @@ class TestFlashInferPreflightDistributed(CustomTestCase):
                 payload,
                 f"rank {rank} voted PROCEED but rank 0 was starved",
             )
+
+    def test_broken_cudart_on_one_rank_broadcasts_skip(self):
+        results = _spawn_and_collect("rank0_broken_cudart")
+        for rank, (status, payload) in results.items():
+            self.assertEqual(status, "ok", f"rank {rank}: {payload}")
+            self.assertFalse(payload, f"rank {rank} proceeded with a broken peer")
 
 
 if __name__ == "__main__":

@@ -309,20 +309,19 @@ def _probe_cumem_create_sequence(cuda_driver, allocation_sizes, prop) -> bool:
             cuda_driver.cuMemRelease(handle)
 
 
-def _preflight_check_workspace_memory(
+def _preflight_check_workspace(
     world_size: int,
     max_token_num: int,
     hidden_dim: int,
     dtype: torch.dtype,
+    backend: str,
     cpu_group: Optional["torch.distributed.ProcessGroup"] = None,
 ) -> bool:
     """Collectively decide whether to enter FlashInfer workspace creation.
 
-    FlashInfer TRTLLM workspaces allocate several SymmDeviceMemory buffers and
-    then exchange handles across ranks. If one rank fails local cuMemCreate and
-    exits while peers enter handle exchange, peers can hang until the watchdog
-    aborts. Probe the same handle type and allocation sequence first, then vote
-    on a CPU group so all ranks proceed or skip together.
+    TRTLLM binds libcudart after exchanging SymmDeviceMemory handles. Probe
+    that binding and the local allocation sequence before the first exchange
+    so a rank-local failure cannot strand peers in a workspace collective.
     """
     import torch.distributed as dist
 
@@ -335,6 +334,13 @@ def _preflight_check_workspace_memory(
 
     allocation_sizes = []
     try:
+        if backend == "trtllm":
+            # Bind the same lazy ctypes table that TRTLLM's cudaMemset uses.
+            # A rank that picked TileLang's libcudart_stub.so can fail symbol
+            # lookup while its peers enter FlashInfer's workspace barrier.
+            from flashinfer.comm.cuda_ipc import cudart
+
+            cudart.cudaGetErrorString(0)
         cuda_driver = get_cuda_driver_bindings()
         prop = _make_flashinfer_workspace_allocation_prop(cuda_driver)
         allocation_sizes = _flashinfer_trtllm_workspace_allocation_sizes(
@@ -346,15 +352,17 @@ def _preflight_check_workspace_memory(
             dtype,
         )
         local_ok = _probe_cumem_create_sequence(cuda_driver, allocation_sizes, prop)
+        if not local_ok:
+            logger.warning("FlashInfer workspace cuMemCreate probe failed locally.")
     except Exception as e:
         logger.warning(
-            "FlashInfer workspace preflight probe failed (%s). "
-            "Skipping allreduce fusion.",
+            "FlashInfer workspace preflight failed locally (backend=%s): %s",
+            backend,
             e,
         )
         local_ok = False
 
-    flag = torch.tensor([1 if local_ok else 0], dtype=torch.int32)
+    flag = torch.tensor([int(local_ok)], dtype=torch.int32, device="cpu")
     dist.all_reduce(flag, op=dist.ReduceOp.BAND, group=group)
 
     logger.debug(
@@ -367,9 +375,9 @@ def _preflight_check_workspace_memory(
     )
     if flag.item() == 0:
         logger.warning(
-            "FlashInfer workspace preflight: cuMemCreate probe failed on at "
-            "least one rank. Skipping allreduce fusion to avoid cross-rank "
-            "desync inside the flashinfer collective."
+            "FlashInfer workspace preflight failed on at least one rank "
+            "(backend=%s). Skipping allreduce fusion before workspace creation.",
+            backend,
         )
         return False
     return True
@@ -461,11 +469,12 @@ class FlashInferWorkspaceManager:
 
         self.cleanup()
 
-        if not _preflight_check_workspace_memory(
+        if not _preflight_check_workspace(
             world_size=world_size,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
             dtype=dtype,
+            backend=backend,
             cpu_group=cpu_group,
         ):
             _flashinfer_allreduce_unavailable = True
