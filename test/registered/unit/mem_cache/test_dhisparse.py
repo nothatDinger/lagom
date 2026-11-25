@@ -128,6 +128,69 @@ def test_missing_host_backing_is_an_error_not_a_silent_invalid_selection():
         )
 
 
+@pytest.mark.parametrize("width", [4, 6])
+def test_verify_capture_and_autotune_have_no_live_hisparse_requests(monkeypatch, width):
+    from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+        build_decode_registry,
+    )
+    from sglang.srt.model_executor.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardMode,
+    )
+    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.runner import decode_cuda_graph_runner as graph
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    bs = 2
+    registry = build_decode_registry(
+        device="cpu",
+        max_bs=bs,
+        max_num_token=bs * width,
+        seq_len_fill_value=1,
+        cache_loc_dtype=torch.int64,
+        share_pool=False,
+    )
+    live = torch.tensor([bs], dtype=torch.int32)
+    coordinator = SimpleNamespace(num_real_reqs=live, prefetcher_name=None)
+    model_runner = SimpleNamespace(
+        hisparse_coordinator=coordinator,
+        spec_algorithm=SpeculativeAlgorithm.DSPARK,
+        server_args=SimpleNamespace(enable_lora=False, is_oasiskv_lookahead=False),
+    )
+    runner = SimpleNamespace(
+        model_runner=model_runner,
+        captured_req_width=width,
+        buffer_registry=registry,
+        buffers=SimpleNamespace(
+            num_token_non_padded=torch.zeros(1, dtype=torch.int32),
+            next_token_logits_buffer=torch.empty(bs * width, 1),
+            rids_int=None,
+            bootstrap_room_ids_int=None,
+            global_num_tokens_gpu=None,
+            global_num_tokens_for_logprob_gpu=None,
+            ngram_embedding_info=None,
+        ),
+        capture_forward_mode=ForwardMode.TARGET_VERIFY,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+        get_spec_info=lambda _: None,
+        attn_backend=None,
+        pp_size=1,
+        require_mlp_tp_gather=False,
+        require_attn_tp_gather=False,
+    )
+    monkeypatch.setattr(graph, "enable_num_token_non_padded", lambda: False)
+    batch, _, _ = graph.DecodeCudaGraphRunner.capture_prepare(runner, bs)
+    assert batch.req_pool_indices.tolist() == [0, 0]
+    assert batch.input_ids.numel() == batch.positions.numel() == bs * width
+    assert batch.hisparse_coordinator.num_real_reqs is live
+    assert live.item() == 0
+
+    # Eager autotune may reuse the runner after a live forward.
+    live.fill_(bs)
+    ModelRunner.prepare_dummy_forward_batch(model_runner, batch)
+    assert live.item() == 0
+
+
 def test_residency_backup_before_reclaim_publish_after_completion_and_refill_fairness():
     free, log, events, visible = [24], [], [], {}
 

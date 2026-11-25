@@ -997,7 +997,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # graph; backends read it from self.model_runner.hisparse_coordinator.
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
         if forward_batch.hisparse_coordinator is not None:
-            forward_batch.hisparse_coordinator.num_real_reqs.fill_(bs)
+            # Verify warmups use dummy request IDs with no committed host KV.
+            # Record swap-in with zero live requests. Replay fills this same
+            # device scalar with raw_bs before launching the captured graph.
+            live_bs = 0 if forward_batch.forward_mode.is_target_verify() else bs
+            forward_batch.hisparse_coordinator.num_real_reqs.fill_(live_bs)
             forward_batch.is_ema_graph_capture = (
                 forward_batch.hisparse_coordinator.prefetcher_name == "ema"
             )

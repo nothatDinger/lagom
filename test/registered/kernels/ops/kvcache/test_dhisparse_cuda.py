@@ -54,8 +54,9 @@ def test_union_overflow_payload_padding_and_graph_replay(packed, capture, force)
         n, stride
     )
     optional = torch.full((n, history), -1, dtype=torch.int32, device="cuda")
-    host_locs = torch.arange(n * history, device="cuda").view(n, history)
-    requests = torch.tensor([2, 0, 1], dtype=torch.int64, device="cuda")
+    host_locs = torch.full((n, history), -1, dtype=torch.int64, device="cuda")
+    requests = torch.zeros(n, dtype=torch.int64, device="cuda")
+    real = torch.zeros(1, dtype=torch.int32, device="cuda")
     lengths = torch.full((n, width), history, dtype=torch.int32, device="cuda")
     selected = (
         torch.arange(n * width * k, device="cuda", dtype=torch.int32).view(n, width, k)
@@ -83,7 +84,7 @@ def test_union_overflow_payload_padding_and_graph_replay(packed, capture, force)
         hot_size=hot,
         workspace=workspace,
         counts=counts,
-        num_real_requests=torch.tensor([2], dtype=torch.int32, device="cuda"),
+        num_real_requests=real,
         item_bytes=item_bytes,
         packed=packed,
     )
@@ -117,13 +118,18 @@ def test_union_overflow_payload_padding_and_graph_replay(packed, capture, force)
         saved.copy_(rows(payload, output.clamp_min(0), packed))
         promote(lru_slots=lru, **kwargs)
 
-    run()  # JIT compilation and temporary storage before capture.
+    run()  # Warm up with the same unbacked dummy requests as target verify capture.
+    assert (output == -1).all() and not epochs.any() and not counts.any()
     graph = None
     if capture:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             run()
-    for offset in (0, 31, 101):
+    # Publish the first real batch into the buffers referenced by the graph.
+    host_locs.copy_(torch.arange(n * history, device="cuda").view_as(host_locs))
+    requests.copy_(torch.tensor([2, 0, 1], device="cuda"))
+    real.fill_(2)
+    for offset in (0, 0, 31, 101):
         selected.add_(offset).remainder_(history)
         selected[0, 0, 1] = -1
         if graph is None:

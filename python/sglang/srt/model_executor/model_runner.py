@@ -1530,6 +1530,13 @@ class ModelRunner:
 
     def prepare_dummy_forward_batch(self, forward_batch: ForwardBatch) -> ForwardBatch:
         """Customize a runner-created dummy batch before attention metadata initialization."""
+        if (
+            self.hisparse_coordinator is not None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            # Autotune can reuse buffers after live work; its dummy verify rows
+            # must not look up host KV or mutate an admitted request's cache.
+            self.hisparse_coordinator.num_real_reqs.zero_()
         return forward_batch
 
     def _prepare_eager_forward_batch(self, forward_batch: ForwardBatch) -> None:
